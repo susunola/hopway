@@ -273,21 +273,40 @@ func PreviewSubscription(ctx context.Context, user engine.Config, rawURL, dataDi
 }
 
 type subscriptionImport struct {
-	result   importer.Result
-	index    int
-	snapshot *Snapshot
-	previous *Snapshot
-	preview  bool
+	result           importer.Result
+	index            int
+	snapshot         *Snapshot
+	previousRevision string
+	preview          bool
+}
+
+var ErrImportSnapshotChanged = errors.New("订阅缓存已由其他操作更新，请重新预览或导入")
+
+func snapshotRevision(snapshot *Snapshot) (string, error) {
+	if snapshot == nil {
+		return MissingRevision, nil
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return "", err
+	}
+	return revision(data), nil
 }
 
 func (plan *subscriptionImport) prepare(ctx context.Context, dataDir string, impl backend.Backend, baseline *engine.Config) error {
 	user := plan.result.Config
 	sub := user.Subscriptions[plan.index]
-	previous, _ := LoadSnapshot(dataDir, sub)
-	if !plan.preview && !reflect.DeepEqual(plan.previous, previous) {
-		return errors.New("订阅缓存已由其他操作更新，请重新导入")
+	if !plan.preview {
+		previous, _ := LoadSnapshot(dataDir, sub)
+		current, err := snapshotRevision(previous)
+		if err != nil {
+			return err
+		}
+		if current != plan.previousRevision {
+			return ErrImportSnapshotChanged
+		}
+		updateUsage(sub, plan.snapshot, previous)
 	}
-	updateUsage(sub, plan.snapshot, previous)
 	validate := func(config engine.Config) error { return engine.ValidateContext(ctx, config, impl, nil) }
 	_, err := validateConfig(user, dataDir, validate, sub.Name, plan.snapshot, baseline)
 	return err
@@ -334,6 +353,10 @@ func fetchSubscription(ctx context.Context, user engine.Config, rawURL, dataDir 
 		return nil, err
 	}
 	previous, _ := LoadSnapshot(dataDir, sub)
+	previousRevision, err := snapshotRevision(previous)
+	if err != nil {
+		return nil, err
+	}
 	snapshot, result, err := Fetch(ctx, sub, impl, nil)
 	if err != nil {
 		if !preview {
@@ -365,7 +388,7 @@ func fetchSubscription(ctx context.Context, user engine.Config, rawURL, dataDir 
 		result.Notes[i] = strings.Replace(note, "替换原有分组和规则", "排在你自己的规则之后生效", 1)
 	}
 	result.Notes = append([]string{fmt.Sprintf("%s「%s」，之后每 %g 分钟自动检查", verb, sub.Name, RefreshInterval(user, sub).Minutes())}, result.Notes...)
-	return &subscriptionImport{result: result, index: index, snapshot: snapshot, previous: previous, preview: preview}, nil
+	return &subscriptionImport{result: result, index: index, snapshot: snapshot, previousRevision: previousRevision, preview: preview}, nil
 }
 
 func RefreshInterval(config engine.Config, sub engine.Subscription) time.Duration {

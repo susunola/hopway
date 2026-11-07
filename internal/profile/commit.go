@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 
 	"mac-proxy/internal/backend"
@@ -109,10 +111,114 @@ type ImportReceipt struct {
 	Notes    []string `json:"notes"`
 }
 
+// PreparedImport is the private handoff between the preview and confirmation
+// processes. It contains credentials and must stay on a private pipe or file.
+type PreparedImport struct {
+	Version      int                   `json:"version"`
+	Path         string                `json:"path"`
+	Revision     string                `json:"revision"`
+	Result       importer.Result       `json:"result"`
+	Subscription *preparedSubscription `json:"subscription,omitempty"`
+}
+
+type preparedSubscription struct {
+	Index            int       `json:"index"`
+	Snapshot         *Snapshot `json:"snapshot"`
+	PreviousRevision string    `json:"previousRevision"`
+}
+
+const preparedImportVersion = 1
+
 // CommitImport downloads before taking the write lock. It publishes a remote
 // snapshot at a new key so the previous config remains readable until rename.
 func CommitImport(ctx context.Context, path, dataDir, expected, raw string, impl backend.Backend) (ImportReceipt, error) {
+	prepared, err := prepareImport(ctx, path, dataDir, expected, raw, impl, false)
+	if err != nil {
+		return ImportReceipt{}, err
+	}
+	return CommitPreparedImport(ctx, path, dataDir, prepared, impl)
+}
+
+// PrepareImport downloads once and validates a candidate without publishing it.
+func PrepareImport(ctx context.Context, path, dataDir, expected, raw string, impl backend.Backend) (PreparedImport, error) {
+	return prepareImport(ctx, path, dataDir, expected, raw, impl, true)
+}
+
+func prepareImport(ctx context.Context, path, dataDir, expected, raw string, impl backend.Backend, preview bool) (PreparedImport, error) {
 	doc, err := readExpected(path, expected)
+	if err != nil {
+		return PreparedImport{}, err
+	}
+	base, err := doc.Config()
+	if err != nil {
+		return PreparedImport{}, err
+	}
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return PreparedImport{}, err
+	}
+	base.DataDir = dataDir
+	source, _, _, err := importer.SubscriptionLink(raw)
+	if err != nil {
+		return PreparedImport{}, err
+	}
+	prepared := PreparedImport{Version: preparedImportVersion, Path: absolutePath, Revision: doc.Revision}
+	if source != nil {
+		plan, err := fetchSubscription(ctx, base, raw, dataDir, impl, preview)
+		if err != nil {
+			return PreparedImport{}, err
+		}
+		prepared.Result = plan.result
+		prepared.Subscription = &preparedSubscription{
+			Index: plan.index, Snapshot: plan.snapshot, PreviousRevision: plan.previousRevision,
+		}
+	} else {
+		prepared.Result, err = importer.Import(ctx, strings.NewReader(raw), base, impl)
+		if err != nil {
+			return PreparedImport{}, err
+		}
+	}
+	if preview {
+		if _, err := prepared.validate(ctx, dataDir, impl, &base, true); err != nil {
+			return PreparedImport{}, err
+		}
+	}
+	return prepared, nil
+}
+
+func (p PreparedImport) validate(ctx context.Context, dataDir string, impl backend.Backend, base *engine.Config, preview bool) (*subscriptionImport, error) {
+	sub := p.Subscription
+	if sub == nil {
+		validate := func(config engine.Config) error { return engine.ValidateContext(ctx, config, impl, nil) }
+		_, err := validateConfig(p.Result.Config, dataDir, validate, "", nil, base)
+		return nil, err
+	}
+	if sub.Index < 0 || sub.Index >= len(p.Result.Config.Subscriptions) || sub.Snapshot == nil ||
+		len(sub.Snapshot.Nodes) == 0 || sub.PreviousRevision == "" {
+		return nil, errors.New("导入预览无效，请重新预览")
+	}
+	snapshot := *sub.Snapshot
+	plan := &subscriptionImport{result: p.Result, index: sub.Index, snapshot: &snapshot,
+		previousRevision: sub.PreviousRevision, preview: preview}
+	plan.result.Config.Subscriptions = slices.Clone(plan.result.Config.Subscriptions)
+	return plan, plan.prepare(ctx, dataDir, impl, base)
+}
+
+// CommitPreparedImport uses the downloaded snapshot without consulting its URL.
+func CommitPreparedImport(ctx context.Context, path, dataDir string, prepared PreparedImport, impl backend.Backend) (ImportReceipt, error) {
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return ImportReceipt{}, err
+	}
+	if path == "" || prepared.Version != preparedImportVersion || prepared.Path != absolutePath || prepared.Revision == "" {
+		return ImportReceipt{}, errors.New("导入预览无效，请重新预览")
+	}
+	release, err := LockWritesContext(ctx, dataDir)
+	if err != nil {
+		return ImportReceipt{}, err
+	}
+	defer release()
+	doc, err := readExpected(path, prepared.Revision)
 	if err != nil {
 		return ImportReceipt{}, err
 	}
@@ -120,49 +226,24 @@ func CommitImport(ctx context.Context, path, dataDir, expected, raw string, impl
 	if err != nil {
 		return ImportReceipt{}, err
 	}
-	base.DataDir = dataDir
-	source, _, _, err := importer.SubscriptionLink(raw)
-	if err != nil {
-		return ImportReceipt{}, err
-	}
-	var plan *subscriptionImport
-	var result importer.Result
-	if source != nil {
-		plan, err = fetchSubscription(ctx, base, raw, dataDir, impl, false)
-		if err == nil {
-			result = plan.result
-		}
-	} else {
-		result, err = importer.Import(ctx, strings.NewReader(raw), base, impl)
-	}
-	if err != nil {
-		return ImportReceipt{}, err
-	}
-	release, err := LockWritesContext(ctx, dataDir)
-	if err != nil {
-		return ImportReceipt{}, err
-	}
-	defer release()
-	if _, err := readExpected(path, expected); err != nil {
-		return ImportReceipt{}, err
-	}
 	if err := ctx.Err(); err != nil {
 		return ImportReceipt{}, err
 	}
+	plan, err := prepared.validate(ctx, dataDir, impl, &base, false)
+	if err != nil {
+		return ImportReceipt{}, err
+	}
+	result := prepared.Result
 	var stagedPath string
 	if plan != nil {
-		if err := plan.prepare(ctx, dataDir, impl, &base); err != nil {
-			return ImportReceipt{}, err
-		}
 		stagedPath, err = plan.stage(ctx, dataDir)
 		if err != nil {
 			return ImportReceipt{}, err
 		}
 		result = plan.result
-	} else {
-		validate := func(config engine.Config) error { return engine.ValidateContext(ctx, config, impl, nil) }
-		if _, err := validateConfig(result.Config, dataDir, validate, "", nil, &base); err != nil {
-			return ImportReceipt{}, err
+		if len(result.Notes) > 0 && strings.HasPrefix(result.Notes[0], "将") {
+			result.Notes = slices.Clone(result.Notes)
+			result.Notes[0] = "已" + strings.TrimPrefix(result.Notes[0], "将")
 		}
 	}
 	data, err := json.MarshalIndent(result.Config, "", "  ")
@@ -171,7 +252,7 @@ func CommitImport(ctx context.Context, path, dataDir, expected, raw string, impl
 	}
 	var saved string
 	if err == nil {
-		saved, err = writeDocument(ctx, path, expected, data)
+		saved, err = writeDocument(ctx, path, prepared.Revision, data)
 	}
 	if err != nil {
 		if stagedPath != "" {

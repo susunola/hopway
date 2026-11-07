@@ -41,6 +41,8 @@ type ready struct {
 	HTTP    string `json:"http"`
 }
 
+const preparedImportLimit = 16 << 20
+
 func main() {
 	path := flag.String("config", "", "JSON configuration file")
 	port := flag.Int("port", -1, "override the SOCKS5 listen port")
@@ -55,6 +57,8 @@ func main() {
 	previewImport := flag.Bool("preview-import", false, "preview a subscription or profile from stdin without writing it")
 	importInput := flag.Bool("import", false, "read a subscription URL or profile from stdin and print converted JSON")
 	commitImport := flag.Bool("commit-import", false, "import from stdin and atomically update the configuration")
+	prepareImport := flag.Bool("prepare-import", false, "internal: produce a private import preview and snapshot")
+	commitPrepared := flag.Bool("commit-prepared-import", false, "internal: save a prepared import without fetching again")
 	saveConfig := flag.Bool("save-config", false, "validate and atomically replace the configuration with JSON from stdin")
 	expectedRevision := flag.String("expected-revision", "", "original configuration SHA-256, or missing for a new file")
 	watchStdin := flag.Bool("watch-stdin", false, "internal: cancel a profile command when its parent closes stdin")
@@ -102,10 +106,15 @@ func main() {
 		}
 		return
 	}
-	if *saveConfig || *commitImport {
+	if *saveConfig || *commitImport || *prepareImport || *commitPrepared {
 		ctx, cancel := profileCommandContext(*watchStdin && *inputFile != "")
 		defer cancel()
-		err := writeProfile(ctx, *path, *expectedRevision, *inputFile, *commitImport)
+		var err error
+		if *prepareImport || *commitPrepared {
+			err = writePreparedImport(ctx, *path, *expectedRevision, *inputFile, *commitPrepared)
+		} else {
+			err = writeProfile(ctx, *path, *expectedRevision, *inputFile, *commitImport)
+		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			if errors.Is(err, profile.ErrConfigurationChanged) {
@@ -180,7 +189,49 @@ func writeProfile(ctx context.Context, path, expected, inputFile string, importi
 	return output.Encode(map[string]string{"revision": revision})
 }
 
+func writePreparedImport(ctx context.Context, path, expected, inputFile string, confirm bool) error {
+	impl := backend.Default()
+	dir := dataDir(path)
+	if confirm {
+		data, err := readProfileInputLimit(inputFile, preparedImportLimit)
+		if err != nil {
+			return err
+		}
+		var prepared profile.PreparedImport
+		if err := json.Unmarshal(data, &prepared); err != nil {
+			return errors.New("导入预览无效，请重新预览")
+		}
+		receipt, err := profile.CommitPreparedImport(ctx, path, dir, prepared, impl)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(receipt)
+	}
+	data, err := readProfileInput(inputFile)
+	if err != nil {
+		return err
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
+	prepared, err := profile.PrepareImport(ctx, path, dir, expected, raw, impl)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(prepared)
+	if err != nil {
+		return err
+	}
+	if len(encoded) > preparedImportLimit {
+		return errors.New("预览后的导入数据超过 16 MB")
+	}
+	_, err = os.Stdout.Write(encoded)
+	return err
+}
+
 func readProfileInput(path string) ([]byte, error) {
+	return readProfileInputLimit(path, importer.MaxSize)
+}
+
+func readProfileInputLimit(path string, limit int) ([]byte, error) {
 	input := os.Stdin
 	if path != "" {
 		file, err := os.Open(path)
@@ -190,9 +241,9 @@ func readProfileInput(path string) ([]byte, error) {
 		defer file.Close()
 		input = file
 	}
-	data, err := io.ReadAll(io.LimitReader(input, importer.MaxSize+1))
-	if err == nil && len(data) > importer.MaxSize {
-		err = errors.New("输入超过 1 MB")
+	data, err := io.ReadAll(io.LimitReader(input, int64(limit)+1))
+	if err == nil && len(data) > limit {
+		err = fmt.Errorf("输入超过 %d MB", limit>>20)
 	}
 	return data, err
 }

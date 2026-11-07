@@ -1417,24 +1417,36 @@ final class CoreModel: ObservableObject {
     }
 
     func importContent(_ raw: String) {
-        guard !saving, let executable else { return }
-        guard !changed else {
-            message = "请先保存配置草稿，再导入节点。"
-            return
-        }
         guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             message = "请先复制订阅地址、节点链接或 Clash 配置。"
             return
         }
+        _ = commitImport(Data(raw.utf8), prepared: false, basedOn: savedRevision)
+    }
+
+    func confirmImport(_ preview: ImportPreview) -> Bool {
+        commitImport(preview.snapshot, prepared: true, basedOn: preview.revision)
+    }
+
+    private func commitImport(_ input: Data, prepared: Bool, basedOn expected: String) -> Bool {
+        guard !saving, let executable else { return false }
+        guard !changed else {
+            message = "请先保存配置草稿，再导入节点。"
+            return false
+        }
+        guard savedRevision == expected else {
+            message = "配置已更新，请重新预览导入。"
+            return false
+        }
         saving = true
-        message = "正在识别并导入…"
+        message = prepared ? "正在保存已预览的配置…" : "正在识别并导入…"
         let destination = configURL
-        let expected = savedRevision
         Task {
             defer { saving = false }
             do {
                 let receipt = try await Task.detached {
-                    let data = try Self.runProfileInput(raw, mode: "-commit-import", at: destination, expected: expected, with: executable)
+                    let data = try Self.runProfileInput(input, mode: prepared ? "-commit-prepared-import" : "-commit-import",
+                                                        at: destination, expected: prepared ? nil : expected, with: executable)
                     return try JSONDecoder().decode(ImportReceipt.self, from: data)
                 }.value
                 acceptSavedConfiguration(receipt.text, revision: receipt.revision)
@@ -1449,12 +1461,25 @@ final class CoreModel: ObservableObject {
                 writeFailed(error, prefix: "导入失败 · ")
             }
         }
+        return true
     }
 
-    struct ImportPreview: Decodable {
+    struct ImportPreview {
         let added: Int
         let skipped: Int
         let notes: [String]
+        fileprivate let snapshot: Data
+        fileprivate let revision: String
+    }
+
+    private struct ImportPreviewEnvelope: Decodable {
+        struct Result: Decodable {
+            let added: Int
+            let skipped: Int
+            let notes: [String]?
+        }
+        let result: Result
+        let revision: String
     }
 
     private struct ImportReceipt: Decodable {
@@ -1470,21 +1495,29 @@ final class CoreModel: ObservableObject {
             throw CoreError(message: "请先保存配置草稿，再预览导入。")
         }
         let destination = configURL
+        let expected = savedRevision
         let data = try await Task.detached {
-            try Self.runProfileInput(raw, mode: "-preview-import", at: destination, with: executable)
+            try Self.runProfileInput(Data(raw.utf8), mode: "-prepare-import", at: destination, expected: expected, with: executable)
         }.value
-        return try JSONDecoder().decode(ImportPreview.self, from: data)
+        let envelope = try JSONDecoder().decode(ImportPreviewEnvelope.self, from: data)
+        guard !changed, savedRevision == expected, envelope.revision == expected else { throw ProfileWriteConflict() }
+        return ImportPreview(added: envelope.result.added, skipped: envelope.result.skipped,
+                             notes: envelope.result.notes ?? [], snapshot: data, revision: expected)
     }
 
-    nonisolated private static func runProfileInput(_ raw: String, mode: String, at destination: URL,
+    nonisolated private static func runProfileInput(_ input: Data, mode: String, at destination: URL,
                                                      expected: String? = nil, with executable: URL) throws -> Data {
-        guard raw.utf8.count <= 1_048_576 else { throw CoreError(message: "输入上限为 1 MB。") }
+        if mode == "-commit-prepared-import" {
+            guard input.count <= 16 * 1_048_576 else { throw CoreError(message: "预览后的导入数据超过 16 MB。") }
+        } else {
+            guard input.count <= 1_048_576 else { throw CoreError(message: "输入上限为 1 MB。") }
+        }
         let files = FileManager.default
         let directory = files.temporaryDirectory.appendingPathComponent("hopway-" + UUID().uuidString)
         try files.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? files.removeItem(at: directory) }
         let source = directory.appendingPathComponent("input")
-        guard files.createFile(atPath: source.path, contents: Data(raw.utf8), attributes: [.posixPermissions: 0o600]) else {
+        guard files.createFile(atPath: source.path, contents: input, attributes: [.posixPermissions: 0o600]) else {
             throw CoreError(message: "无法暂存配置内容。")
         }
         let output = Pipe()
@@ -1596,7 +1629,7 @@ final class CoreModel: ObservableObject {
 
     nonisolated private static func validateAndSave(_ text: String, to destination: URL,
                                                     expected: String, with executable: URL) throws -> String {
-        let data = try runProfileInput(text, mode: "-save-config", at: destination, expected: expected, with: executable)
+        let data = try runProfileInput(Data(text.utf8), mode: "-save-config", at: destination, expected: expected, with: executable)
         let receipt = try JSONDecoder().decode([String: String].self, from: data)
         guard let revision = receipt["revision"] else { throw CoreError(message: "无法读取保存后的配置版本。") }
         return revision

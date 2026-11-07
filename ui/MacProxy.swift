@@ -82,6 +82,7 @@ private struct Dashboard: View {
     @State private var showsLinkImport = false
     @State private var importLink = ""
     @State private var preview: CoreModel.ImportPreview?
+    @State private var previewRequest = UUID()
     @State private var importError: String?
     @State private var previewing = false
     @State private var showsConfigurationEditor = false
@@ -150,7 +151,12 @@ private struct Dashboard: View {
         .onChange(of: core.importCount) { _, _ in
             if page != .subscriptions { page = .nodes }
         }
-        .sheet(isPresented: $showsLinkImport, onDismiss: { importLink = ""; preview = nil; importError = nil }) {
+        .sheet(isPresented: $showsLinkImport, onDismiss: {
+            importLink = ""
+            preview = nil
+            previewRequest = UUID()
+            importError = nil
+        }) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("导入链接").font(.headline)
                 Text("粘贴 Shadowrocket 或 Clash 的一键导入链接，也可直接填订阅地址。")
@@ -173,20 +179,26 @@ private struct Dashboard: View {
                     Spacer()
                     Button("取消") { showsLinkImport = false }.keyboardShortcut(.cancelAction)
                     Button(previewing ? "正在预览…" : preview == nil ? "预览" : "确认导入") {
-                        if preview != nil {
-                            core.importContent(importLink)
-                            showsLinkImport = false
+                        if let preview {
+                            if core.confirmImport(preview) {
+                                showsLinkImport = false
+                            } else {
+                                self.preview = nil
+                                importError = core.message
+                            }
                         } else {
                             let link = importLink
+                            let request = UUID()
+                            previewRequest = request
                             previewing = true
                             importError = nil
                             Task {
                                 defer { previewing = false }
                                 do {
                                     let result = try await core.previewImport(link)
-                                    if importLink == link && showsLinkImport { preview = result }
+                                    if previewRequest == request && showsLinkImport { preview = result }
                                 } catch {
-                                    if importLink == link && showsLinkImport { importError = error.localizedDescription }
+                                    if previewRequest == request && showsLinkImport { importError = error.localizedDescription }
                                 }
                             }
                         }
@@ -197,7 +209,11 @@ private struct Dashboard: View {
             }
             .padding(22)
             .frame(width: 490)
-            .onChange(of: importLink) { _, _ in preview = nil; importError = nil }
+            .onChange(of: importLink) { _, _ in
+                preview = nil
+                previewRequest = UUID()
+                importError = nil
+            }
         }
         .sheet(isPresented: $showsConfigurationEditor) {
             configurationEditor

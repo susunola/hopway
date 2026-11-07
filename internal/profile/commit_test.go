@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -195,6 +196,138 @@ func TestReimportPublishesNewSnapshotWithoutChangingPrevious(t *testing.T) {
 	}
 	if _, err := CommitRefresh(ctx, config, sub, pending, path, cache, impl); !errors.Is(err, ErrRefreshSourceChanged) {
 		t.Fatalf("late refresh accepted after the snapshot generation changed: %v", err)
+	}
+}
+
+func TestPreparedImportCommitsExactlyWhatWasPreviewed(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) != 1 {
+			w.Header().Set("ETag", "\"later\"")
+			io.WriteString(w, "ss://aes-128-gcm:b@127.0.0.1:19002#Later")
+			return
+		}
+		w.Header().Set("ETag", "\"preview\"")
+		w.Header().Set("subscription-userinfo", "upload=10; download=20; total=100")
+		io.WriteString(w, `proxies:
+  - {name: Preview, type: socks5, server: 127.0.0.1, port: 19001}
+proxy-groups:
+  - {name: Traffic, type: select, proxies: [Preview, DIRECT]}
+rules:
+  - MATCH,Traffic
+`)
+	}))
+	defer server.Close()
+	ctx, impl := context.Background(), backend.Native{}
+	dir := t.TempDir()
+	path, cache := filepath.Join(dir, "config.json"), filepath.Join(dir, "cache")
+	preview, err := PrepareImport(ctx, path, cache, MissingRevision, server.URL, impl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 || preview.Result.Added != 1 || preview.Subscription == nil {
+		t.Fatal("preview did not keep the downloaded subscription")
+	}
+	for _, name := range []string{path, cache} {
+		if _, err := os.Stat(name); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("preview wrote %s: %v", filepath.Base(name), err)
+		}
+	}
+	// Confirmation in the app runs in another process.
+	wire, err := json.Marshal(preview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var confirmation PreparedImport
+	if err := json.Unmarshal(wire, &confirmation); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := CommitPreparedImport(ctx, path, cache, confirmation, impl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests.Load() != 1 || receipt.Added != 1 || len(receipt.Notes) == 0 || !strings.HasPrefix(receipt.Notes[0], "已添加订阅") {
+		t.Fatalf("confirmation did not use the preview, requests=%d", requests.Load())
+	}
+	config, err := engine.Decode(strings.NewReader(receipt.Text))
+	if err != nil || len(config.Subscriptions) != 1 {
+		t.Fatalf("missing saved subscription: %v", err)
+	}
+	sub := config.Subscriptions[0]
+	saved, err := LoadSnapshot(cache, sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Updated != preview.Subscription.Snapshot.Updated || len(saved.Nodes) != 1 || saved.Nodes[0].Name != "Preview" ||
+		len(saved.Groups) != 1 || saved.Groups[0].Members[0] != "Preview" || len(saved.Rules) != 1 ||
+		saved.Validators == nil || saved.Validators.ETag != "\"preview\"" ||
+		saved.Usage == nil || saved.Usage.Used == nil || *saved.Usage.Used != 30 {
+		t.Fatal("saved snapshot changed the previewed routing, validator or quota")
+	}
+	next, _, err := Fetch(ctx, sub, impl, nil)
+	if err != nil || requests.Load() != 2 || next.Nodes[0].Name != "Later" {
+		t.Fatalf("fixture did not offer a different response after confirmation: %v", err)
+	}
+}
+
+func TestPreparedImportCannotOverwriteNewerProfileOrCache(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		io.WriteString(w, "ss://aes-128-gcm:b@127.0.0.1:19002#Preview")
+	}))
+	defer server.Close()
+	ctx, impl := context.Background(), backend.Native{}
+	dir := t.TempDir()
+	path, cache := filepath.Join(dir, "config.json"), filepath.Join(dir, "cache")
+	config := engine.Default()
+	sub := engine.Subscription{Name: "existing", URL: server.URL}
+	config.Subscriptions = []engine.Subscription{sub}
+	original, _ := json.Marshal(config)
+	revision, err := CommitConfig(ctx, path, cache, MissingRevision, original, impl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSnapshot(cache, sub, &Snapshot{Nodes: []outbound.Node{node("Previous")}}); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := PrepareImport(ctx, path, cache, revision, server.URL, impl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPath := filepath.Join(dir, "other.json")
+	if err := os.WriteFile(otherPath, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CommitPreparedImport(ctx, otherPath, cache, prepared, impl); err == nil {
+		t.Fatal("confirmation accepted a preview for another profile with the same revision")
+	}
+	if other, err := os.ReadFile(otherPath); err != nil || !bytes.Equal(other, original) {
+		t.Fatalf("confirmation changed the other profile: %v", err)
+	}
+	if err := SaveSnapshot(cache, sub, &Snapshot{Nodes: []outbound.Node{node("Refreshed")}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CommitPreparedImport(ctx, path, cache, prepared, impl); !errors.Is(err, ErrImportSnapshotChanged) {
+		t.Fatalf("confirmation should reject a changed cache: %v", err)
+	}
+	if doc, err := ReadDocument(path); err != nil || !bytes.Equal(doc.Bytes, original) {
+		t.Fatalf("stale confirmation changed the profile: %v", err)
+	}
+	config.Subscriptions[0].Alias = "User edit"
+	edited, _ := json.Marshal(config)
+	if _, err := CommitConfig(ctx, path, cache, revision, edited, impl); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CommitPreparedImport(ctx, path, cache, prepared, impl); !errors.Is(err, ErrConfigurationChanged) {
+		t.Fatalf("confirmation should reject a changed profile: %v", err)
+	}
+	snapshot, err := LoadSnapshot(cache, sub)
+	if err != nil || len(snapshot.Nodes) != 1 || snapshot.Nodes[0].Name != "Refreshed" || requests.Load() != 1 {
+		t.Fatalf("stale confirmation made a network request or replaced the refreshed cache: %v", err)
+	}
+	if paths, err := filepath.Glob(filepath.Join(cache, "subscriptions", "*.json")); err != nil || len(paths) != 1 {
+		t.Fatalf("stale confirmation left a staged snapshot: %v", err)
 	}
 }
 
