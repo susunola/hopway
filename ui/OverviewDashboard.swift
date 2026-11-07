@@ -278,6 +278,7 @@ struct OverviewDashboard: View {
         let todayCount = days.last?.count
         let rates = running ? core.liveTraffic : nil
         let ratePlaceholder = running ? "等待采样" : core.phase.rawValue
+        let chartHeight: CGFloat = 112
 
         return VStack(alignment: .leading, spacing: 11) {
             HStack(spacing: 8) {
@@ -299,18 +300,18 @@ struct OverviewDashboard: View {
                     }
                 }
                 .frame(width: 244, alignment: .leading)
-                Divider().frame(height: 123)
+                Divider().frame(height: chartHeight + 39)
                 VStack(alignment: .leading, spacing: 5) {
                     Text("近 7 天")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                     if days.contains(where: { $0.count.total > 0 }) {
-                        TrafficTrendChart(days: days, height: 84)
+                        TrafficTrendChart(days: days, height: chartHeight)
                     } else {
                         Text("近 7 天暂无流量记录")
                             .font(.callout)
                             .foregroundStyle(.secondary)
-                            .frame(height: 84, alignment: .center)
+                            .frame(height: chartHeight, alignment: .center)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
