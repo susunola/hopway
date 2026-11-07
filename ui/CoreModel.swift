@@ -116,6 +116,7 @@ struct ProxyStatus: Decodable {
         let service: Bool?
         let device: String?
         let error: String?
+        let operation: String?
     }
 
     struct PolicyGroup: Decodable, Identifiable {
@@ -218,6 +219,7 @@ final class CoreModel: ObservableObject {
     @Published private(set) var verification: String?
     @Published private(set) var saving = false
     @Published private(set) var updatingPolicy = false
+    @Published private var requestedTUNOperation: String?
     @Published private(set) var trafficHistory: TrafficHistory?
     @Published private(set) var liveTraffic: TrafficRate?
     @Published private(set) var subscriptions: [SubscriptionSummary] = []
@@ -392,6 +394,7 @@ final class CoreModel: ObservableObject {
 
     private func stop() {
         phase = .stopping
+        requestedTUNOperation = nil
         polling?.cancel()
         polling = nil
         try? input?.close()
@@ -414,6 +417,7 @@ final class CoreModel: ObservableObject {
         statusReadAt = nil
         updateTrafficRate(nil)
         updatingPolicy = false
+        requestedTUNOperation = nil
         phase = .stopped
     }
 
@@ -564,33 +568,48 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    private var tunOperation: String? {
+        guard phase == .running else { return nil }
+        return requestedTUNOperation ?? (statusReadFailed ? nil : status?.tun?.operation)
+    }
+
+    var changingTUN: Bool { tunOperation != nil }
+
+    var tunProgress: String? {
+        switch tunOperation {
+        case "enable": status?.tun?.service == true ? "正在开启增强模式…" : "正在开启增强模式，如有系统弹窗请完成授权。"
+        case "disable": "正在关闭增强模式…"
+        case "install-helper": "正在安装 TUN 助手，请在系统弹窗中完成授权。"
+        case "remove-helper": "正在移除 TUN 助手，请在系统弹窗中完成授权。"
+        default: nil
+        }
+    }
+
     /// Turns on TUN mode (macOS asks for the administrator password) or off.
     func setTUN(_ enabled: Bool) {
-        guard let info = endpoint else { return }
-        message = enabled ? "正在开启增强模式，请在系统弹窗中输入管理员密码…" : nil
-        Task {
-            do {
-                struct Body: Encodable { let enabled: Bool }
-                _ = try await call(info, path: "tun", method: "PUT", body: JSONEncoder().encode(Body(enabled: enabled)))
-                await refresh(info)
-            } catch {
-                if endpoint?.token == info.token { message = "增强模式切换失败 · " + error.localizedDescription }
-            }
-        }
+        requestTUN(enabled ? "enable" : "disable", path: "tun", body: ["enabled": enabled])
     }
 
     /// Installs or removes the service that lets TUN start without a password.
     func setTUNService(_ installed: Bool) {
-        guard let info = endpoint else { return }
-        message = "请在系统弹窗中输入管理员密码…"
+        requestTUN(installed ? "install-helper" : "remove-helper", path: "tun-service", body: ["installed": installed])
+    }
+
+    private func requestTUN(_ operation: String, path: String, body: [String: Bool]) {
+        guard phase == .running, let info = endpoint, !changingTUN else { return }
+        requestedTUNOperation = operation
         Task {
+            defer {
+                if endpoint?.token == info.token { requestedTUNOperation = nil }
+            }
             do {
-                struct Body: Encodable { let installed: Bool }
-                _ = try await call(info, path: "tun-service", method: "PUT", body: JSONEncoder().encode(Body(installed: installed)))
-                message = nil
+                _ = try await call(info, path: path, method: "PUT", body: JSONEncoder().encode(body))
+                guard phase == .running, endpoint?.token == info.token else { return }
                 await refresh(info)
             } catch {
-                if endpoint?.token == info.token { message = "增强模式服务操作失败 · " + error.localizedDescription }
+                if phase == .running, endpoint?.token == info.token {
+                    message = "增强模式操作失败 · " + error.localizedDescription
+                }
             }
         }
     }

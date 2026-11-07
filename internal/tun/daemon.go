@@ -242,15 +242,25 @@ func UninstallService() error {
 }
 
 // RunAsAdmin runs this executable with args through the administrator prompt.
-func RunAsAdmin(executable, prompt string, args ...string) error {
+func RunAsAdmin(ctx context.Context, executable, prompt string, args ...string) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	command := "quoted form of " + appleString(executable)
 	for _, arg := range args {
 		command += ` & " " & quoted form of ` + appleString(arg)
 	}
 	script := fmt.Sprintf(`do shell script %s with administrator privileges with prompt %s`, command, appleString(prompt))
-	output, err := exec.Command("/usr/bin/osascript", "-e", script).CombinedOutput()
+	cmd := exec.CommandContext(ctx, "/usr/bin/osascript", "-e", script)
+	cmd.WaitDelay = time.Second
+	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		message := strings.TrimSpace(string(output))
+		if message == "" {
+			return err
+		}
 		if strings.Contains(message, "-128") {
 			message = "已取消授权"
 		}

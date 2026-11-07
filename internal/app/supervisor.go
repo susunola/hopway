@@ -50,6 +50,7 @@ type TUNStatus struct {
 	Service   bool   `json:"service"` // the password-free service is installed and answering
 	Device    string `json:"device,omitempty"`
 	Error     string `json:"error,omitempty"`
+	Operation string `json:"operation,omitempty"`
 }
 
 type Status struct {
@@ -92,11 +93,15 @@ type Supervisor struct {
 	recovered   bool
 	events      []netmon.Event
 
-	tunMu     sync.Mutex // serializes TUN changes; the helper prompt can take minutes
-	tunDevice *tun.Service
-	tunName   string
-	tunErr    string
+	tunMu        sync.Mutex // serializes TUN changes; the helper prompt can take minutes
+	tunDevice    *tun.Service
+	tunName      string
+	tunErr       string
+	tunOperation string
+	tunTask      sync.WaitGroup
 }
+
+var ErrTUNBusy = errors.New("正在处理另一项增强模式操作")
 
 // TUNSupported is true where HopWay can create the device: macOS through
 // the privileged helper, Linux when running as root.
@@ -190,24 +195,59 @@ func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
 		s.SetSystemProxy(true)
 	}
 	if t := s.loaded.Merged.TUN; t != nil && t.Enabled {
-		go s.SetTUN(true) // may wait for the user to enter a password
+		_ = s.StartTUNChange(true) // may wait for the user to enter a password
 	}
 	return nil
 }
 
-// SetTUN turns the TUN device on or off. On macOS without root this shows
+// StartTUNChange records the operation before acknowledging the request.
+func (s *Supervisor) StartTUNChange(enabled bool) error {
+	operation := "disable"
+	if enabled {
+		operation = "enable"
+	}
+	return s.startTUNOperation(operation, func() error { return s.setTUN(enabled) })
+}
+
+// StartTUNServiceChange asynchronously installs or removes the TUN helper.
+func (s *Supervisor) StartTUNServiceChange(installed bool) error {
+	operation := "remove-helper"
+	if installed {
+		operation = "install-helper"
+	}
+	return s.startTUNOperation(operation, func() error { return s.setTUNService(installed) })
+}
+
+func (s *Supervisor) startTUNOperation(operation string, apply func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing {
+		return net.ErrClosed
+	}
+	if s.tunOperation != "" {
+		return ErrTUNBusy
+	}
+	s.tunOperation, s.tunErr = operation, ""
+	s.tunTask.Add(1)
+	go func() {
+		defer s.tunTask.Done()
+		err := apply()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.tunOperation = ""
+		if err != nil && !s.closing {
+			s.tunErr = err.Error()
+		}
+	}()
+	return nil
+}
+
+// setTUN turns the TUN device on or off. On macOS without root this shows
 // the system's administrator password dialog once per start.
-func (s *Supervisor) SetTUN(enabled bool) error {
+func (s *Supervisor) setTUN(enabled bool) error {
 	s.tunMu.Lock()
 	defer s.tunMu.Unlock()
-	err := s.setTUNLocked(enabled)
-	s.mu.Lock()
-	s.tunErr = ""
-	if err != nil {
-		s.tunErr = err.Error()
-	}
-	s.mu.Unlock()
-	return err
+	return s.setTUNLocked(enabled)
 }
 
 func (s *Supervisor) setTUNLocked(enabled bool) error {
@@ -323,30 +363,21 @@ func serviceInstalled() bool {
 	return err == nil
 }
 
-// SetTUNService installs or removes the password-free TUN service. Either
+// setTUNService installs or removes the password-free TUN service. Either
 // way macOS asks for the administrator password once.
-func (s *Supervisor) SetTUNService(installed bool) error {
-	err := func() error {
-		if runtime.GOOS != "darwin" {
-			return errors.New("the TUN service is only used on macOS")
-		}
-		executable, err := os.Executable()
-		if err != nil {
-			return err
-		}
-		if installed {
-			return tun.RunAsAdmin(executable, "安装 HopWay 增强模式服务后，开启增强模式（TUN）时不再需要输入密码。",
-				"-tun-install", strconv.Itoa(os.Getuid()))
-		}
-		return tun.RunAsAdmin(executable, "卸载 HopWay 增强模式服务。", "-tun-uninstall")
-	}()
-	s.mu.Lock()
-	s.tunErr = ""
-	if err != nil {
-		s.tunErr = err.Error()
+func (s *Supervisor) setTUNService(installed bool) error {
+	if runtime.GOOS != "darwin" {
+		return errors.New("the TUN service is only used on macOS")
 	}
-	s.mu.Unlock()
-	return err
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if installed {
+		return tun.RunAsAdmin(s.ctx, executable, "安装 HopWay 增强模式服务后，开启增强模式（TUN）时不再需要输入密码。",
+			"-tun-install", strconv.Itoa(os.Getuid()))
+	}
+	return tun.RunAsAdmin(s.ctx, executable, "卸载 HopWay 增强模式服务。", "-tun-uninstall")
 }
 
 func (s *Supervisor) networkChanged(event netmon.Event) {
@@ -413,7 +444,8 @@ func (s *Supervisor) Close() {
 			}
 		}
 		s.proxyMu.Unlock()
-		if err := s.SetTUN(false); err != nil {
+		s.tunTask.Wait()
+		if err := s.setTUN(false); err != nil {
 			log.Printf("close TUN: %v", err)
 		}
 		if core := s.current.Load(); core != nil {
@@ -510,7 +542,7 @@ func (s *Supervisor) Status() Status {
 		Error: s.proxyErr, Recovered: s.recovered}
 	status.Network = append([]netmon.Event(nil), s.events...)
 	status.TUN = TUNStatus{Supported: TUNSupported, Enabled: s.tunDevice != nil, Device: s.tunName, Error: s.tunErr,
-		Service: runtime.GOOS == "darwin" && serviceInstalled()}
+		Service: runtime.GOOS == "darwin" && serviceInstalled(), Operation: s.tunOperation}
 	status.Reloaded = s.started.UnixMilli()
 	for _, sub := range s.loaded.User.Subscriptions {
 		entry := s.subMeta[sub.URL]

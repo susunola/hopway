@@ -127,7 +127,7 @@ private struct Dashboard: View {
                 .padding(.top, 26)
                 .padding(.bottom, page == .overview ? 0 : 26)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                if let message = core.message {
+                if let message = core.tunProgress ?? core.message {
                     Divider()
                     Label(message, systemImage: "info.circle")
                         .font(.callout)
@@ -484,12 +484,12 @@ private struct Dashboard: View {
                         .disabled(status.systemProxy?.supported != true || core.statusReadFailed)
                     Toggle("TUN 增强模式", isOn: Binding(
                         get: { status.tun?.enabled ?? false }, set: core.setTUN))
-                        .disabled(status.tun?.supported != true || core.statusReadFailed)
+                        .disabled(status.tun?.supported != true || core.statusReadFailed || core.changingTUN)
                     HStack {
                         Button(status.tun?.service == true ? "移除 TUN 助手" : "安装 TUN 助手") {
                             core.setTUNService(status.tun?.service != true)
                         }
-                        .disabled(status.tun?.supported != true || core.statusReadFailed)
+                        .disabled(status.tun?.supported != true || core.statusReadFailed || core.changingTUN)
                         if let device = status.tun?.device {
                             Text("设备 " + device).font(.caption).foregroundStyle(.secondary)
                         }

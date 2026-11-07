@@ -229,6 +229,51 @@ func TestSubscriptionRefreshDiscardsPreviousNetworkResponse(t *testing.T) {
 	}
 }
 
+func TestTUNOperationTracksCompletionAndStop(t *testing.T) {
+	s, err := Open("", t.TempDir(), backend.Native{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Start(sysproxy.Target{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range []error{nil, errors.New("已取消授权")} {
+		finish := make(chan error, 1)
+		if err := s.startTUNOperation("enable", func() error {
+			select {
+			case err := <-finish:
+				return err
+			case <-s.ctx.Done():
+				return s.ctx.Err()
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := s.Status().TUN; got.Operation != "enable" || got.Error != "" {
+			t.Fatalf("authorization wait was not reported as in progress: %+v", got)
+		}
+		if err := s.StartTUNServiceChange(true); !errors.Is(err, ErrTUNBusy) {
+			t.Fatalf("concurrent helper request was not refused: %v", err)
+		}
+		finish <- result
+		s.tunTask.Wait()
+		if got := s.Status().TUN; got.Operation != "" || (result == nil) != (got.Error == "") {
+			t.Fatalf("operation survived completion or hid authorization failure: %+v", got)
+		}
+	}
+	if err := s.startTUNOperation("install-helper", func() error {
+		<-s.ctx.Done()
+		return s.ctx.Err()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if got := s.Status().TUN; got.Operation != "" || got.Error != "" {
+		t.Fatalf("stopped core still reported an authorization operation: %+v", got)
+	}
+}
+
 func TestReloadRejectsBrokenConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")

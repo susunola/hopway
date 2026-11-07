@@ -29,7 +29,7 @@ func CreateDevice(Options) (int, string, error)                           { retu
 func OpenWithService(context.Context, string, bool) (int, string, error) {
 	return 0, "", errUnsupported
 }
-func ServiceAvailable(string) bool               { return false }
-func InstallService(string, uint32) error        { return errUnsupported }
-func UninstallService() error                    { return errUnsupported }
-func RunAsAdmin(string, string, ...string) error { return errUnsupported }
+func ServiceAvailable(string) bool                                { return false }
+func InstallService(string, uint32) error                         { return errUnsupported }
+func UninstallService() error                                     { return errUnsupported }
+func RunAsAdmin(context.Context, string, string, ...string) error { return errUnsupported }

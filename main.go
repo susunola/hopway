@@ -405,7 +405,10 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
-		go supervisor.SetTUN(body.Enabled)
+		if err := supervisor.StartTUNChange(body.Enabled); err != nil {
+			http.Error(writer, err.Error(), http.StatusConflict)
+			return
+		}
 		writer.WriteHeader(http.StatusAccepted)
 	})
 	router.HandleFunc("PUT /tun-service", func(writer http.ResponseWriter, request *http.Request) {
@@ -418,7 +421,10 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
-		go supervisor.SetTUNService(body.Installed) // waits on the password dialog
+		if err := supervisor.StartTUNServiceChange(body.Installed); err != nil {
+			http.Error(writer, err.Error(), http.StatusConflict)
+			return
+		}
 		writer.WriteHeader(http.StatusAccepted)
 	})
 	router.HandleFunc("PUT /system-proxy", func(writer http.ResponseWriter, request *http.Request) {
