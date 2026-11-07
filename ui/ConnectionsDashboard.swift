@@ -141,6 +141,9 @@ struct ConnectionsDashboard: View {
             Text("\(row.inboundLabel) · \(row.rule) · " + row.routeLabel)
                 .lineLimit(1)
                 .help(row.routeLabel)
+            if let source = row.targetSourceLabel {
+                Text("目标来源 · " + source).font(.caption).foregroundStyle(.secondary)
+            }
             let context = [row.process.map { "应用 \($0)" }, row.server.map { "服务器 \($0)" },
                            row.start.map { Date(timeIntervalSince1970: $0 / 1000).formatted(date: .omitted, time: .standard) }]
                 .compactMap { $0 }.joined(separator: " · ")

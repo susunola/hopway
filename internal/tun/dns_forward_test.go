@@ -99,7 +99,7 @@ func TestDNSForwardingRetriesTruncatedAndOversizeUDP(t *testing.T) {
 			defer cancel()
 			query := dnsTestQuery(t, 8192)
 			dialer := net.Dialer{}
-			data, err := forwardDNS(ctx, query, server, dialer.DialContext)
+			data, err := forwardDNS(ctx, query, server, dialer.DialContext, dnsTimeout)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -152,12 +152,12 @@ func TestDNSForwardingIgnoresInvalidUDPAndHandlesNextQuery(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	if _, err := forwardDNS(ctx, query, server, dial); err == nil {
+	if _, err := forwardDNS(ctx, query, server, dial, dnsTimeout); err == nil {
 		t.Fatal("invalid oversized datagram was accepted")
 	}
 	next, stop := context.WithTimeout(context.Background(), time.Second)
 	defer stop()
-	data, err := forwardDNS(next, query, server, dial)
+	data, err := forwardDNS(next, query, server, dial, dnsTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestDNSSocketCancellationInterruptsRead(t *testing.T) {
 	finished := make(chan error, 1)
 	go func() {
 		dialer := net.Dialer{}
-		_, err := forwardDNS(ctx, query, server, dialer.DialContext)
+		_, err := forwardDNS(ctx, query, server, dialer.DialContext, dnsTimeout)
 		finished <- err
 	}()
 	select {

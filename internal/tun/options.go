@@ -8,19 +8,29 @@ import (
 )
 
 const DefaultMTU = 9000
+const dnsTimeout = 5 * time.Second
+
+type DNSSettings struct {
+	TimeoutMS       int  `json:"timeoutMs"`
+	ExceptionCount  int  `json:"exceptionCount"`
+	SniffingEnabled bool `json:"sniffingEnabled"`
+}
 
 type Options struct {
-	FD             int // a device opened by the privileged helper; 0 creates one (needs root)
-	Name           string
-	MTU            uint32
-	Address        netip.Prefix // the device's own address
-	AutoRoute      bool
-	RouteAddress   []netip.Prefix // limits auto-route to these ranges (default: everything)
-	FakeRange      netip.Prefix
-	UpstreamDNS    []string // host:port servers for HopWay's own lookups and forwarded queries
-	LocalDNS       []string // system resolvers, before adding public fallback servers
-	IPv6           bool     // give the device an IPv6 address, route ::/0 and answer AAAA with fake IPv6
-	UDPIdleTimeout time.Duration
+	FD               int // a device opened by the privileged helper; 0 creates one (needs root)
+	Name             string
+	MTU              uint32
+	Address          netip.Prefix // the device's own address
+	AutoRoute        bool
+	RouteAddress     []netip.Prefix // limits auto-route to these ranges (default: everything)
+	FakeRange        netip.Prefix
+	UpstreamDNS      []string // host:port servers for HopWay's own lookups and forwarded queries
+	LocalDNS         []string // system resolvers, before adding public fallback servers
+	IPv6             bool     // give the device an IPv6 address, route ::/0 and answer AAAA with fake IPv6
+	UDPIdleTimeout   time.Duration
+	FakeIPExceptions []string
+	DNSTimeoutMS     int
+	DisableSniffing  bool
 }
 
 var defaultAddress6 = netip.MustParsePrefix("fdfe:dcba:9876::1/126")
@@ -35,6 +45,13 @@ func (o *Options) defaults() {
 	if !o.FakeRange.IsValid() {
 		o.FakeRange = DefaultFakeRange
 	}
+}
+
+func (o Options) dnsForwardTimeout() time.Duration {
+	if o.DNSTimeoutMS == 0 {
+		return dnsTimeout
+	}
+	return time.Duration(o.DNSTimeoutMS) * time.Millisecond
 }
 
 // Dial and Decide connect the device to the engine.

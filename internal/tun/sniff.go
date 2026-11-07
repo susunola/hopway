@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"mac-proxy/internal/peer"
 	"mac-proxy/internal/wire"
 )
 
@@ -17,35 +18,38 @@ const sniffWait = 300 * time.Millisecond
 // server name from a TLS ClientHello or an HTTP Host header. The returned
 // connection replays the peeked bytes. Protocols where the server speaks
 // first simply time out after sniffWait and keep going unsniffed.
-func sniff(conn net.Conn) (string, *wire.BufferedConn) {
+func sniff(conn net.Conn) (string, peer.TargetSource, *wire.BufferedConn) {
 	reader := bufio.NewReaderSize(conn, 16<<10)
 	replay := &wire.BufferedConn{Conn: conn, Reader: reader}
 	conn.SetReadDeadline(time.Now().Add(sniffWait))
 	defer conn.SetReadDeadline(time.Time{})
 	head, err := reader.Peek(5)
 	if err != nil {
-		return "", replay
+		return "", peer.TargetIP, replay
 	}
 	if head[0] == 0x16 && head[1] == 3 { // TLS handshake record
 		length := int(binary.BigEndian.Uint16(head[3:5]))
 		record, err := reader.Peek(5 + min(length, reader.Size()-5))
 		if err != nil && len(record) < 5 {
-			return "", replay
+			return "", peer.TargetIP, replay
 		}
-		return serverName(record[5:]), replay
+		if name := serverName(record[5:]); name != "" {
+			return name, peer.TargetTLSSNI, replay
+		}
+		return "", peer.TargetIP, replay
 	}
 	if isHTTPMethod(head) {
 		for size := 512; size <= reader.Size(); size *= 2 {
 			data, _ := reader.Peek(min(size, reader.Buffered()+reader.Size()))
 			if host := httpHost(data); host != "" {
-				return host, replay
+				return host, peer.TargetHTTPHost, replay
 			}
 			if bytes.Contains(data, []byte("\r\n\r\n")) || len(data) < size {
 				break
 			}
 		}
 	}
-	return "", replay
+	return "", peer.TargetIP, replay
 }
 
 func isHTTPMethod(head []byte) bool {

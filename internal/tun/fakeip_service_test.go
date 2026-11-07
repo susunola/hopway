@@ -4,6 +4,9 @@ package tun
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"sync/atomic"
@@ -15,7 +18,78 @@ import (
 
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
+	"mac-proxy/internal/outbound"
+	"mac-proxy/internal/peer"
 )
+
+func TestTUNConnectionRecordsTargetSource(t *testing.T) {
+	const domain = "target.example"
+	const address = "203.0.113.1:443"
+	for _, tc := range []struct {
+		name       string
+		disable    bool
+		fake       bool
+		write      func(net.Conn)
+		wantSource peer.TargetSource
+	}{
+		{name: "HTTP Host", write: func(c net.Conn) {
+			_, _ = io.WriteString(c, "GET / HTTP/1.1\r\nHost: "+domain+"\r\n\r\n")
+		}, wantSource: peer.TargetHTTPHost},
+		{name: "TLS SNI", write: func(c net.Conn) {
+			_ = tls.Client(c, &tls.Config{ServerName: domain}).Handshake()
+		}, wantSource: peer.TargetTLSSNI},
+		{name: "disabled without client data", disable: true, wantSource: peer.TargetIP},
+		{name: "DNS mapping with sniffing disabled", disable: true, fake: true, wantSource: peer.TargetFakeIP},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := engine.Default()
+			config.Rules = []engine.Rule{
+				{Type: engine.RuleDomain, Value: domain, Via: "REJECT"},
+				{Type: engine.RuleMatch, Via: "REJECT"},
+			}
+			core, err := engine.New(config, backend.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer core.Close()
+			service := &Service{options: Options{DisableSniffing: tc.disable}, fake: NewFakeIP(testFakeRange), dial: core.Dial}
+			destination := M.ParseSocksaddr(address)
+			if tc.fake {
+				destination.Addr = service.fake.Allocate(domain)
+			}
+			client, ingress := net.Pipe()
+			defer client.Close()
+			defer ingress.Close()
+			finished := make(chan error, 1)
+			if tc.write != nil {
+				go tc.write(client)
+			}
+			go service.NewConnectionEx(context.Background(), ingress, M.ParseSocksaddr("127.0.0.1:12345"),
+				destination, func(err error) { finished <- err })
+			// Disabled flows reach the rule engine without waiting for a client hello.
+			timeout := time.Second
+			if tc.disable {
+				timeout = 250 * time.Millisecond
+			}
+			select {
+			case err := <-finished:
+				if !errors.Is(err, outbound.ErrRejected) {
+					t.Fatalf("expected rule rejection, got %v", err)
+				}
+			case <-time.After(timeout):
+				t.Fatal("TUN flow did not reach the rule engine")
+			}
+			wantTarget := domain + ":443"
+			if tc.wantSource == peer.TargetIP {
+				wantTarget = address
+			}
+			records := core.Status().Connections
+			if len(records) != 1 || records[0].TargetSource != tc.wantSource || records[0].Target != wantTarget {
+				t.Fatalf("unexpected connection record: %+v", records)
+			}
+		})
+	}
+}
 
 func TestFakeIPLeaseHeldByTCPAndUDPHandlers(t *testing.T) {
 	for _, network := range []string{"tcp", "udp"} {

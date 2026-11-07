@@ -9,10 +9,20 @@ import (
 )
 
 type Addrs struct {
-	Client netip.AddrPort // the application's socket
-	Server netip.AddrPort // what it connected to (HopWay's listener, or the real target under TUN)
-	Local  bool           // the client is a process on this machine
+	Client       netip.AddrPort // the application's socket
+	Server       netip.AddrPort // what it connected to (HopWay's listener, or the real target under TUN)
+	Local        bool           // the client is a process on this machine
+	TargetSource TargetSource   // how TUN obtained the routing target
 }
+
+type TargetSource string
+
+const (
+	TargetFakeIP   TargetSource = "fake-ip"
+	TargetTLSSNI   TargetSource = "tls-sni"
+	TargetHTTPHost TargetSource = "http-host"
+	TargetIP       TargetSource = "ip"
+)
 
 type key struct{}
 

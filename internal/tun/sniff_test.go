@@ -10,34 +10,36 @@ import (
 
 	"context"
 	"github.com/miekg/dns"
+
+	"mac-proxy/internal/peer"
 )
 
-func pipeSniff(t *testing.T, write func(net.Conn)) (string, []byte) {
+func pipeSniff(t *testing.T, write func(net.Conn)) (string, peer.TargetSource, []byte) {
 	client, server := net.Pipe()
 	go write(client)
-	name, replay := sniff(server)
+	name, source, replay := sniff(server)
 	replay.SetReadDeadline(time.Now().Add(time.Second))
 	data := make([]byte, 5)
 	io.ReadFull(replay, data)
 	client.Close()
-	return name, data
+	return name, source, data
 }
 
 func TestSniffTLSAndHTTP(t *testing.T) {
-	name, data := pipeSniff(t, func(c net.Conn) {
+	name, source, data := pipeSniff(t, func(c net.Conn) {
 		tls.Client(c, &tls.Config{ServerName: "WWW.Example.Test", InsecureSkipVerify: true}).Handshake()
 	})
-	if name != "www.example.test" || data[0] != 0x16 {
+	if name != "www.example.test" || source != peer.TargetTLSSNI || data[0] != 0x16 {
 		t.Fatalf("tls: %q %x", name, data)
 	}
-	name, data = pipeSniff(t, func(c net.Conn) {
+	name, source, data = pipeSniff(t, func(c net.Conn) {
 		c.Write([]byte("GET / HTTP/1.1\r\nUser-Agent: x\r\nHost: api.example.test:8080\r\n\r\n"))
 	})
-	if name != "api.example.test" || string(data) != "GET /" {
+	if name != "api.example.test" || source != peer.TargetHTTPHost || string(data) != "GET /" {
 		t.Fatalf("http: %q %q", name, data)
 	}
-	name, _ = pipeSniff(t, func(c net.Conn) { time.Sleep(sniffWait + 100*time.Millisecond); c.Write([]byte("hello")) })
-	if name != "" {
+	name, source, _ = pipeSniff(t, func(c net.Conn) { time.Sleep(sniffWait + 100*time.Millisecond); c.Write([]byte("hello")) })
+	if name != "" || source != peer.TargetIP {
 		t.Fatalf("server-first protocol sniffed as %q", name)
 	}
 }
@@ -60,7 +62,7 @@ func TestFakeIPAndDNS(t *testing.T) {
 	query.SetQuestion("site.test.", dns.TypeA)
 	payload, _ := query.Pack()
 	fake = NewFakeIP(DefaultFakeRange)
-	reply, err := answerDNS(context.Background(), payload, fake, nil)
+	reply, err := answerDNS(context.Background(), payload, fake, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +74,7 @@ func TestFakeIPAndDNS(t *testing.T) {
 	}
 	query.SetQuestion("site.test.", dns.TypeAAAA)
 	payload, _ = query.Pack()
-	reply, _ = answerDNS(context.Background(), payload, fake, nil)
+	reply, _ = answerDNS(context.Background(), payload, fake, nil, nil)
 	msg.Unpack(reply)
 	if len(msg.Answer) != 0 || msg.Rcode != dns.RcodeSuccess {
 		t.Fatal("AAAA must be answered empty")
@@ -80,7 +82,7 @@ func TestFakeIPAndDNS(t *testing.T) {
 	forwarded := false
 	query.SetQuestion("printer.local.", dns.TypeA)
 	payload, _ = query.Pack()
-	answerDNS(context.Background(), payload, fake, func(context.Context, []byte) ([]byte, error) { forwarded = true; return nil, nil })
+	answerDNS(context.Background(), payload, fake, nil, func(context.Context, []byte, bool) ([]byte, error) { forwarded = true; return nil, nil })
 	if !forwarded {
 		t.Fatal(".local names must go to the real resolver")
 	}
@@ -105,7 +107,7 @@ func TestFakeIPv6(t *testing.T) {
 	query := new(dns.Msg)
 	query.SetQuestion("six.test.", dns.TypeAAAA)
 	payload, _ := query.Pack()
-	reply, _ := answerDNS(context.Background(), payload, fake, nil)
+	reply, _ := answerDNS(context.Background(), payload, fake, nil, nil)
 	var msg dns.Msg
 	msg.Unpack(reply)
 	if len(msg.Answer) != 1 {

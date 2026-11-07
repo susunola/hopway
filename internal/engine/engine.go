@@ -59,9 +59,12 @@ type Config struct {
 }
 
 type TUNConfig struct {
-	Enabled bool   `json:"enabled"`
-	MTU     uint32 `json:"mtu,omitempty"`
-	IPv6    bool   `json:"ipv6,omitempty"` // capture IPv6 too (fake IPv6 answers, ::/0 route)
+	Enabled          bool     `json:"enabled"`
+	MTU              uint32   `json:"mtu,omitempty"`
+	IPv6             bool     `json:"ipv6,omitempty"` // capture IPv6 too (fake IPv6 answers, ::/0 route)
+	FakeIPExceptions []string `json:"fakeIPExceptions,omitempty"`
+	DNSTimeoutMS     int      `json:"dnsTimeoutMs,omitempty"`
+	DisableSniffing  bool     `json:"disableSniffing,omitempty"`
 }
 
 // InboundConfig controls the local listeners. Zero uses the listener default.
@@ -161,32 +164,33 @@ type GroupStatus struct {
 
 // Record describes one connection. Timings are milliseconds.
 type Record struct {
-	ID              uint64        `json:"id"`
-	Start           int64         `json:"start"`
-	Inbound         string        `json:"inbound"`
-	Target          string        `json:"target"`
-	Via             string        `json:"via"`
-	Route           []string      `json:"route,omitempty"`
-	Rule            string        `json:"rule"`
-	State           string        `json:"state"`
-	Sent            uint64        `json:"sent"`
-	Recv            uint64        `json:"received"`
-	Error           string        `json:"error,omitempty"`
-	Stage           string        `json:"stage,omitempty"`
-	FailureCode     string        `json:"failureCode,omitempty"`
-	Failures        []DialFailure `json:"failures,omitempty"`
-	Server          string        `json:"server,omitempty"`
-	Shared          bool          `json:"shared,omitempty"`      // rode a multiplexed session, no socket of its own
-	Network         string        `json:"network,omitempty"`     // "udp" for datagram sessions
-	Process         string        `json:"process,omitempty"`     // app or executable name
-	ProcessPath     string        `json:"processPath,omitempty"` // executable path
-	ProcessBundleID string        `json:"processBundleId,omitempty"`
-	PID             uint32        `json:"pid,omitempty"`
-	Attempts        int           `json:"attempts,omitempty"`
-	DNSMs           int64         `json:"dnsMs,omitempty"`
-	ConnectMs       int64         `json:"connectMs,omitempty"`
-	HandshakeMs     int64         `json:"handshakeMs,omitempty"`
-	FirstByteMs     int64         `json:"firstByteMs,omitempty"`
+	ID              uint64            `json:"id"`
+	Start           int64             `json:"start"`
+	Inbound         string            `json:"inbound"`
+	Target          string            `json:"target"`
+	TargetSource    peer.TargetSource `json:"targetSource,omitempty"`
+	Via             string            `json:"via"`
+	Route           []string          `json:"route,omitempty"`
+	Rule            string            `json:"rule"`
+	State           string            `json:"state"`
+	Sent            uint64            `json:"sent"`
+	Recv            uint64            `json:"received"`
+	Error           string            `json:"error,omitempty"`
+	Stage           string            `json:"stage,omitempty"`
+	FailureCode     string            `json:"failureCode,omitempty"`
+	Failures        []DialFailure     `json:"failures,omitempty"`
+	Server          string            `json:"server,omitempty"`
+	Shared          bool              `json:"shared,omitempty"`      // rode a multiplexed session, no socket of its own
+	Network         string            `json:"network,omitempty"`     // "udp" for datagram sessions
+	Process         string            `json:"process,omitempty"`     // app or executable name
+	ProcessPath     string            `json:"processPath,omitempty"` // executable path
+	ProcessBundleID string            `json:"processBundleId,omitempty"`
+	PID             uint32            `json:"pid,omitempty"`
+	Attempts        int               `json:"attempts,omitempty"`
+	DNSMs           int64             `json:"dnsMs,omitempty"`
+	ConnectMs       int64             `json:"connectMs,omitempty"`
+	HandshakeMs     int64             `json:"handshakeMs,omitempty"`
+	FirstByteMs     int64             `json:"firstByteMs,omitempty"`
 }
 
 type Status struct {
@@ -294,6 +298,12 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 	}
 	if config.TUN != nil {
 		if err := wire.ValidateTUNMTU(config.TUN.MTU, config.TUN.IPv6); err != nil {
+			return nil, err
+		}
+		if err := wire.ValidateTUNDNSTimeout(config.TUN.DNSTimeoutMS); err != nil {
+			return nil, err
+		}
+		if _, err := wire.ParseFakeIPExceptions(config.TUN.FakeIPExceptions); err != nil {
 			return nil, err
 		}
 	}
@@ -742,6 +752,7 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	// outside the lock. The process is looked up here only if a process rule
 	// could decide the route; otherwise later, off the connection's path.
 	addrs, local := peer.From(ctx)
+	record.TargetSource = addrs.TargetSource
 	local = local && addrs.Local
 	var owner *process.Owner
 	looked := false
@@ -912,6 +923,7 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 		return nil, err
 	}
 	addrs, local := peer.From(ctx)
+	record.TargetSource = addrs.TargetSource
 	local = local && addrs.Local
 	var owner *process.Owner
 	looked := false

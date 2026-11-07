@@ -54,6 +54,7 @@ type TUNStatus struct {
 	Error     string           `json:"error,omitempty"`
 	Operation string           `json:"operation,omitempty"`
 	FakeIP    *tun.FakeIPStats `json:"fakeIP,omitempty"`
+	DNS       *tun.DNSSettings `json:"dns,omitempty"`
 }
 
 type Status struct {
@@ -317,6 +318,9 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 	options := tun.Options{UDPIdleTimeout: idle}
 	if t != nil {
 		options.MTU, options.IPv6 = t.MTU, t.IPv6
+		options.FakeIPExceptions = t.FakeIPExceptions
+		options.DNSTimeoutMS = t.DNSTimeoutMS
+		options.DisableSniffing = t.DisableSniffing
 	}
 	if err := options.CheckFakeIPNetworks(); err != nil {
 		return err
@@ -644,6 +648,8 @@ func (s *Supervisor) status(includeConnections bool) Status {
 	if s.tunDevice != nil {
 		fakeIP := s.tunDevice.FakeIPStats()
 		status.TUN.FakeIP = &fakeIP
+		dns := s.tunDevice.DNSSettings()
+		status.TUN.DNS = &dns
 	}
 	status.Reloaded = s.started.UnixMilli()
 	for _, sub := range s.loaded.User.Subscriptions {

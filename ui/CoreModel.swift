@@ -101,6 +101,7 @@ struct ProxyStatus: Decodable, Equatable {
         let start: Double?
         let inbound: String
         let target: String
+        let targetSource: String?
         let via: String
         let rule: String
         let state: String
@@ -125,6 +126,16 @@ struct ProxyStatus: Decodable, Equatable {
 
         var routeLabel: String { ((route ?? []) + [via]).joined(separator: " → ") }
 
+        var targetSourceLabel: String? {
+            switch targetSource {
+            case "fake-ip": "DNS 映射（Fake IP）"
+            case "tls-sni": "TLS SNI"
+            case "http-host": "HTTP Host"
+            case "ip": "原始 IP"
+            default: nil
+            }
+        }
+
         var failureStage: String? { DialDiagnostic.stage(stage) }
         var failureMessage: String? { DialDiagnostic.message(failureCode, fallback: error) }
 
@@ -137,6 +148,7 @@ struct ProxyStatus: Decodable, Equatable {
         var diagnosis: String {
             let lines = [failureMessage, failureStage.map { "失败阶段 · " + $0 },
                          processPath.map { "应用 · " + $0 }, processBundleId.map { "应用标识 · " + $0 }, "路径 · " + routeLabel,
+                         targetSourceLabel.map { "目标来源 · " + $0 },
                          server.map { "服务器 · " + $0 }, timingLabel.isEmpty ? nil : timingLabel]
             return (lines.compactMap { $0 } + (failures ?? []).map(\.label)).joined(separator: "\n")
         }
@@ -173,6 +185,12 @@ struct ProxyStatus: Decodable, Equatable {
     }
 
     struct TUN: Decodable, Equatable {
+        struct DNS: Decodable, Equatable {
+            let timeoutMs: Int
+            let exceptionCount: Int
+            let sniffingEnabled: Bool
+        }
+
         let supported: Bool
         let enabled: Bool
         let service: Bool?
@@ -180,6 +198,7 @@ struct ProxyStatus: Decodable, Equatable {
         let error: String?
         let operation: String?
         let fakeIP: FakeIP?
+        let dns: DNS?
     }
 
     struct PolicyGroup: Decodable, Equatable, Identifiable {

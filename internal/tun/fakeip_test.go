@@ -129,7 +129,7 @@ func fakeDNSResponse(t *testing.T, query *dns.Msg, fake *FakeIP) *dns.Msg {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err = answerDNS(context.Background(), data, fake, func(context.Context, []byte) ([]byte, error) {
+	data, err = answerDNS(context.Background(), data, fake, nil, func(context.Context, []byte, bool) ([]byte, error) {
 		t.Fatalf("synthetic query leaked to upstream: %v", query.Question)
 		return nil, nil
 	})

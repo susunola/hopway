@@ -49,6 +49,7 @@ type Service struct {
 	cancelDNS      context.CancelFunc
 	dnsUDP         chan struct{}
 	dnsTCP         chan struct{}
+	exceptions     wire.FakeIPExceptions
 }
 
 const tunUDPIdle = 5 * time.Minute
@@ -71,6 +72,13 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 	if err := wire.ValidateTUNMTU(options.MTU, options.IPv6); err != nil {
 		return nil, err
 	}
+	if err := wire.ValidateTUNDNSTimeout(options.DNSTimeoutMS); err != nil {
+		return nil, err
+	}
+	exceptions, err := wire.ParseFakeIPExceptions(options.FakeIPExceptions)
+	if err != nil {
+		return nil, err
+	}
 	var existingInterface string
 	if fd > 0 {
 		if err := verifyDevice(fd, options.Name); err != nil {
@@ -81,7 +89,8 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 	if err := options.checkFakeIPNetworks(existingInterface); err != nil {
 		return nil, err
 	}
-	s := &Service{options: options, fake: NewFakeIP(options.FakeRange), dial: dial, dialPacket: dialPacket}
+	s := &Service{options: options, fake: NewFakeIP(options.FakeRange), dial: dial, dialPacket: dialPacket,
+		exceptions: exceptions}
 	if options.IPv6 {
 		s.fake.EnableIPv6(DefaultFakeRange6)
 	}
@@ -89,7 +98,6 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 	s.dnsCtx, s.cancelDNS = context.WithCancel(s.ctx)
 	s.dnsUDP, s.dnsTCP = make(chan struct{}, 64), make(chan struct{}, 32)
 	finder := control.NewDefaultInterfaceFinder()
-	var err error
 	fail := func(err error) (*Service, error) {
 		return nil, errors.Join(err, s.Close())
 	}
@@ -221,18 +229,18 @@ func (s *Service) replyDNS(ctx context.Context, payload []byte, destination M.So
 			server = upstreams[0]
 		}
 	}
-	reply, err := answerDNS(ctx, payload, s.fake, func(ctx context.Context, query []byte) ([]byte, error) {
+	reply, err := answerDNS(ctx, payload, s.fake, s.exceptions, func(ctx context.Context, query []byte, local bool) ([]byte, error) {
 		upstream := server
-		if isLocalReverseDNS(query) {
+		if local {
 			if len(s.options.LocalDNS) == 0 {
-				return nil, errors.New("no local DNS server for reverse lookup")
+				return nil, errors.New("no local DNS server for private lookup")
 			}
 			upstream = s.options.LocalDNS[0]
 		}
 		if upstream == "" {
 			return nil, errors.New("no upstream DNS server")
 		}
-		return forwardDNS(ctx, query, upstream, backend.BoundDial)
+		return forwardDNS(ctx, query, upstream, backend.BoundDial, s.options.dnsForwardTimeout())
 	})
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -324,6 +332,14 @@ func (s *Service) FakeIPStats() FakeIPStats {
 	return s.fake.Stats()
 }
 
+func (s *Service) DNSSettings() DNSSettings {
+	return DNSSettings{
+		TimeoutMS:       int(s.options.dnsForwardTimeout().Milliseconds()),
+		ExceptionCount:  len(s.exceptions),
+		SniffingEnabled: !s.options.DisableSniffing,
+	}
+}
+
 // done calls onClose, which the stack may leave nil.
 func done(onClose N.CloseHandlerFunc, err error) {
 	if onClose != nil {
@@ -347,20 +363,27 @@ func (s *Service) NewConnectionEx(ctx context.Context, conn net.Conn, source, de
 	if release != nil {
 		defer release()
 	}
+	var targetSource peer.TargetSource
+	if release != nil {
+		targetSource = peer.TargetFakeIP
+	} else if destination.IsIP() {
+		targetSource = peer.TargetIP
+	}
 	var reader *bufio.Reader
-	if destination.IsIP() && release == nil {
+	if targetSource == peer.TargetIP && !s.options.DisableSniffing {
 		// An application that connects to an IP directly may still say
 		// which site it wants in its TLS ClientHello or HTTP Host header.
-		name, replay := sniff(conn)
+		name, sniffedSource, replay := sniff(conn)
 		reader = replay.Reader
 		if name != "" {
 			target = net.JoinHostPort(name, strconv.Itoa(int(destination.Port)))
+			targetSource = sniffedSource
 		}
 	}
 	if reader == nil {
 		reader = bufio.NewReader(conn)
 	}
-	ctx = peer.WithAddrs(ctx, peer.Addrs{Client: source.AddrPort(), Server: destination.AddrPort(), Local: true})
+	ctx = peer.WithAddrs(ctx, peer.Addrs{Client: source.AddrPort(), Server: destination.AddrPort(), Local: true, TargetSource: targetSource})
 	upstream, err := wire.DialWithClient(ctx, conn, reader, func(ctx context.Context) (net.Conn, error) {
 		return s.dial(ctx, "TUN", target)
 	})
@@ -386,10 +409,14 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		done(onClose, err)
 		return
 	}
+	var targetSource peer.TargetSource
 	if release != nil {
 		defer release()
+		targetSource = peer.TargetFakeIP
+	} else if destination.IsIP() {
+		targetSource = peer.TargetIP
 	}
-	ctx = peer.WithAddrs(ctx, peer.Addrs{Client: source.AddrPort(), Server: destination.AddrPort(), Local: true})
+	ctx = peer.WithAddrs(ctx, peer.Addrs{Client: source.AddrPort(), Server: destination.AddrPort(), Local: true, TargetSource: targetSource})
 	remote, err := s.dialPacket(ctx, "TUN", target)
 	if err != nil {
 		upstreamFailure := ctx.Err() == nil && !errors.Is(err, net.ErrClosed)

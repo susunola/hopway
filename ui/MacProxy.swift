@@ -254,6 +254,7 @@ private struct Dashboard: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(destination.title)
                 .accessibilityAddTraits(page == destination ? .isSelected : [])
             }
 
@@ -462,7 +463,7 @@ private struct Dashboard: View {
     private var configuration: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                HopPageHeading(title: "设置", detail: "接入方式、监听端口和内核配置。")
+                HopPageHeading(title: "设置", detail: "管理接入、DNS、测速和订阅刷新。")
                 accessSettings
                 AdvancedSettingsPanel(core: core, draft: $advancedDraft) { showsConfigurationEditor = true }
                 coreSettings
@@ -578,6 +579,27 @@ private struct Dashboard: View {
                 }
                 if let retirement = core.status?.retirement {
                     LabeledContent("旧内核回收", value: "处理中 \(retirement.pending) · 强制关闭 \(retirement.forced) · 清理超时 \(retirement.slow)")
+                }
+                if let resources = core.status?.resources, core.phase == .running, !core.statusReadFailed {
+                    DisclosureGroup("连接资源") {
+                        VStack(alignment: .leading, spacing: 5) {
+                            if let used = resources.connections, let limit = resources.connectionLimit {
+                                LabeledContent("活动连接额度", value: "\(used) / \(limit) · 拒绝 \(resources.connectionsRefused ?? 0) 次")
+                            }
+                            LabeledContent("UDP 会话", value: "\(resources.udpSessions) / \(resources.udpSessionLimit)")
+                            LabeledContent("UDP 正在建连", value: "\(resources.udpOpening) / \(resources.udpOpenLimit)")
+                            LabeledContent("每端点并发拨号上限", value: resources.endpointDialLimit.formatted())
+                            if let idle = resources.udpIdleTimeoutSec {
+                                LabeledContent("UDP 空闲回收", value: "\(idle) 秒")
+                            }
+                            if let queued = resources.udpQueuedBytes, let limit = resources.udpQueueLimitBytes {
+                                LabeledContent("UDP 暂存", value: "\(queued.formatted(.byteCount(style: .memory))) / \(limit.formatted(.byteCount(style: .memory)))")
+                            }
+                        }
+                        .font(.caption)
+                        .monospacedDigit()
+                        .padding(.top, 5)
+                    }
                 }
                 if let notice = core.configurationNotice, core.phase == .running {
                     Label(notice, systemImage: "clock").foregroundStyle(.orange)

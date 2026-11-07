@@ -13,13 +13,16 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"mac-proxy/internal/wire"
 )
 
 // answerDNS builds the reply to a query hijacked from the TUN device.
 // A records get fake IPs; AAAA gets a fake IPv6 address when IPv6 is on,
 // otherwise an empty answer so applications use IPv4; anything else is forwarded upstream through a
 // socket bound to the physical interface (never back into the TUN).
-func answerDNS(ctx context.Context, payload []byte, fake *FakeIP, forward func(context.Context, []byte) ([]byte, error)) ([]byte, error) {
+func answerDNS(ctx context.Context, payload []byte, fake *FakeIP, exceptions wire.FakeIPExceptions,
+	forward func(context.Context, []byte, bool) ([]byte, error)) ([]byte, error) {
 	var query dns.Msg
 	if err := query.Unpack(payload); err != nil {
 		return nil, err
@@ -28,11 +31,11 @@ func answerDNS(ctx context.Context, payload []byte, fake *FakeIP, forward func(c
 		return nil, errDNSResponse
 	}
 	if query.Opcode != dns.OpcodeQuery || len(query.Question) != 1 {
-		return forward(ctx, payload)
+		return forward(ctx, payload, false)
 	}
 	question := query.Question[0]
 	if question.Qclass != dns.ClassINET {
-		return forward(ctx, payload)
+		return forward(ctx, payload, false)
 	}
 	reply := new(dns.Msg).SetReply(&query)
 	reply.RecursionAvailable = true
@@ -40,7 +43,8 @@ func answerDNS(ctx context.Context, payload []byte, fake *FakeIP, forward func(c
 	case dns.TypePTR:
 		address := reverseDNSAddress(question.Name)
 		if !fake.Contains(address) {
-			return forward(ctx, payload)
+			local := address.IsPrivate() || address.IsLoopback() || address.IsLinkLocalUnicast() || address.IsUnspecified()
+			return forward(ctx, payload, local)
 		}
 		name, found := fake.Lookup(address)
 		if !found {
@@ -52,8 +56,11 @@ func answerDNS(ctx context.Context, payload []byte, fake *FakeIP, forward func(c
 			}}
 		}
 	case dns.TypeA, dns.TypeAAAA:
+		if exceptions.Contains(question.Name) {
+			return forward(ctx, payload, true)
+		}
 		if isLocalName(question.Name) {
-			return forward(ctx, payload)
+			return forward(ctx, payload, false)
 		}
 		name := strings.TrimSuffix(question.Name, ".")
 		if _, err := netip.ParseAddr(name); err == nil || name == "" || strings.ContainsAny(name, "/\\: *") {
@@ -80,7 +87,7 @@ func answerDNS(ctx context.Context, payload []byte, fake *FakeIP, forward func(c
 			}
 		}
 	default:
-		return forward(ctx, payload)
+		return forward(ctx, payload, false)
 	}
 	return reply.Pack()
 }
@@ -111,16 +118,6 @@ func reverseDNSAddress(name string) netip.Addr {
 	return netip.Addr{}
 }
 
-func isLocalReverseDNS(payload []byte) bool {
-	var query dns.Msg
-	if err := query.Unpack(payload); err != nil || query.Opcode != dns.OpcodeQuery ||
-		len(query.Question) != 1 || query.Question[0].Qtype != dns.TypePTR || query.Question[0].Qclass != dns.ClassINET {
-		return false
-	}
-	addr := reverseDNSAddress(query.Question[0].Name)
-	return addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsUnspecified()
-}
-
 // isLocalName keeps mDNS and private names on the real resolver.
 func isLocalName(name string) bool {
 	for _, suffix := range []string{".local.", ".lan.", ".home.arpa.", ".in-addr.arpa.", ".ip6.arpa."} {
@@ -134,7 +131,6 @@ func isLocalName(name string) bool {
 const (
 	dnsHeaderSize = 12
 	maxDNSUDP     = 4096
-	dnsTimeout    = 5 * time.Second
 )
 
 var errDNSResponse = errors.New("DNS response does not match query")
@@ -143,7 +139,7 @@ type dnsDial func(context.Context, string, string) (net.Conn, error)
 
 // forwardDNS uses a connected UDP socket and retries over TCP if the
 // matching UDP response is truncated or exceeds our receive budget.
-func forwardDNS(ctx context.Context, payload []byte, server string, dial dnsDial) ([]byte, error) {
+func forwardDNS(ctx context.Context, payload []byte, server string, dial dnsDial, timeout time.Duration) ([]byte, error) {
 	if len(payload) > dns.MaxMsgSize {
 		return nil, dns.ErrBuf
 	}
@@ -151,7 +147,7 @@ func forwardDNS(ctx context.Context, payload []byte, server string, dial dnsDial
 	if err := query.Unpack(payload); err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, dnsTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	upstream := append([]byte(nil), payload...)
 	id := dns.Id()

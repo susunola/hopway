@@ -19,6 +19,7 @@ import (
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
 	"mac-proxy/internal/outbound"
+	"mac-proxy/internal/peer"
 )
 
 // TestDevice runs real traffic through a TUN device. It needs root and
@@ -69,6 +70,7 @@ func TestDevice(t *testing.T) {
 	config.Rules = []engine.Rule{
 		{Type: engine.RuleDomain, Value: "blocked.test", Via: "REJECT"},
 		{Type: engine.RuleDomain, Value: "stalled.test", Via: "stall"},
+		{Type: engine.RuleIPCIDR, Value: "203.0.113.0/24", NoResolve: true, Via: "REJECT"},
 		{Type: engine.RuleMatch, Via: "DIRECT"},
 	}
 	core, err := engine.New(config, backend.Default())
@@ -78,9 +80,17 @@ func TestDevice(t *testing.T) {
 	defer core.Close()
 	// An upstream DNS server for queries HopWay does not answer itself.
 	upstream := &dns.Server{Addr: "127.0.0.1:0", Net: "udp", Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-		reply := new(dns.Msg)
-		reply.SetReply(r)
-		reply.Answer = []dns.RR{&dns.TXT{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 60}, Txt: []string{"from upstream"}}}
+		reply := new(dns.Msg).SetReply(r)
+		q := r.Question[0]
+		header := dns.RR_Header{Name: q.Name, Rrtype: q.Qtype, Class: dns.ClassINET, Ttl: 60}
+		switch q.Qtype {
+		case dns.TypeA:
+			reply.Answer = []dns.RR{&dns.A{Hdr: header, A: net.ParseIP("192.168.5.2")}}
+		case dns.TypeAAAA:
+			reply.Answer = []dns.RR{&dns.AAAA{Hdr: header, AAAA: net.ParseIP("fd00::2")}}
+		case dns.TypeTXT:
+			reply.Answer = []dns.RR{&dns.TXT{Hdr: header, Txt: []string{"from upstream"}}}
+		}
 		w.WriteMsg(reply)
 	})}
 	started := make(chan struct{})
@@ -89,8 +99,10 @@ func TestDevice(t *testing.T) {
 	<-started
 	defer upstream.Shutdown()
 
-	service, err := Start(Options{Name: "hwtest0", MTU: 40000, AutoRoute: true, UpstreamDNS: []string{upstream.PacketConn.LocalAddr().String()},
-		RouteAddress: []netip.Prefix{DefaultFakeRange}}, core.Dial, core.DialPacket)
+	resolvers := []string{upstream.PacketConn.LocalAddr().String()}
+	service, err := Start(Options{Name: "hwtest0", MTU: 40000, AutoRoute: true, UpstreamDNS: resolvers,
+		LocalDNS: resolvers, FakeIPExceptions: []string{"Home.Example."}, DisableSniffing: true,
+		RouteAddress: []netip.Prefix{DefaultFakeRange, netip.MustParsePrefix("203.0.113.0/24")}}, core.Dial, core.DialPacket)
 	if err != nil {
 		t.Skipf("cannot create a TUN device here: %v", err)
 	}
@@ -130,7 +142,8 @@ func TestDevice(t *testing.T) {
 	}
 	conn.Close()
 	records := core.Status().Connections
-	if len(records) == 0 || records[0].Inbound != "TUN" || records[0].Target != net.JoinHostPort("echo.test", strconv.Itoa(echoPort)) {
+	if len(records) == 0 || records[0].Inbound != "TUN" || records[0].TargetSource != peer.TargetFakeIP ||
+		records[0].Target != net.JoinHostPort("echo.test", strconv.Itoa(echoPort)) {
 		t.Fatalf("engine did not see the name: %+v", records)
 	}
 
@@ -179,6 +192,48 @@ func TestDevice(t *testing.T) {
 	if err != nil || len(answer.Answer) != 1 || answer.Answer[0].(*dns.TXT).Txt[0] != "from upstream" {
 		t.Fatalf("forwarded query: %v %v", answer, err)
 	}
+
+	t.Run("Fake IP exceptions", func(t *testing.T) {
+		dnsClient := &dns.Client{Timeout: 2 * time.Second}
+		for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+			query := new(dns.Msg).SetQuestion("nas.home.example.", qtype)
+			answer, _, err := dnsClient.Exchange(query, "172.19.0.2:53")
+			if err != nil || len(answer.Answer) != 1 {
+				t.Fatalf("exception query: %v %v", answer, err)
+			}
+			switch rr := answer.Answer[0].(type) {
+			case *dns.A:
+				if qtype != dns.TypeA || rr.A.String() != "192.168.5.2" {
+					t.Fatalf("exception A: %s", rr.A)
+				}
+			case *dns.AAAA:
+				if qtype != dns.TypeAAAA || rr.AAAA.String() != "fd00::2" {
+					t.Fatalf("exception AAAA: %s", rr.AAAA)
+				}
+			default:
+				t.Fatalf("unexpected exception answer %T", rr)
+			}
+		}
+		lookup(t, "nothome.example")
+	})
+
+	t.Run("sniffing disabled", func(t *testing.T) {
+		const target = "203.0.113.9:80"
+		client, err := net.DialTimeout("tcp4", target, 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		client.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = io.WriteString(client, "GET / HTTP/1.1\r\nHost: blocked.test\r\n\r\n")
+		_, _ = client.Read(make([]byte, 1))
+		for _, record := range core.Status().Connections {
+			if record.Target == target && record.TargetSource == peer.TargetIP && record.State == "blocked" {
+				return
+			}
+		}
+		t.Fatal("literal TCP target was not routed as an IP")
+	})
 
 	t.Run("cancel stalled TLS with full read ahead", func(t *testing.T) {
 		target := net.JoinHostPort(lookup(t, "stalled.test").String(), "443")
