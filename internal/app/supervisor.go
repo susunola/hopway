@@ -188,7 +188,7 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 	}
 	options := tun.Options{}
 	if t := s.loaded.Merged.TUN; t != nil {
-		options.MTU = t.MTU
+		options.MTU, options.IPv6 = t.MTU, t.IPv6
 	}
 	// Read the real DNS servers before the system DNS is pointed at the device.
 	options.UpstreamDNS = tun.SystemDNS(options.DNSAddress())
@@ -202,7 +202,7 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 		if err != nil {
 			return err
 		}
-		fd, name, err := tun.OpenWithHelper(executable)
+		fd, name, err := tun.OpenWithHelper(executable, options.IPv6)
 		if err != nil {
 			return err
 		}

@@ -47,6 +47,7 @@ type Config struct {
 type TUNConfig struct {
 	Enabled bool   `json:"enabled"`
 	MTU     uint32 `json:"mtu,omitempty"`
+	IPv6    bool   `json:"ipv6,omitempty"` // capture IPv6 too (fake IPv6 answers, ::/0 route)
 }
 
 // Subscription is a remote node list refreshed in the background.
@@ -632,8 +633,15 @@ func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *
 				engine.health[via] = h
 			}
 			h.alive, h.checked, h.err = false, time.Now(), describe(err)
-		} else if err == nil && h != nil && !h.alive {
-			h.alive, h.err = true, ""
+		} else if err == nil {
+			if h == nil {
+				h = &nodeHealth{}
+				engine.health[via] = h
+			}
+			if !h.alive {
+				h.alive, h.err = true, ""
+			}
+			h.succeeded = time.Now()
 		}
 		engine.mu.Unlock()
 	}

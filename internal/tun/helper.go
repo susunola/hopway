@@ -45,6 +45,9 @@ func RunHelper(socketPath string, options Options) error {
 	}
 	tunOptions := stun.Options{Name: name, Inet4Address: []netip.Prefix{options.Address}, MTU: options.MTU,
 		AutoRoute: true, InterfaceMonitor: monitor, InterfaceFinder: finder}
+	if options.IPv6 {
+		tunOptions.Inet6Address = []netip.Prefix{defaultAddress6}
+	}
 	device, err := stun.New(tunOptions)
 	if err != nil {
 		return err
@@ -86,7 +89,7 @@ func deviceFD(device stun.Tun) (int, error) {
 
 // OpenWithHelper asks for administrator rights (macOS's standard password
 // dialog) to run executable as the helper, and returns the device it sends.
-func OpenWithHelper(executable string) (int, string, error) {
+func OpenWithHelper(executable string, ipv6 bool) (int, string, error) {
 	if runtime.GOOS != "darwin" {
 		return 0, "", errors.New("the TUN helper is only used on macOS")
 	}
@@ -95,7 +98,11 @@ func OpenWithHelper(executable string) (int, string, error) {
 		return 0, "", err
 	}
 	defer cleanup()
-	script := fmt.Sprintf(`do shell script quoted form of %s & " -tun-helper " & quoted form of %s with administrator privileges with prompt "HopWay 需要管理员权限来开启增强模式（TUN），用于创建虚拟网卡并接管路由。"`,
+	flags := " -tun-helper "
+	if ipv6 {
+		flags = " -tun-ipv6 -tun-helper "
+	}
+	script := fmt.Sprintf(`do shell script quoted form of %s & "`+flags+`" & quoted form of %s with administrator privileges with prompt "HopWay 需要管理员权限来开启增强模式（TUN），用于创建虚拟网卡并接管路由。"`,
 		appleString(executable), appleString(path))
 	cmd := exec.Command("/usr/bin/osascript", "-e", script)
 	var output strings.Builder

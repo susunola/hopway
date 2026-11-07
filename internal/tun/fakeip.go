@@ -19,9 +19,57 @@ type FakeIP struct {
 	next   uint32
 	byName map[string]netip.Addr
 	byAddr map[netip.Addr]string
+	six    *fakeIP6 // optional IPv6 pool for AAAA answers
 }
 
-var DefaultFakeRange = netip.MustParsePrefix("198.18.0.0/15")
+var (
+	DefaultFakeRange  = netip.MustParsePrefix("198.18.0.0/15")
+	DefaultFakeRange6 = netip.MustParsePrefix("fc00::/18")
+)
+
+// fakeIP6 numbers names in the low 32 bits of an IPv6 prefix.
+type fakeIP6 struct {
+	prefix netip.Prefix
+	next   uint32
+	limit  uint32
+	byName map[string]netip.Addr
+}
+
+// EnableIPv6 adds an IPv6 pool; AAAA queries then get fake addresses too.
+func (f *FakeIP) EnableIPv6(prefix netip.Prefix) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	limit := uint32(1<<31 - 1)
+	if bits := 128 - prefix.Bits(); bits < 31 {
+		limit = uint32(1)<<bits - 1
+	}
+	f.six = &fakeIP6{prefix: prefix.Masked(), next: 2, limit: limit, byName: map[string]netip.Addr{}}
+}
+
+// Allocate6 returns the IPv6 address for name, or an invalid one without a pool.
+func (f *FakeIP) Allocate6(name string) netip.Addr {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.six == nil {
+		return netip.Addr{}
+	}
+	if addr, ok := f.six.byName[name]; ok {
+		return addr
+	}
+	raw := f.six.prefix.Addr().As16()
+	binary.BigEndian.PutUint32(raw[12:], binary.BigEndian.Uint32(raw[12:])+f.six.next)
+	addr := netip.AddrFrom16(raw)
+	f.six.next++
+	if f.six.next >= f.six.limit {
+		f.six.next = 2
+	}
+	if old, ok := f.byAddr[addr]; ok {
+		delete(f.six.byName, old)
+	}
+	f.six.byName[name], f.byAddr[addr] = addr, name
+	return addr
+}
 
 func NewFakeIP(prefix netip.Prefix) *FakeIP {
 	prefix = prefix.Masked()
@@ -33,7 +81,15 @@ func NewFakeIP(prefix netip.Prefix) *FakeIP {
 		byName: map[string]netip.Addr{}, byAddr: map[netip.Addr]string{}}
 }
 
-func (f *FakeIP) Contains(addr netip.Addr) bool { return f.prefix.Contains(addr.Unmap()) }
+func (f *FakeIP) Contains(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	if f.prefix.Contains(addr) {
+		return true
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.six != nil && f.six.prefix.Contains(addr)
+}
 
 // Allocate returns the address for name, reusing a previous one. When the
 // range wraps, the oldest mapping is overwritten.

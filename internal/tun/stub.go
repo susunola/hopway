@@ -15,5 +15,5 @@ func Start(Options, Dial, DialPacket) (*Service, error) { return nil, errUnsuppo
 func (*Service) Close() error                           { return nil }
 func (*Service) ResetNetwork()                          {}
 func RunHelper(string, Options) error                   { return errUnsupported }
-func OpenWithHelper(string) (int, string, error)        { return 0, "", errUnsupported }
+func OpenWithHelper(string, bool) (int, string, error)  { return 0, "", errUnsupported }
 func SystemDNS(netip.Addr) []string                     { return nil }

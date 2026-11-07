@@ -42,10 +42,11 @@ const (
 )
 
 type nodeHealth struct {
-	latency time.Duration
-	alive   bool
-	checked time.Time
-	err     string
+	latency   time.Duration
+	alive     bool
+	checked   time.Time
+	err       string
+	succeeded time.Time // last real connection that worked through the node
 }
 
 type group struct {
@@ -252,11 +253,21 @@ func (engine *Engine) Probe(ctx context.Context, names []string) {
 		go func() {
 			defer wait.Done()
 			for name := range work {
+				started := time.Now()
 				latency, err := engine.probe(ctx, name)
 				engine.mu.Lock()
+				previous := engine.health[name]
 				h := &nodeHealth{latency: latency, alive: err == nil, checked: time.Now()}
+				if previous != nil {
+					h.succeeded = previous.succeeded
+				}
 				if err != nil {
 					h.err = err.Error()
+					// A probe that fails (the probe URL may be blocked) does
+					// not outweigh real traffic that worked meanwhile.
+					if h.succeeded.After(started) {
+						h.alive, h.latency, h.err = true, previous.latency, ""
+					}
 				}
 				engine.health[name] = h
 				engine.mu.Unlock()

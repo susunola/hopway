@@ -9,8 +9,8 @@ import (
 )
 
 // answerDNS builds the reply to a query hijacked from the TUN device.
-// A records get fake IPs; AAAA gets an empty answer so applications use
-// IPv4 through the tunnel; anything else is forwarded upstream through a
+// A records get fake IPs; AAAA gets a fake IPv6 address when IPv6 is on,
+// otherwise an empty answer so applications use IPv4; anything else is forwarded upstream through a
 // socket bound to the physical interface (never back into the TUN).
 func answerDNS(ctx context.Context, payload []byte, fake *FakeIP, forward func(context.Context, []byte) ([]byte, error)) ([]byte, error) {
 	var query dns.Msg
@@ -32,12 +32,20 @@ func answerDNS(ctx context.Context, payload []byte, fake *FakeIP, forward func(c
 	reply := new(dns.Msg)
 	reply.SetReply(&query)
 	reply.RecursionAvailable = true
-	if question.Qtype == dns.TypeA {
+	switch question.Qtype {
+	case dns.TypeA:
 		addr := fake.Allocate(question.Name)
 		reply.Answer = []dns.RR{&dns.A{
 			Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 1},
 			A:   net.IP(addr.AsSlice()),
 		}}
+	case dns.TypeAAAA:
+		if addr := fake.Allocate6(question.Name); addr.IsValid() {
+			reply.Answer = []dns.RR{&dns.AAAA{
+				Hdr:  dns.RR_Header{Name: question.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 1},
+				AAAA: net.IP(addr.AsSlice()),
+			}}
+		}
 	}
 	return reply.Pack()
 }
