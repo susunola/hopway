@@ -81,8 +81,16 @@ struct ProxyStatus: Decodable {
         }
     }
 
+    struct SystemProxy: Decodable {
+        let supported: Bool
+        let enabled: Bool
+        let error: String?
+        let recovered: Bool?
+    }
+
     let policy: Policy
     let warnings: [String]?
+    let systemProxy: SystemProxy?
     let nodes: [Node]
     let connections: [Connection]
     let active: Int
@@ -109,6 +117,7 @@ final class CoreModel: ObservableObject {
     @Published private(set) var saving = false
     @Published private(set) var updatingPolicy = false
     @Published var draft = ""
+    private var announcedRecovery = false
     @Published private(set) var saved = ""
 
     private var process: Process?
@@ -287,6 +296,10 @@ final class CoreModel: ObservableObject {
             if message == nil, let warnings = status?.warnings, !warnings.isEmpty {
                 message = warnings.joined(separator: "；")
             }
+            if message == nil, status?.systemProxy?.recovered == true, !announcedRecovery {
+                announcedRecovery = true
+                message = "上次异常退出时留下的系统代理设置已自动还原。"
+            }
         } catch {
             guard !Task.isCancelled, endpoint?.token == info.token else { return }
             message = "读取内核状态失败 · " + error.localizedDescription
@@ -304,6 +317,21 @@ final class CoreModel: ObservableObject {
                 await refresh(info)
             } catch {
                 if endpoint?.token == info.token { message = error.localizedDescription }
+            }
+        }
+    }
+
+    /// Points macOS's proxy settings at HopWay, or restores the user's own.
+    func setSystemProxy(_ enabled: Bool) {
+        guard let info = endpoint else { return }
+        message = nil
+        Task {
+            do {
+                struct Body: Encodable { let enabled: Bool }
+                _ = try await call(info, path: "system-proxy", method: "PUT", body: JSONEncoder().encode(Body(enabled: enabled)))
+                await refresh(info)
+            } catch {
+                if endpoint?.token == info.token { message = "系统代理设置失败 · " + error.localizedDescription }
             }
         }
     }

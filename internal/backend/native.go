@@ -41,6 +41,8 @@ func (instance nativeInstance) Dialer(name string) (Dialer, bool) {
 
 func (nativeInstance) Close() error { return nil }
 
+func (nativeInstance) ResetConnections() {}
+
 type namedError struct {
 	name string
 	err  error

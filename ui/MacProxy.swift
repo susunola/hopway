@@ -26,6 +26,9 @@ private struct StatusMenu: View {
         Text("代理 · " + core.phase.rawValue)
         Button(core.phase == .running ? "停止代理" : "启动代理", action: core.toggle)
             .disabled(core.phase == .starting || core.phase == .stopping || core.saving)
+        if let proxy = core.status?.systemProxy, proxy.supported {
+            Button(proxy.enabled ? "关闭系统代理" : "设为系统代理") { core.setSystemProxy(!proxy.enabled) }
+        }
         Button("打开控制台") {
             openWindow(id: "dashboard")
             NSApp.activate(ignoringOtherApps: true)
@@ -112,6 +115,14 @@ private struct Dashboard: View {
                             }
                             Text("全局模式和规则中的 SELECT 使用选定出站。界面切换只对本次运行生效。")
                                 .font(.caption).foregroundStyle(.secondary)
+                            if let proxy = status.systemProxy, proxy.supported {
+                                Toggle("设为系统代理", isOn: Binding(
+                                    get: { proxy.enabled },
+                                    set: { core.setSystemProxy($0) }
+                                ))
+                                Text(proxy.error ?? "开启后，所有网络服务的 HTTP、HTTPS 和 SOCKS 代理都指向 HopWay；停止或退出时会还原原来的设置。")
+                                    .font(.caption).foregroundStyle(proxy.error == nil ? Color.secondary : .red)
+                            }
                         } else {
                             Text("启动内核后，可在这里切换路由模式和出站。")
                                 .foregroundStyle(.secondary)

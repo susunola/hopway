@@ -35,6 +35,8 @@ type Config struct {
 	// Subscriptions are merged in by the profile package; the engine only
 	// sees their nodes, groups and rules.
 	Subscriptions []Subscription `json:"subscriptions,omitempty"`
+	// SystemProxy points macOS's proxy settings at HopWay while it runs.
+	SystemProxy bool `json:"systemProxy,omitempty"`
 
 	// DataDir holds caches (downloaded rule sets). Set by the caller, not saved.
 	DataDir string `json:"-"`
@@ -248,6 +250,24 @@ func Validate(config Config, impl backend.Backend) error {
 		}
 	}
 	return nil
+}
+
+// NetworkChanged recovers from a network switch or a wake from sleep: cached
+// DNS answers and pooled sessions belong to the old network, and node
+// latencies must be measured again.
+func (engine *Engine) NetworkChanged() {
+	backend.Resolver.Flush()
+	if engine.instance != nil {
+		engine.instance.ResetConnections()
+	}
+	engine.mu.Lock()
+	for _, h := range engine.health {
+		h.checked = time.Time{} // unknown again until probed
+	}
+	engine.mu.Unlock()
+	if members := engine.autoMembers(); len(members) != 0 && engine.stop != nil {
+		go engine.Probe(context.Background(), members)
+	}
 }
 
 func (engine *Engine) Close() error {

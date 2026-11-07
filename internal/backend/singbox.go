@@ -121,6 +121,8 @@ func (instance *singInstance) Dialer(name string) (Dialer, bool) {
 
 func (instance *singInstance) Close() error { return instance.box.Close() }
 
+func (instance *singInstance) ResetConnections() { instance.box.CloseIdleConnections() }
+
 func build(outbounds []map[string]any, guard Guard) (*box.Box, error) {
 	registry := include.OutboundRegistry()
 	sbout.Register[option.StubOptions](registry, traceType, func(ctx context.Context, _ adapter.Router, _ log.ContextLogger, tag string, _ option.StubOptions) (adapter.Outbound, error) {
