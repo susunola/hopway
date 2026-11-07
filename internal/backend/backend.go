@@ -8,8 +8,6 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"sort"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -63,21 +61,16 @@ var ErrLoop = errors.New("destination points to this proxy")
 // traffic never loops back into the tunnel.
 var socketControl atomic.Pointer[func(network, address string, c syscall.RawConn) error]
 
-// goResolver, when set, replaces the system resolver for HopWay's own
-// lookups. In TUN mode the system resolver's queries would be hijacked and
-// answered with fake IPs, so HopWay asks the DNS servers directly over
-// bound sockets instead.
-var goResolver atomic.Pointer[net.Resolver]
-
 // upstream DNS servers for HopWay's own lookups while SocketControl is set.
 var upstreamDNS atomic.Pointer[[]string]
 
 func SetSocketControl(control func(network, address string, c syscall.RawConn) error, upstreams ...string) {
+	Resolver.mu.Lock()
+	defer Resolver.mu.Unlock()
 	if control == nil {
 		socketControl.Store(nil)
-		goResolver.Store(nil)
 		upstreamDNS.Store(nil)
-		Resolver.Flush()
+		Resolver.resetLocked(systemLookup)
 		return
 	}
 	// Loopback never goes through the tunnel, and a socket bound to the
@@ -91,25 +84,35 @@ func SetSocketControl(control func(network, address string, c syscall.RawConn) e
 		return control(network, address, c)
 	}
 	socketControl.Store(&bound)
-	if len(upstreams) != 0 {
-		upstreamDNS.Store(&upstreams)
-	}
-	var next atomic.Uint32
-	goResolver.Store(&net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-		// The system's DNS setting may point at the tunnel itself; ask the
-		// servers that were configured before it instead.
-		if list := upstreamDNS.Load(); list != nil && len(*list) != 0 {
-			address = (*list)[int(next.Add(1))%len(*list)]
+	servers := make([]string, 0, len(upstreams))
+	for _, upstream := range upstreams {
+		// A DNS hostname would itself require resolving, potentially
+		// through the fake DNS that this socket is meant to bypass.
+		if address, err := netip.ParseAddrPort(upstream); err == nil && address.Port() != 0 {
+			servers = append(servers, address.String())
 		}
-		return BoundDial(ctx, network, address)
-	}})
-	Resolver.Flush()
+	}
+	upstreamDNS.Store(&servers)
+	Resolver.resetLocked(func() lookupIP {
+		var next atomic.Uint32
+		resolver := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if len(servers) == 0 {
+				return nil, errNoUpstream
+			}
+			// The system resolver may point at HopWay's fake DNS. Use the
+			// pre-TUN servers and socket binding for this network generation.
+			address = servers[(next.Add(1)-1)%uint32(len(servers))]
+			dialer := net.Dialer{Control: bound}
+			return dialer.DialContext(ctx, network, address)
+		}}
+		return ipLookup(resolver)
+	})
 }
 
 // UpstreamDNS returns the servers HopWay's own lookups use in TUN mode.
 func UpstreamDNS() []string {
 	if list := upstreamDNS.Load(); list != nil {
-		return *list
+		return append([]string(nil), (*list)...)
 	}
 	return nil
 }
@@ -136,76 +139,6 @@ func ListenPacket(ctx context.Context, peer netip.Addr) (net.PacketConn, error) 
 		network = "udp4"
 	}
 	return config.ListenPacket(ctx, network, "")
-}
-
-// Resolver is the DNS cache shared by DIRECT connections and node servers.
-var Resolver = &cache{entries: make(map[string]cached), pinned: make(map[string][]netip.Addr)}
-
-type cached struct {
-	addrs   []netip.Addr
-	expires time.Time
-}
-
-type cache struct {
-	mu      sync.Mutex
-	entries map[string]cached
-	pinned  map[string][]netip.Addr // fixed answers (hosts entries), never flushed
-}
-
-// Pin makes host always resolve to addrs; nil removes the entry.
-func (c *cache) Pin(host string, addrs []netip.Addr) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if addrs == nil {
-		delete(c.pinned, host)
-		return
-	}
-	c.pinned[host] = addrs
-}
-
-const cacheTTL = 30 * time.Second
-
-func (c *cache) Lookup(ctx context.Context, host string) ([]netip.Addr, error) {
-	if addr, err := netip.ParseAddr(host); err == nil {
-		return []netip.Addr{addr.Unmap()}, nil
-	}
-	c.mu.Lock()
-	if addrs, ok := c.pinned[host]; ok {
-		c.mu.Unlock()
-		return addrs, nil
-	}
-	entry, ok := c.entries[host]
-	c.mu.Unlock()
-	if ok && time.Now().Before(entry.expires) {
-		return entry.addrs, nil
-	}
-	resolver := net.DefaultResolver
-	if r := goResolver.Load(); r != nil {
-		resolver = r
-	}
-	addrs, err := resolver.LookupNetIP(ctx, "ip", host)
-	if err != nil {
-		return nil, err
-	}
-	for i := range addrs {
-		addrs[i] = addrs[i].Unmap()
-	}
-	// IPv4 first: many home networks advertise IPv6 that does not route.
-	sort.SliceStable(addrs, func(i, j int) bool { return addrs[i].Is4() && !addrs[j].Is4() })
-	c.mu.Lock()
-	if len(c.entries) > 4096 {
-		c.entries = make(map[string]cached)
-	}
-	c.entries[host] = cached{addrs, time.Now().Add(cacheTTL)}
-	c.mu.Unlock()
-	return addrs, nil
-}
-
-// Flush drops cached answers, called when the network changes.
-func (c *cache) Flush() {
-	c.mu.Lock()
-	c.entries = make(map[string]cached)
-	c.mu.Unlock()
 }
 
 // NetDial resolves and connects to address over network ("tcp" or "udp"),

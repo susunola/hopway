@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -43,6 +44,11 @@ type Service struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	once           sync.Once
+	dnsMu          sync.Mutex
+	dnsCtx         context.Context
+	cancelDNS      context.CancelFunc
+	dnsUDP         chan struct{}
+	dnsTCP         chan struct{}
 }
 
 const tunUDPIdle = 5 * time.Minute
@@ -68,6 +74,8 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 		s.fake.EnableIPv6(DefaultFakeRange6)
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.dnsCtx, s.cancelDNS = context.WithCancel(s.ctx)
+	s.dnsUDP, s.dnsTCP = make(chan struct{}, 64), make(chan struct{}, 32)
 	finder := control.NewDefaultInterfaceFinder()
 	var err error
 	fail := func(err error) (*Service, error) {
@@ -155,6 +163,10 @@ func (s *Service) Close() error {
 
 // ResetNetwork drops stack state tied to the previous network.
 func (s *Service) ResetNetwork() {
+	s.dnsMu.Lock()
+	s.cancelDNS()
+	s.dnsCtx, s.cancelDNS = context.WithCancel(s.ctx)
+	s.dnsMu.Unlock()
 	if s.stack != nil {
 		s.stack.ResetNetwork()
 	}
@@ -169,30 +181,102 @@ func (s *Service) JudgeFlow(network uint8, source, destination netip.AddrPort, _
 	return stun.FlowVerdict{Action: stun.ActionAccept}
 }
 
+func (s *Service) dnsView() context.Context {
+	s.dnsMu.Lock()
+	defer s.dnsMu.Unlock()
+	return s.dnsCtx
+}
+
+func (s *Service) isVirtualDNS(destination M.Socksaddr) bool {
+	return destination.IsIP() && (s.options.Address.Contains(destination.Addr) ||
+		defaultAddress6.Contains(destination.Addr) || s.fake.Contains(destination.Addr))
+}
+
+func (s *Service) replyDNS(ctx context.Context, payload []byte, destination M.Socksaddr) ([]byte, error) {
+	server := destination.String()
+	// Queries for the virtual DNS server use a physical upstream.
+	if s.isVirtualDNS(destination) {
+		server = ""
+		if upstreams := backend.UpstreamDNS(); len(upstreams) != 0 {
+			server = upstreams[0]
+		}
+	}
+	reply, err := answerDNS(ctx, payload, s.fake, func(ctx context.Context, query []byte) ([]byte, error) {
+		if server == "" {
+			return nil, errors.New("no upstream DNS server")
+		}
+		return forwardDNS(ctx, query, server, backend.BoundDial)
+	})
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		return dnsFailure(payload)
+	}
+	return reply, nil
+}
+
 func (s *Service) NewDNSPacket(payload []byte, source, destination M.Socksaddr, writer N.PacketWriter) {
+	if len(payload) < dnsHeaderSize || len(payload) > maxDNSUDP {
+		return
+	}
+	ctx := s.dnsView()
+	select {
+	case s.dnsUDP <- struct{}{}:
+	case <-ctx.Done():
+		return
+	default:
+		return
+	}
 	query := append([]byte(nil), payload...)
 	go func() {
-		server := destination.String()
-		// Queries addressed to the tunnel itself (the system DNS points
-		// here in TUN mode) are forwarded to the real upstream.
-		if destination.IsIP() && (s.options.Address.Contains(destination.Addr) || defaultAddress6.Contains(destination.Addr) || s.fake.Contains(destination.Addr)) {
-			server = ""
-			if upstreams := backend.UpstreamDNS(); len(upstreams) != 0 {
-				server = upstreams[0]
-			}
+		defer func() { <-s.dnsUDP }()
+		reply, err := s.replyDNS(ctx, query, destination)
+		if err == nil {
+			// Reserve space for the IPv6 and UDP headers as well.
+			reply, err = limitDNSUDP(query, reply, min(maxDNSUDP, int(s.options.MTU)-48))
 		}
-		forward := func(ctx context.Context, payload []byte) ([]byte, error) {
-			if server == "" {
-				return nil, errors.New("no upstream DNS server")
-			}
-			return forwarder(server, backend.BoundDial)(ctx, payload)
+		if err == nil && ctx.Err() == nil {
+			writer.WritePacket(buf.As(reply), destination)
 		}
-		reply, err := answerDNS(s.ctx, query, s.fake, forward)
-		if err != nil || reply == nil {
-			return
-		}
-		writer.WritePacket(buf.As(reply), destination)
 	}()
+}
+
+func (s *Service) serveDNSTCP(ctx context.Context, conn net.Conn, destination M.Socksaddr) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stopView := context.AfterFunc(s.dnsView(), cancel)
+	defer stopView()
+	stopConn := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopConn()
+	select {
+	case s.dnsTCP <- struct{}{}:
+		defer func() { <-s.dnsTCP }()
+	default:
+		return errors.New("too many concurrent DNS connections")
+	}
+	for {
+		if err := conn.SetReadDeadline(time.Now().Add(dnsTimeout)); err != nil {
+			return err
+		}
+		query, err := readDNSFrame(conn)
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		reply, err := s.replyDNS(ctx, query, destination)
+		if err != nil {
+			return err
+		}
+		if err := conn.SetWriteDeadline(time.Now().Add(dnsTimeout)); err != nil {
+			return err
+		}
+		if err := writeDNSFrame(conn, reply); err != nil {
+			return err
+		}
+	}
 }
 
 // target turns a destination into what the engine routes on: the name
@@ -214,6 +298,12 @@ func done(onClose N.CloseHandlerFunc, err error) {
 }
 
 func (s *Service) NewConnectionEx(ctx context.Context, conn net.Conn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	if destination.Port == 53 && s.isVirtualDNS(destination) {
+		err := s.serveDNSTCP(ctx, conn, destination)
+		conn.Close()
+		done(onClose, err)
+		return
+	}
 	target := s.target(destination)
 	if destination.IsIP() && s.fake.Contains(destination.Addr) && target == destination.String() {
 		// A fake address we no longer know: the mapping wrapped around.
