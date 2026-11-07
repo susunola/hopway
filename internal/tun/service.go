@@ -112,6 +112,7 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 		AutoRoute: options.AutoRoute, Inet4RouteAddress: options.RouteAddress, FileDescriptor: options.FD,
 		InterfaceMonitor: s.monitor, InterfaceFinder: finder,
 	}
+	excludeLocalRoutes(&tunOptions)
 	if options.IPv6 {
 		tunOptions.Inet6Address = []netip.Prefix{defaultAddress6}
 	}
@@ -180,6 +181,11 @@ func (s *Service) ResetNetwork() {
 // JudgeFlow sends every DNS query to NewDNSPacket and everything else to
 // the connection handlers.
 func (s *Service) JudgeFlow(network uint8, source, destination netip.AddrPort, _ []byte) stun.FlowVerdict {
+	if belongsToLocalLink(destination.Addr()) {
+		// Route exclusions should leave these packets on the physical
+		// link. If captured anyway, they must not create proxy sessions.
+		return stun.FlowVerdict{Action: stun.ActionDrop}
+	}
 	if network == syscall.IPPROTO_UDP && destination.Port() == 53 {
 		return stun.FlowVerdict{Action: stun.ActionHijackDNS}
 	}

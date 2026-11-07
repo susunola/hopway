@@ -205,6 +205,7 @@ func (m *matcher) match(host string, resolve func(string) []netip.Addr, owner fu
 	host = normalizeHost(host)
 	best := m.final
 	if addr, err := netip.ParseAddr(host); err == nil {
+		addr = addr.WithZone("")
 		best = min(best, m.ip.lookup(addr))
 		best = m.matchSetIP(best, addr, false)
 		return found(m.matchProcess(best, owner))

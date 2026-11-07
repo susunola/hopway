@@ -460,6 +460,23 @@ func resolveForRules(ctx context.Context, host string) []netip.Addr {
 
 // route picks the outbound name for host. Rules are immutable after New.
 func (engine *Engine) route(ctx context.Context, host string, policy Policy, owner func() *process.Owner) (string, string) {
+	if strings.Contains(host, "%") {
+		if addr, err := netip.ParseAddr(host); err == nil && wire.IsScopedLinkLocal(addr) {
+			if policy.Mode == "global" && policy.Selected == "REJECT" {
+				return "REJECT", "global mode"
+			}
+			if policy.Mode == "rule" {
+				index := engine.rules.match(host, nil, owner)
+				if index >= 0 {
+					rule := engine.rules.rules[index]
+					if rule.Via == "REJECT" || rule.Via == "SELECT" && policy.Selected == "REJECT" {
+						return "REJECT", rule.String()
+					}
+				}
+			}
+			return "DIRECT", "IPv6 link-local interface"
+		}
+	}
 	switch policy.Mode {
 	case "direct":
 		return "DIRECT", "direct mode"

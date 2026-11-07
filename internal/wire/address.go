@@ -5,11 +5,18 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 )
 
 var ErrAddressType = errors.New("unsupported address type")
+
+// IsScopedLinkLocal identifies an IPv6 link-local address with an explicit
+// interface zone. The zone is meaningful only on the machine that set it.
+func IsScopedLinkLocal(addr netip.Addr) bool {
+	return addr.Is6() && addr.IsLinkLocalUnicast() && addr.Zone() != ""
+}
 
 func Split(target string) (string, uint16, error) {
 	host, port, err := net.SplitHostPort(target)

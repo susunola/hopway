@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"net/netip"
 	"testing"
@@ -131,5 +132,32 @@ func TestProcessRules(t *testing.T) {
 	calls := 0
 	if got := rules[m.match("a.early.test", nil, func() *process.Owner { calls++; return nil })].Via; got != "A" || calls != 0 {
 		t.Errorf("an earlier domain rule must win without a process lookup (got %s, %d lookups)", got, calls)
+	}
+}
+
+func TestScopedIPv6RouteRespectsLocalInterfaceAndExplicitRejection(t *testing.T) {
+	rules := []Rule{
+		{Type: RuleIPCIDR, Value: "fe80::123/128", Via: "REJECT", NoResolve: true},
+		{Type: RuleMatch, Via: "SELECT"},
+	}
+	m, err := newMatcher(rules, func(string) bool { return true }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{rules: m}
+	for _, sample := range []struct {
+		host, mode, selected, want string
+	}{
+		{"fe80::123%en9", "rule", "proxy", "REJECT"},
+		{"fe80::124%en9", "rule", "proxy", "DIRECT"},
+		{"fe80::124%en9", "global", "proxy", "DIRECT"},
+		{"fe80::124%en9", "global", "REJECT", "REJECT"},
+		{"fe80::124%en9", "rule", "REJECT", "REJECT"},
+		{"fe80::124%en9", "auto", "proxy", "DIRECT"},
+		{"2001:db8::2", "global", "proxy", "proxy"},
+	} {
+		if got, _ := e.route(context.Background(), sample.host, Policy{Mode: sample.mode, Selected: sample.selected}, nil); got != sample.want {
+			t.Errorf("%s in %s mode via %s, want %s", sample.host, sample.mode, got, sample.want)
+		}
 	}
 }

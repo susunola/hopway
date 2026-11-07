@@ -34,7 +34,7 @@ func TestDNSConcurrentLookupsShareFlightAndAllowOtherHosts(t *testing.T) {
 	defer release.Do(func() { close(unblock) })
 	var calls atomic.Int32
 	c := newCache(func() lookupIP {
-		return func(ctx context.Context, host string) ([]netip.Addr, error) {
+		return func(ctx context.Context, _, host string) ([]netip.Addr, error) {
 			if host == "other.test." {
 				return []netip.Addr{newDNSAddr}, nil
 			}
@@ -64,7 +64,7 @@ func TestDNSConcurrentLookupsShareFlightAndAllowOtherHosts(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		c.mu.Lock()
-		p := c.view.pending["same.test."]
+		p := c.view.pending[dnsKey{"same.test.", "ip"}]
 		ready := p != nil && p.waiters == requests
 		c.mu.Unlock()
 		if ready {
@@ -102,13 +102,13 @@ func TestDNSFlushDiscardsLateAnswer(t *testing.T) {
 	c := newCache(func() lookupIP {
 		generation++
 		if generation == 1 {
-			return func(context.Context, string) ([]netip.Addr, error) {
+			return func(context.Context, string, string) ([]netip.Addr, error) {
 				close(started)
 				<-unblock // simulate an old DNS view that replies after cancellation
 				return []netip.Addr{oldDNSAddr}, nil
 			}
 		}
-		return func(context.Context, string) ([]netip.Addr, error) {
+		return func(context.Context, string, string) ([]netip.Addr, error) {
 			return []netip.Addr{newDNSAddr}, nil
 		}
 	}, 10)
@@ -119,7 +119,7 @@ func TestDNSFlushDiscardsLateAnswer(t *testing.T) {
 	}()
 	<-started
 	c.mu.Lock()
-	first := c.view.pending["switch.test."]
+	first := c.view.pending[dnsKey{"switch.test.", "ip"}]
 	c.mu.Unlock()
 	c.Pin("pin.test", []netip.Addr{oldDNSAddr})
 	c.Flush()
@@ -144,7 +144,7 @@ func TestDNSFlushDiscardsLateAnswer(t *testing.T) {
 func TestDNSCacheDistinguishesMissingAndTemporary(t *testing.T) {
 	var missing, failing atomic.Int32
 	c := newCache(func() lookupIP {
-		return func(_ context.Context, host string) ([]netip.Addr, error) {
+		return func(_ context.Context, _, host string) ([]netip.Addr, error) {
 			if host == "missing.test." {
 				missing.Add(1)
 				return nil, &net.DNSError{IsNotFound: true, Err: "no such host"}
@@ -176,7 +176,7 @@ func TestDNSCacheDistinguishesMissingAndTemporary(t *testing.T) {
 func TestDNSCacheEvictsLeastRecentlyUsed(t *testing.T) {
 	var hotCalls atomic.Int32
 	c := newCache(func() lookupIP {
-		return func(_ context.Context, host string) ([]netip.Addr, error) {
+		return func(_ context.Context, _, host string) ([]netip.Addr, error) {
 			if host == "hot.test." {
 				hotCalls.Add(1)
 			}
@@ -191,7 +191,7 @@ func TestDNSCacheEvictsLeastRecentlyUsed(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(c.view.entries) != dnsCacheLimit || c.view.entries["entry-0.test."] != nil || hotCalls.Load() != 1 {
+	if len(c.view.entries) != dnsCacheLimit || c.view.entries[dnsKey{"entry-0.test.", "ip"}] != nil || hotCalls.Load() != 1 {
 		t.Fatalf("LRU: %d entries, hot host queried %d times", len(c.view.entries), hotCalls.Load())
 	}
 }
@@ -201,7 +201,7 @@ func TestDNSCanceledCallerDoesNotCancelAnotherWaiter(t *testing.T) {
 	var release sync.Once
 	defer release.Do(func() { close(unblock) })
 	c := newCache(func() lookupIP {
-		return func(ctx context.Context, _ string) ([]netip.Addr, error) {
+		return func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
 			select {
 			case <-unblock:
 				return []netip.Addr{oldDNSAddr}, nil
@@ -224,7 +224,7 @@ func TestDNSCanceledCallerDoesNotCancelAnotherWaiter(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		c.mu.Lock()
-		p := c.view.pending["shared.test."]
+		p := c.view.pending[dnsKey{"shared.test.", "ip"}]
 		ready := p != nil && p.waiters == 2
 		c.mu.Unlock()
 		if ready {
@@ -247,7 +247,7 @@ func TestDNSCanceledCallerDoesNotCancelAnotherWaiter(t *testing.T) {
 
 func TestDNSRelativeNameKeepsSearchSuffixFallback(t *testing.T) {
 	c := newCache(func() lookupIP {
-		return func(_ context.Context, host string) ([]netip.Addr, error) {
+		return func(_ context.Context, _, host string) ([]netip.Addr, error) {
 			if host == "site.dev" {
 				return []netip.Addr{newDNSAddr}, nil
 			}

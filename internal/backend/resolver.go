@@ -29,13 +29,9 @@ var (
 // Resolver is the DNS cache shared by DIRECT connections and node servers.
 var Resolver = newCache(systemLookup, dnsCacheLimit)
 
-type lookupIP func(context.Context, string) ([]netip.Addr, error)
+type lookupIP func(context.Context, string, string) ([]netip.Addr, error)
 
-func ipLookup(resolver *net.Resolver) lookupIP {
-	return func(ctx context.Context, host string) ([]netip.Addr, error) {
-		return resolver.LookupNetIP(ctx, "ip", host)
-	}
-}
+func ipLookup(resolver *net.Resolver) lookupIP { return resolver.LookupNetIP }
 
 func systemLookup() lookupIP {
 	// Each generation needs a distinct net.Resolver, including its internal
@@ -54,8 +50,13 @@ func (r dnsResult) answer() ([]netip.Addr, error) {
 	return slices.Clone(r.addrs), r.err
 }
 
+type dnsKey struct {
+	host   string
+	family string
+}
+
 type cached struct {
-	host    string
+	key     dnsKey
 	result  dnsResult
 	expires time.Time
 }
@@ -72,9 +73,9 @@ type dnsView struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	lookup  lookupIP
-	entries map[string]*list.Element
+	entries map[dnsKey]*list.Element
 	recent  list.List
-	pending map[string]*flight
+	pending map[dnsKey]*flight
 }
 
 type cache struct {
@@ -99,8 +100,8 @@ func (c *cache) resetLocked(factory func() lookupIP) {
 	c.factory = factory
 	c.view = &dnsView{
 		ctx: ctx, cancel: cancel, lookup: factory(),
-		entries: make(map[string]*list.Element),
-		pending: make(map[string]*flight),
+		entries: make(map[dnsKey]*list.Element),
+		pending: make(map[dnsKey]*flight),
 	}
 }
 
@@ -123,6 +124,19 @@ func (c *cache) Lookup(ctx context.Context, host string) ([]netip.Addr, error) {
 	if addr, err := netip.ParseAddr(host); err == nil {
 		return []netip.Addr{addr.Unmap()}, nil
 	}
+	c.mu.Lock()
+	view := c.view
+	c.mu.Unlock()
+	return c.lookupNetwork(ctx, view, "ip", host)
+}
+
+func (c *cache) lookupNetwork(ctx context.Context, view *dnsView, family, host string) ([]netip.Addr, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		return matchingFamily([]netip.Addr{addr.Unmap()}, family), nil
+	}
 	host = strings.ToLower(host)
 	key := strings.TrimSuffix(host, ".")
 	// Share absolute answers across case and trailing-dot variants. A
@@ -131,22 +145,39 @@ func (c *cache) Lookup(ctx context.Context, host string) ([]netip.Addr, error) {
 	if strings.Contains(key, ".") {
 		absolute = key + "."
 	}
-	addrs, err := c.lookup(ctx, absolute, key)
+	addrs, err := c.lookup(ctx, view, dnsKey{absolute, family}, key)
 	var dnsErr *net.DNSError
 	if absolute != host && errors.As(err, &dnsErr) && dnsErr.IsNotFound {
-		return c.lookup(ctx, host, key)
+		return c.lookup(ctx, view, dnsKey{host, family}, key)
 	}
 	return addrs, err
 }
 
-func (c *cache) lookup(ctx context.Context, host, pin string) ([]netip.Addr, error) {
+func matchingFamily(addrs []netip.Addr, family string) []netip.Addr {
+	if family == "ip" {
+		return slices.Clone(addrs)
+	}
+	var selected []netip.Addr
+	for _, addr := range addrs {
+		addr = addr.Unmap()
+		if addr.Is4() == (family == "ip4") {
+			selected = append(selected, addr)
+		}
+	}
+	return selected
+}
+
+func (c *cache) lookup(ctx context.Context, view *dnsView, key dnsKey, pin string) ([]netip.Addr, error) {
 	c.mu.Lock()
-	view := c.view
+	if err := view.ctx.Err(); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
 	if addrs, ok := c.pinned[pin]; ok {
 		c.mu.Unlock()
-		return slices.Clone(addrs), nil
+		return matchingFamily(addrs, key.family), nil
 	}
-	if element := view.entries[host]; element != nil {
+	if element := view.entries[key]; element != nil {
 		entry := element.Value.(cached)
 		if time.Now().Before(entry.expires) {
 			view.recent.MoveToFront(element)
@@ -155,7 +186,22 @@ func (c *cache) lookup(ctx context.Context, host, pin string) ([]netip.Addr, err
 		}
 		view.remove(element)
 	}
-	p := view.pending[host]
+	// A rule may have just resolved the full set of IPs. Reuse any known
+	// addresses, and query only if that result did not include this family.
+	if key.family != "ip" {
+		if element := view.entries[dnsKey{key.host, "ip"}]; element != nil {
+			entry := element.Value.(cached)
+			if time.Now().Before(entry.expires) {
+				addrs := matchingFamily(entry.result.addrs, key.family)
+				if len(addrs) != 0 || entry.result.err != nil {
+					view.recent.MoveToFront(element)
+					c.mu.Unlock()
+					return addrs, entry.result.err
+				}
+			}
+		}
+	}
+	p := view.pending[key]
 	if p == nil {
 		if len(view.pending) >= dnsFlightLimit {
 			c.mu.Unlock()
@@ -163,9 +209,9 @@ func (c *cache) lookup(ctx context.Context, host, pin string) ([]netip.Addr, err
 		}
 		flightCtx, cancel := context.WithTimeout(view.ctx, dnsTimeout)
 		p = &flight{ctx: flightCtx, cancel: cancel, done: make(chan struct{}), waiters: 1}
-		view.pending[host] = p
+		view.pending[key] = p
 		c.mu.Unlock()
-		go c.resolve(view, host, p)
+		go c.resolve(view, key, p)
 	} else {
 		p.waiters++
 		c.mu.Unlock()
@@ -173,10 +219,10 @@ func (c *cache) lookup(ctx context.Context, host, pin string) ([]netip.Addr, err
 	select {
 	case <-ctx.Done():
 		c.mu.Lock()
-		if view.pending[host] == p {
+		if view.pending[key] == p {
 			p.waiters--
 			if p.waiters == 0 {
-				delete(view.pending, host)
+				delete(view.pending, key)
 				p.cancel()
 			}
 		}
@@ -195,9 +241,9 @@ func (c *cache) lookup(ctx context.Context, host, pin string) ([]netip.Addr, err
 	}
 }
 
-func (c *cache) resolve(view *dnsView, host string, p *flight) {
+func (c *cache) resolve(view *dnsView, key dnsKey, p *flight) {
 	defer p.cancel()
-	addrs, err := view.lookup(p.ctx, host)
+	addrs, err := view.lookup(p.ctx, key.family, key.host)
 	for i := range addrs {
 		addrs[i] = addrs[i].Unmap()
 	}
@@ -215,11 +261,11 @@ func (c *cache) resolve(view *dnsView, host string, p *flight) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	p.result = result
-	if view.pending[host] == p {
-		delete(view.pending, host)
+	if view.pending[key] == p {
+		delete(view.pending, key)
 		if c.view == view && p.ctx.Err() == nil && ttl != 0 {
-			entry := cached{host, result, time.Now().Add(ttl)}
-			view.entries[host] = view.recent.PushFront(entry)
+			entry := cached{key, result, time.Now().Add(ttl)}
+			view.entries[key] = view.recent.PushFront(entry)
 			if len(view.entries) > c.limit {
 				view.remove(view.recent.Back())
 			}
@@ -229,7 +275,7 @@ func (c *cache) resolve(view *dnsView, host string, p *flight) {
 }
 
 func (view *dnsView) remove(element *list.Element) {
-	delete(view.entries, element.Value.(cached).host)
+	delete(view.entries, element.Value.(cached).key)
 	view.recent.Remove(element)
 }
 

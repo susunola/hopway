@@ -10,10 +10,8 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"mac-proxy/internal/outbound"
-	"mac-proxy/internal/trace"
 	"mac-proxy/internal/wire"
 )
 
@@ -73,11 +71,11 @@ func SetSocketControl(control func(network, address string, c syscall.RawConn) e
 		Resolver.resetLocked(systemLookup)
 		return
 	}
-	// Loopback never goes through the tunnel, and a socket bound to the
-	// physical interface cannot receive loopback replies.
+	// Keep loopback on the host and preserve an explicitly scoped IPv6
+	// destination's own interface instead of binding it to the default one.
 	bound := func(network, address string, c syscall.RawConn) error {
 		if host, _, err := net.SplitHostPort(address); err == nil {
-			if addr, err := netip.ParseAddr(host); err == nil && addr.Unmap().IsLoopback() {
+			if addr, err := netip.ParseAddr(host); err == nil && (addr.Unmap().IsLoopback() || wire.IsScopedLinkLocal(addr)) {
 				return nil
 			}
 		}
@@ -127,11 +125,11 @@ func BoundDial(ctx context.Context, network, address string) (net.Conn, error) {
 }
 
 // ListenPacket opens an unconnected UDP socket for sending to peer, with
-// SocketControl applied unless peer is a loopback address.
+// SocketControl applied unless the peer already identifies a local path.
 func ListenPacket(ctx context.Context, peer netip.Addr) (net.PacketConn, error) {
 	config := net.ListenConfig{}
 	peer = peer.Unmap()
-	if control := socketControl.Load(); control != nil && !peer.IsLoopback() {
+	if control := socketControl.Load(); control != nil && !peer.IsLoopback() && !wire.IsScopedLinkLocal(peer) {
 		config.Control = *control
 	}
 	network := "udp6"
@@ -139,55 +137,4 @@ func ListenPacket(ctx context.Context, peer netip.Addr) (net.PacketConn, error) 
 		network = "udp4"
 	}
 	return config.ListenPacket(ctx, network, "")
-}
-
-// NetDial resolves and connects to address over network ("tcp" or "udp"),
-// recording DNS and connect timings in the context's trace.
-func NetDial(ctx context.Context, network, address string, guard Guard) (net.Conn, error) {
-	t := trace.From(ctx)
-	host, port, err := wire.Split(address)
-	if err != nil {
-		return nil, err
-	}
-	start := time.Now()
-	addrs, err := Resolver.Lookup(ctx, host)
-	dns := time.Since(start)
-	if err != nil || len(addrs) == 0 {
-		if err == nil {
-			err = errors.New("no addresses for " + host)
-		}
-		t.Dial(address, dns, 0, trace.StageDNS)
-		return nil, err
-	}
-	connectStart := time.Now()
-	var dialer net.Dialer
-	if control := socketControl.Load(); control != nil {
-		dialer.Control = *control
-	}
-	for i, addr := range addrs {
-		target := netip.AddrPortFrom(addr, port)
-		if guard != nil {
-			if err = guard(target); err != nil {
-				break
-			}
-		}
-		attempt := ctx
-		var cancel context.CancelFunc = func() {}
-		if i < len(addrs)-1 {
-			// Leave time for the remaining addresses if this one is black-holed.
-			attempt, cancel = context.WithTimeout(ctx, 3*time.Second)
-		}
-		var conn net.Conn
-		conn, err = dialer.DialContext(attempt, network, target.String())
-		cancel()
-		if err == nil {
-			t.Dial(address, dns, time.Since(connectStart), "")
-			return conn, nil
-		}
-		if ctx.Err() != nil {
-			break
-		}
-	}
-	t.Dial(address, dns, time.Since(connectStart), trace.StageConnect)
-	return nil, err
 }

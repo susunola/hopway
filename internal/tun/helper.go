@@ -66,6 +66,7 @@ func CreateDevice(options Options) (int, string, error) {
 	}
 	tunOptions := stun.Options{Name: name, Inet4Address: []netip.Prefix{options.Address}, MTU: options.MTU,
 		AutoRoute: true, InterfaceMonitor: monitor, InterfaceFinder: finder}
+	excludeLocalRoutes(&tunOptions)
 	if options.IPv6 {
 		tunOptions.Inet6Address = []netip.Prefix{defaultAddress6}
 	}
