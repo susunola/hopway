@@ -70,6 +70,7 @@ func associate(client *net.TCPConn, requested string, dialPacket DialPacketFunc,
 	}()
 
 	var mu sync.Mutex
+	var replyMu sync.Mutex
 	sessions := make(map[string]*udpSession)
 	workerSlots := make(chan struct{}, maxUDPAssociationTargets+1)
 	var source netip.AddrPort
@@ -134,7 +135,7 @@ func associate(client *net.TCPConn, requested string, dialPacket DialPacketFunc,
 			go func(session *udpSession, target string, from netip.AddrPort) {
 				defer workers.Done()
 				defer func() { <-workerSlots }()
-				err := session.run(relay, from, target, dialPacket)
+				err := session.run(relay, &replyMu, from, target, dialPacket)
 				mu.Lock()
 				if sessions[target] == session {
 					delete(sessions, target)
@@ -194,10 +195,10 @@ func udpQueueCharge(size int) int {
 	return 32 + 1<<bits.Len(uint(max(size, 64)-1))
 }
 
-func (s *udpSession) run(relay *net.UDPConn, client netip.AddrPort, target string, dial DialPacketFunc) error {
-	defer s.cancel()
+func (s *udpSession) run(relay *net.UDPConn, replyMu *sync.Mutex, client netip.AddrPort, target string, dial DialPacketFunc) error {
 	upstream, err := dial(s.ctx, "SOCKS5 UDP", target)
 	if err != nil {
+		s.cancel()
 		return err
 	}
 	closeUpstream := sync.OnceFunc(func() { _ = upstream.Close() })
@@ -206,10 +207,11 @@ func (s *udpSession) run(relay *net.UDPConn, client netip.AddrPort, target strin
 	readDone := make(chan struct{})
 	go func() {
 		defer close(readDone)
-		s.replies(upstream, relay, client)
+		s.replies(upstream, relay, replyMu, client)
 		s.cancel()
 	}()
 	defer func() {
+		s.cancel()
 		closeUpstream()
 		<-readDone
 	}()
@@ -241,7 +243,7 @@ func (s *udpSession) run(relay *net.UDPConn, client netip.AddrPort, target strin
 	}
 }
 
-func (s *udpSession) replies(session net.PacketConn, relay *net.UDPConn, client netip.AddrPort) {
+func (s *udpSession) replies(session net.PacketConn, relay *net.UDPConn, replyMu *sync.Mutex, client netip.AddrPort) {
 	buffer := make([]byte, udpReplyHeadroom+65535)
 	var header [udpReplyHeadroom]byte
 	for s.ctx.Err() == nil {
@@ -260,14 +262,23 @@ func (s *udpSession) replies(session net.PacketConn, relay *net.UDPConn, client 
 		if s.ctx.Err() != nil {
 			return
 		}
-		s.touch()
 		prefix, err := wire.AppendAddress(header[:3], M.SocksaddrFromNet(from).String())
 		if err != nil {
 			continue
 		}
 		start := udpReplyHeadroom - len(prefix)
 		copy(buffer[start:udpReplyHeadroom], prefix)
-		if _, err := relay.WriteToUDPAddrPort(buffer[start:udpReplyHeadroom+n], client); err != nil {
+		// Recheck under the relay's write lock. A replacement can open
+		// while this reply is prepared, but cannot overtake an admitted write.
+		replyMu.Lock()
+		if s.ctx.Err() != nil {
+			replyMu.Unlock()
+			return
+		}
+		s.touch()
+		_, err = relay.WriteToUDPAddrPort(buffer[start:udpReplyHeadroom+n], client)
+		replyMu.Unlock()
+		if err != nil {
 			return
 		}
 	}

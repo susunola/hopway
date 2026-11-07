@@ -5,10 +5,12 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -356,6 +358,91 @@ func TestUDPAssociationRelaysOutOfOrderAndDuplicateReplies(t *testing.T) {
 		if string(payload) != want {
 			t.Fatalf("reply %d differs, got %d bytes, want %d", i, len(payload), len(want))
 		}
+	}
+}
+
+type heldUDPReplyAddr struct {
+	net.Addr
+	started func()
+	release <-chan struct{}
+}
+
+func (a heldUDPReplyAddr) String() string {
+	a.started()
+	<-a.release
+	return a.Addr.String()
+}
+
+type retiringUDPOutbound struct {
+	net.PacketConn
+	closed  chan struct{}
+	address heldUDPReplyAddr
+}
+
+func (c *retiringUDPOutbound) ReadFrom(data []byte) (int, net.Addr, error) {
+	n, address, err := c.PacketConn.ReadFrom(data)
+	held := c.address
+	held.Addr = address
+	return n, held, err
+}
+
+func (c *retiringUDPOutbound) WriteTo(data []byte, address net.Addr) (int, error) {
+	if string(data) == "retire" {
+		return 0, os.ErrDeadlineExceeded
+	}
+	return c.PacketConn.WriteTo(data, address)
+}
+
+func (c *retiringUDPOutbound) Close() error {
+	err := c.PacketConn.Close()
+	close(c.closed)
+	return err
+}
+
+func TestUDPReplacementDropsPreparedReplyFromOldSession(t *testing.T) {
+	target := udpEcho(t, "echo:")
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	closed := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	var first atomic.Bool
+	client, relay := openUDPAssociation(t, func(ctx context.Context, _, target string) (net.PacketConn, error) {
+		conn, err := backend.DirectPacket(ctx, target, nil)
+		if err != nil || !first.CompareAndSwap(false, true) {
+			return conn, err
+		}
+		return &retiringUDPOutbound{PacketConn: conn, closed: closed, address: heldUDPReplyAddr{
+			started: sync.OnceFunc(func() { close(ready) }), release: release,
+		}}, nil
+	})
+	wait := func(ch <-chan struct{}, message string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(time.Second):
+			t.Fatal(message)
+		}
+	}
+	sendUDP(t, client, relay, target, "old reply")
+	wait(ready, "old reply was not paused during address encoding")
+	sendUDP(t, client, relay, target, "retire")
+	wait(closed, "timed-out UDP writer did not retire the old session")
+	sendUDP(t, client, relay, target, "replacement")
+	client.SetReadDeadline(time.Now().Add(time.Second))
+	var buffer [256]byte
+	n, _, err := client.ReadFromUDP(buffer[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, payload, err := parseDatagram(buffer[:n])
+	if err != nil || from != target || string(payload) != "echo:replacement" {
+		t.Fatalf("replacement reply: %q %q, %v", from, payload, err)
+	}
+	unblock()
+	client.SetReadDeadline(time.Now().Add(120 * time.Millisecond))
+	if n, _, err := client.ReadFromUDP(buffer[:]); err == nil {
+		t.Fatalf("old session wrote a late reply: %q", buffer[:n])
 	}
 }
 

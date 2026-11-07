@@ -113,6 +113,7 @@ type UDPNat struct {
 	egress              atomic.Pointer[udpNatEgressTable]
 	classAccess         sync.Mutex
 	classConns          map[uint32]map[*udpNatConn]struct{}
+	writeAccess         sync.Mutex
 	cleanup             *udpNatCleanupQueue
 	state               atomic.Uint32
 	lifecycleAccess     sync.Mutex
@@ -424,10 +425,12 @@ func (s *UDPNat) getOrCreateConn(source M.Socksaddr, destination M.Socksaddr, us
 		if !ok {
 			return nil, false
 		}
+		ctx, cancel := context.WithCancel(ctx)
 		newConn := &udpNatConn{
 			service:      s,
 			key:          key,
 			writer:       writer,
+			cancel:       cancel,
 			localAddr:    source,
 			packetChan:   make(chan *N.PacketBuffer, 64),
 			doneChan:     make(chan struct{}),
@@ -561,6 +564,7 @@ type udpNatConn struct {
 	key             udpNatSessionKey
 	interfaceIndex  uint32
 	writer          N.PacketWriter
+	cancel          context.CancelFunc
 	localAddr       M.Socksaddr
 	packetChan      chan *N.PacketBuffer
 	packetAccess    sync.RWMutex
@@ -670,6 +674,11 @@ func (c *udpNatConn) ReadPacket(buffer *buf.Buffer) (addr M.Socksaddr, err error
 	select {
 	case p := <-c.packetChan:
 		c.releaseQueue(p.Buffer)
+		if c.isClosed() {
+			p.Buffer.Release()
+			N.PutPacketBuffer(p)
+			return M.Socksaddr{}, io.ErrClosedPipe
+		}
 		_, err = buffer.ReadOnceFrom(p.Buffer)
 		destination := p.Destination
 		p.Buffer.Release()
@@ -683,6 +692,14 @@ func (c *udpNatConn) ReadPacket(buffer *buf.Buffer) (addr M.Socksaddr, err error
 }
 
 func (c *udpNatConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	// Serialize admission and writes to the shared device. Retirement can
+	// invalidate a flow without waiting for device I/O under the NAT cache lock.
+	c.service.writeAccess.Lock()
+	defer c.service.writeAccess.Unlock()
+	if c.isClosed() || c.service.state.Load() != udpNatStateStarted {
+		buffer.Release()
+		return io.ErrClosedPipe
+	}
 	if !c.allowPeer(destination) {
 		buffer.Release()
 		return nil
@@ -697,12 +714,31 @@ func (c *udpNatConn) CreatePacketBatchWriter() (N.PacketBatchWriter, bool) {
 		return nil, false
 	}
 	if creator, isCreator := c.writer.(N.PacketBatchWriteCreator); isCreator {
-		return creator.CreatePacketBatchWriter()
+		writer, ok := creator.CreatePacketBatchWriter()
+		if !ok {
+			return nil, false
+		}
+		return &udpNatBatchWriter{conn: c, writer: writer}, true
 	}
 	if writer, isWriter := c.writer.(N.PacketBatchWriter); isWriter {
-		return writer, true
+		return &udpNatBatchWriter{conn: c, writer: writer}, true
 	}
 	return nil, false
+}
+
+type udpNatBatchWriter struct {
+	conn   *udpNatConn
+	writer N.PacketBatchWriter
+}
+
+func (w *udpNatBatchWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []M.Socksaddr) error {
+	w.conn.service.writeAccess.Lock()
+	defer w.conn.service.writeAccess.Unlock()
+	if w.conn.isClosed() || w.conn.service.state.Load() != udpNatStateStarted {
+		buf.ReleaseMulti(buffers)
+		return io.ErrClosedPipe
+	}
+	return w.writer.WritePacketBatch(buffers, destinations)
 }
 
 func (c *udpNatConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
@@ -718,6 +754,11 @@ func (c *udpNatConn) waitReadPacket(options N.ReadWaitOptions) (buffer *buf.Buff
 	select {
 	case packet := <-c.packetChan:
 		c.releaseQueue(packet.Buffer)
+		if c.isClosed() {
+			packet.Buffer.Release()
+			N.PutPacketBuffer(packet)
+			return nil, M.Socksaddr{}, io.ErrClosedPipe
+		}
 		buffer = options.Copy(packet.Buffer)
 		destination = packet.Destination
 		N.PutPacketBuffer(packet)
@@ -754,6 +795,14 @@ func (c *udpNatConn) WaitReadPackets() (buffers []*buf.Buffer, destinations []M.
 	buffers = batch.buffers[:0]
 	destinations = batch.destinations[:0]
 	defer func() {
+		if c.isClosed() {
+			buf.ReleaseMulti(buffers)
+			clear(buffers)
+			clear(destinations)
+			batch.buffers, batch.destinations = buffers[:0], destinations[:0]
+			buffers, destinations, err = nil, nil, io.ErrClosedPipe
+			return
+		}
 		batch.buffers = buffers
 		batch.destinations = destinations
 	}()
@@ -785,6 +834,11 @@ func (c *udpNatConn) Timeout() time.Duration {
 }
 
 func (c *udpNatConn) SetTimeout(timeout time.Duration) bool {
+	// UpdateLifetime compares the connection identity but can refresh an
+	// expired entry. Peek expires it before we admit the received datagram.
+	if current, ok := c.service.cache.Peek(c.key); !ok || current != c {
+		return false
+	}
 	updated := c.service.cache.UpdateLifetime(c.key, c, timeout)
 	if !updated {
 		return false
@@ -816,6 +870,7 @@ func (c *udpNatConn) close() (discarded int) {
 	c.closeOnce.Do(func() {
 		c.packetAccess.Lock()
 		close(c.doneChan)
+		c.cancel()
 		drained := false
 		for !drained {
 			select {

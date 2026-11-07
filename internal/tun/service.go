@@ -392,18 +392,22 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	ctx = peer.WithAddrs(ctx, peer.Addrs{Client: source.AddrPort(), Server: destination.AddrPort(), Local: true})
 	remote, err := s.dialPacket(ctx, "TUN", target)
 	if err != nil {
+		upstreamFailure := ctx.Err() == nil && !errors.Is(err, net.ErrClosed)
 		discarded := discardUDPPackets(conn)
-		if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+		if upstreamFailure {
 			wire.TUNUDPDrops.Add(backend.PacketDropReason(err), discarded)
 		}
 		done(onClose, err)
 		return
 	}
+	closeRemote := sync.OnceFunc(func() { _ = remote.Close() })
+	stopRemote := context.AfterFunc(ctx, closeRemote)
+	defer stopRemote()
 	var once sync.Once
 	finish := func(err error) {
 		once.Do(func() {
 			conn.Close()
-			remote.Close()
+			closeRemote()
 			done(onClose, err)
 		})
 	}
@@ -427,16 +431,17 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 				packet.Release()
 				continue
 			}
+			// Confirm this NAT entry is still current before sending. A
+			// late reply must not revive or write through a retired entry.
+			if ctx.Err() != nil || (lifetime != nil && !lifetime.SetTimeout(s.options.udpIdleTimeout())) {
+				packet.Release()
+				finish(nil)
+				return
+			}
 			packet.Truncate(n)
 			downloadOptions.PostReturn(packet)
 			if err := conn.WritePacket(packet, original); err != nil {
 				finish(err)
-				return
-			}
-			// The NAT table already refreshes uploads. Refresh downloads
-			// here and let the table, rather than a second timer, own expiry.
-			if lifetime != nil && !lifetime.SetTimeout(s.options.udpIdleTimeout()) {
-				finish(nil)
 				return
 			}
 		}
@@ -456,6 +461,9 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	}
 	for {
 		packet, to, err := readPacket()
+		if err == nil {
+			err = ctx.Err()
+		}
 		if err == nil {
 			if to == destination {
 				_, writeErr := remote.WriteTo(packet.Bytes(), written)

@@ -15,3 +15,8 @@ keep the original queue behavior.
 
 The UDP NAT connection exposes its underlying writer so callers can reserve
 packet header space before reading a reply.
+
+The NAT flow owns a cancellable context. Closing or expiring it cancels
+its outbound and invalidates single and batched writes to the TUN device.
+Writes already admitted to the device are ordered before replacement
+replies. NAT cleanup does not wait for device I/O.
