@@ -63,7 +63,7 @@ func TestV2RayTCP(t *testing.T) {
 				}
 			}()
 			node := Node{Type: kind, Server: listener.Addr().String(), UUID: fixtureUUID}
-			if err := node.Validate(); err != nil {
+			if err := node.PrepareNative(); err != nil {
 				t.Fatal(err)
 			}
 			conn, err := node.Dial(ctx, "example.test:443", func(ctx context.Context, target string) (net.Conn, error) {

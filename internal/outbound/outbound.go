@@ -16,58 +16,31 @@ import (
 	"net/url"
 	"time"
 
-	M "github.com/sagernet/sing/common/metadata"
-
 	"mac-proxy/internal/wire"
 )
 
 var ErrRejected = errors.New("blocked by routing policy")
 
-type Node struct {
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	Server     string `json:"server"`
-	Username   string `json:"username,omitempty"`
-	Password   string `json:"password,omitempty"`
-	ServerName string `json:"serverName,omitempty"`
-	Cipher     string `json:"cipher,omitempty"`
-	CAPEM      string `json:"caPEM,omitempty"`
-	UUID       string `json:"uuid,omitempty"`
-	TLS        bool   `json:"tls,omitempty"`
-	rootCAs    *x509.CertPool
-	v2Dial     func(net.Conn, M.Socksaddr) (net.Conn, error)
-}
-
-func (node *Node) Validate() error {
-	if _, _, err := wire.Split(node.Server); err != nil {
-		return errors.New("server must be host:port")
+// PrepareNative validates a node for the built-in protocol implementation and
+// caches the state it needs. The built-in implementation has no third-party
+// protocol code beyond VLESS/VMess and is kept for licence-sensitive builds.
+func (node *Node) PrepareNative() error {
+	if err := node.Validate(); err != nil {
+		return err
+	}
+	if len(node.Options) != 0 {
+		return errors.New("extra options need the sing-box backend")
 	}
 	if node.CAPEM != "" {
-		if !node.usesTLS() {
-			return errors.New("caPEM requires TLS")
-		}
 		roots, err := x509.SystemCertPool()
 		if err != nil {
 			return fmt.Errorf("load system trust: %w", err)
 		}
-		if !roots.AppendCertsFromPEM([]byte(node.CAPEM)) {
-			return errors.New("caPEM must contain a valid PEM certificate")
-		}
+		roots.AppendCertsFromPEM([]byte(node.CAPEM))
 		node.rootCAs = roots
 	}
 	switch node.Type {
-	case "socks5":
-		if (node.Username == "") != (node.Password == "") || len(node.Username) > 255 || len(node.Password) > 255 {
-			return errors.New("SOCKS5 credentials must both be present and at most 255 bytes")
-		}
-	case "http", "https":
-		if node.Password != "" && node.Username == "" {
-			return errors.New("HTTP proxy authentication requires a username")
-		}
-	case "trojan":
-		if node.Password == "" {
-			return errors.New("Trojan requires a password")
-		}
+	case "socks5", "http", "https", "trojan":
 	case "shadowsocks":
 		if node.Password == "" || cipherSize(node.Cipher) == 0 {
 			return errors.New("Shadowsocks requires a password and aes-128-gcm or aes-256-gcm")
@@ -75,13 +48,9 @@ func (node *Node) Validate() error {
 	case "vless", "vmess":
 		return node.prepareV2Ray()
 	default:
-		return fmt.Errorf("unsupported node type %q", node.Type)
+		return fmt.Errorf("node type %q needs the sing-box backend", node.Type)
 	}
 	return nil
-}
-
-func (node Node) usesTLS() bool {
-	return node.Type == "https" || node.Type == "trojan" || ((node.Type == "vless" || node.Type == "vmess") && node.TLS)
 }
 
 func (node Node) Dial(ctx context.Context, target string, dial func(context.Context, string) (net.Conn, error)) (net.Conn, error) {
@@ -106,7 +75,7 @@ func (node Node) Dial(ctx context.Context, target string, dial func(context.Cont
 	defer stop()
 
 	var conn net.Conn = raw
-	if node.usesTLS() {
+	if node.UsesTLS() {
 		name := node.ServerName
 		if name == "" {
 			name, _, _ = net.SplitHostPort(node.Server)

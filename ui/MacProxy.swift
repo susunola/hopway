@@ -107,7 +107,7 @@ private struct Dashboard: View {
                                 set: { core.updatePolicy(Policy(mode: status.policy.mode, selected: $0)) }
                             )) {
                                 ForEach(status.nodes) { node in
-                                    Text("\(node.name) · \(node.type)").tag(node.name)
+                                    Text(node.label).tag(node.name)
                                 }
                             }
                             Text("全局模式和规则中的 SELECT 使用选定出站。界面切换只对本次运行生效。")
@@ -194,14 +194,14 @@ private struct Dashboard: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 Table(rows) {
-                    TableColumn("目标") { Text($0.target).textSelection(.enabled).help($0.error ?? $0.target) }.width(min: 135, ideal: 180)
+                    TableColumn("目标") { Text($0.target).textSelection(.enabled).help($0.diagnosis) }.width(min: 135, ideal: 180)
                     TableColumn("入站", value: \.inbound).width(min: 80, ideal: 105)
                     TableColumn("出站", value: \.via).width(min: 80, ideal: 100)
                     TableColumn("规则", value: \.rule).width(min: 65, ideal: 130)
                     TableColumn("状态") { row in
                         Text(row.stateLabel)
                             .foregroundStyle(row.state == "active" ? Color.green : row.state == "failed" ? .red : .secondary)
-                            .help(row.error ?? row.stateLabel)
+                            .help(row.diagnosis)
                     }.width(66)
                     TableColumn("发送 / 接收") {
                         Text("\($0.sent.formatted()) / \($0.received.formatted()) B").monospacedDigit()

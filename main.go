@@ -16,6 +16,7 @@ import (
 	"os"
 	"time"
 
+	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
 	"mac-proxy/internal/httpproxy"
 	"mac-proxy/internal/importer"
@@ -40,7 +41,7 @@ func main() {
 		base, err := loadConfig(*path)
 		if err == nil {
 			var result importer.Result
-			result, err = importer.Import(context.Background(), os.Stdin, base)
+			result, err = importer.Import(context.Background(), os.Stdin, base, backend.Default())
 			if err == nil {
 				err = json.NewEncoder(os.Stdout).Encode(result)
 			}
@@ -84,7 +85,8 @@ func run(path string, port int, check, managed bool) error {
 	if port != -1 {
 		config.SOCKSPort = port
 	}
-	if _, err := engine.New(config); err != nil {
+	impl := backend.Default()
+	if err := engine.Validate(config, impl); err != nil {
 		return err
 	}
 	if check {
@@ -119,10 +121,11 @@ func run(path string, port int, check, managed bool) error {
 		info.Control = "http://" + control.Addr().String()
 		info.Token = hex.EncodeToString(token[:])
 	}
-	core, err := engine.New(config, ports...)
+	core, err := engine.New(config, impl, ports...)
 	if err != nil {
 		return err
 	}
+	defer core.Close()
 	serverErrors := make(chan error, 3)
 	go func() { serverErrors <- serveSOCKS(socks, core) }()
 	httpServer := &http.Server{
@@ -184,6 +187,28 @@ func controlHandler(core *engine.Engine, token string) http.Handler {
 			return
 		}
 		writer.WriteHeader(http.StatusNoContent)
+	})
+	router.HandleFunc("PUT /groups/{name}", func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			Selected string `json:"selected"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 4096))
+		decoder.DisallowUnknownFields()
+		err := decoder.Decode(&body)
+		if err == nil {
+			err = core.SelectInGroup(request.PathValue("name"), body.Selected)
+		}
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	})
+	// Probing takes seconds, longer than the control API's write timeout, so
+	// it runs in the background and results appear in /status.
+	router.HandleFunc("POST /probe", func(writer http.ResponseWriter, request *http.Request) {
+		go core.Probe(context.Background(), nil)
+		writer.WriteHeader(http.StatusAccepted)
 	})
 	authorization := []byte("Bearer " + token)
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

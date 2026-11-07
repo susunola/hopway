@@ -10,12 +10,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"go.yaml.in/yaml/v3"
 
+	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
 	"mac-proxy/internal/outbound"
 )
@@ -29,69 +31,201 @@ type Result struct {
 	Notes   []string      `json:"notes"`
 	names   map[string]bool
 	seen    map[string]bool
+	renamed map[string]string // original name -> final node name
+	check   func(outbound.Node) error
 }
 
 type clash struct {
 	Proxies   []yaml.Node `yaml:"proxies"`
 	Groups    []yaml.Node `yaml:"proxy-groups"`
-	Rules     []yaml.Node `yaml:"rules"`
+	Rules     []string    `yaml:"rules"`
 	Providers yaml.Node   `yaml:"proxy-providers"`
 }
 
 type clashNode struct {
-	Name        string    `yaml:"name"`
-	Type        string    `yaml:"type"`
-	Server      string    `yaml:"server"`
-	Port        int       `yaml:"port"`
-	Username    string    `yaml:"username"`
-	Password    string    `yaml:"password"`
-	UUID        string    `yaml:"uuid"`
-	Cipher      string    `yaml:"cipher"`
-	SNI         string    `yaml:"sni"`
-	ServerName  string    `yaml:"servername"`
-	Network     string    `yaml:"network"`
-	Flow        string    `yaml:"flow"`
-	Plugin      string    `yaml:"plugin"`
-	Dialer      string    `yaml:"dialer-proxy"`
-	Encryption  string    `yaml:"encryption"`
-	TLS         bool      `yaml:"tls"`
-	Insecure    bool      `yaml:"skip-cert-verify"`
-	AlterID     int       `yaml:"alterId"`
-	Reality     yaml.Node `yaml:"reality-opts"`
-	WS          yaml.Node `yaml:"ws-opts"`
-	GRPC        yaml.Node `yaml:"grpc-opts"`
-	HTTP        yaml.Node `yaml:"http-opts"`
-	ALPN        []string  `yaml:"alpn"`
-	Fingerprint string    `yaml:"fingerprint"`
+	Name         string            `yaml:"name"`
+	Type         string            `yaml:"type"`
+	Server       string            `yaml:"server"`
+	Port         int               `yaml:"port"`
+	Ports        string            `yaml:"ports"`
+	Username     string            `yaml:"username"`
+	Password     string            `yaml:"password"`
+	UUID         string            `yaml:"uuid"`
+	Cipher       string            `yaml:"cipher"`
+	SNI          string            `yaml:"sni"`
+	ServerName   string            `yaml:"servername"`
+	Network      string            `yaml:"network"`
+	Flow         string            `yaml:"flow"`
+	Plugin       string            `yaml:"plugin"`
+	PluginOpts   map[string]any    `yaml:"plugin-opts"`
+	Dialer       string            `yaml:"dialer-proxy"`
+	Encryption   string            `yaml:"encryption"`
+	TLS          bool              `yaml:"tls"`
+	Insecure     bool              `yaml:"skip-cert-verify"`
+	AlterID      int               `yaml:"alterId"`
+	Reality      *clashReality     `yaml:"reality-opts"`
+	WS           *clashWS          `yaml:"ws-opts"`
+	GRPC         map[string]string `yaml:"grpc-opts"`
+	H2           *clashH2          `yaml:"h2-opts"`
+	HTTP         yaml.Node         `yaml:"http-opts"`
+	ALPN         []string          `yaml:"alpn"`
+	Fingerprint  string            `yaml:"client-fingerprint"`
+	Obfs         string            `yaml:"obfs"`
+	ObfsPassword string            `yaml:"obfs-password"`
+	Congestion   string            `yaml:"congestion-controller"`
+	UDPRelayMode string            `yaml:"udp-relay-mode"`
+	Up           string            `yaml:"up"`
+	Down         string            `yaml:"down"`
+}
+
+type clashReality struct {
+	PublicKey string `yaml:"public-key"`
+	ShortID   string `yaml:"short-id"`
+}
+
+type clashWS struct {
+	Path        string            `yaml:"path"`
+	Headers     map[string]string `yaml:"headers"`
+	EarlyData   int               `yaml:"max-early-data"`
+	EarlyHeader string            `yaml:"early-data-header-name"`
+}
+
+type clashH2 struct {
+	Host []string `yaml:"host"`
+	Path string   `yaml:"path"`
+}
+
+type clashGroup struct {
+	Name      string   `yaml:"name"`
+	Type      string   `yaml:"type"`
+	Proxies   []string `yaml:"proxies"`
+	Use       []string `yaml:"use"`
+	URL       string   `yaml:"url"`
+	Interval  int      `yaml:"interval"`
+	Tolerance int      `yaml:"tolerance"`
 }
 
 func (n clashNode) convert() (outbound.Node, error) {
-	if (n.Network != "" && n.Network != "tcp") || n.Flow != "" || n.Plugin != "" ||
-		n.Insecure || n.AlterID != 0 || n.Dialer != "" || (n.Encryption != "" && n.Encryption != "none") ||
-		n.Reality.Kind != 0 || n.WS.Kind != 0 || n.GRPC.Kind != 0 || n.HTTP.Kind != 0 || len(n.ALPN) != 0 || n.Fingerprint != "" {
-		return outbound.Node{}, errors.New("传输或 TLS 参数不受支持")
+	if n.AlterID != 0 {
+		return outbound.Node{}, errors.New("只支持 VMess AEAD（alterId=0）")
+	}
+	if n.HTTP.Kind != 0 || n.Network == "http" {
+		return outbound.Node{}, errors.New("HTTP 头部伪装不受支持")
+	}
+	if n.Encryption != "" && n.Encryption != "none" {
+		return outbound.Node{}, errors.New("VLESS 加密扩展不受支持")
 	}
 	if n.Port < 1 || n.Port > 65535 {
 		return outbound.Node{}, errors.New("端口无效")
 	}
 	kind := strings.ToLower(n.Type)
-	if kind == "ss" {
+	switch kind {
+	case "ss":
 		kind = "shadowsocks"
+	case "socks", "socks5":
+		kind = "socks5"
+	case "hy2":
+		kind = "hysteria2"
 	}
 	if n.TLS && kind == "http" {
 		kind = "https"
 	}
-	if n.TLS && (kind == "socks5" || kind == "shadowsocks") {
-		return outbound.Node{}, errors.New("此协议的 TLS 封装不受支持")
-	}
-	name := n.ServerName
-	if name == "" {
-		name = n.SNI
-	}
-	return outbound.Node{
+	node := outbound.Node{
 		Name: n.Name, Type: kind, Server: net.JoinHostPort(strings.Trim(n.Server, "[]"), strconv.Itoa(n.Port)),
-		Username: n.Username, Password: n.Password, UUID: n.UUID, Cipher: n.Cipher, ServerName: name, TLS: n.TLS,
-	}, nil
+		Username: n.Username, Password: n.Password, UUID: n.UUID, Cipher: n.Cipher,
+	}
+	if !outbound.Types[kind] {
+		return node, errors.New("节点协议 " + n.Type + " 不受支持")
+	}
+	s := spec{network: n.Network, sni: n.ServerName, alpn: n.ALPN, fingerprint: n.Fingerprint, flow: n.Flow,
+		insecure: n.Insecure, extra: map[string]any{}}
+	if s.sni == "" {
+		s.sni = n.SNI
+	}
+	if n.TLS {
+		s.security = "tls"
+	}
+	if n.Reality != nil {
+		s.security, s.publicKey, s.shortID = "reality", n.Reality.PublicKey, n.Reality.ShortID
+	}
+	if n.WS != nil {
+		s.path, s.host, s.earlyData, s.earlyHeader = n.WS.Path, n.WS.Headers["Host"], n.WS.EarlyData, n.WS.EarlyHeader
+	}
+	if n.GRPC != nil {
+		s.serviceName = n.GRPC["grpc-service-name"]
+	}
+	if n.H2 != nil {
+		s.path, s.host = n.H2.Path, strings.Join(n.H2.Host, ",")
+	}
+	if n.Dialer != "" {
+		s.extra["detour"] = n.Dialer
+	}
+	switch kind {
+	case "hysteria2":
+		s.network, s.security = "", "tls"
+		if n.Obfs != "" {
+			if n.Obfs != "salamander" {
+				return node, errors.New("Hysteria2 混淆 " + n.Obfs + " 不受支持")
+			}
+			s.extra["obfs"] = map[string]any{"type": "salamander", "password": n.ObfsPassword}
+		}
+		if n.Ports != "" {
+			s.extra["server_ports"] = hopPorts(n.Ports)
+		}
+		for key, value := range map[string]string{"up_mbps": n.Up, "down_mbps": n.Down} {
+			if mbps, err := strconv.Atoi(strings.Fields(value + " 0")[0]); err == nil && mbps > 0 {
+				s.extra[key] = mbps
+			}
+		}
+	case "tuic":
+		s.network, s.security = "", "tls"
+		if n.Congestion != "" {
+			s.extra["congestion_control"] = n.Congestion
+		}
+		if n.UDPRelayMode != "" {
+			s.extra["udp_relay_mode"] = n.UDPRelayMode
+		}
+	case "trojan", "anytls":
+		s.security = map[bool]string{true: "reality", false: "tls"}[s.security == "reality"]
+	case "shadowsocks":
+		if n.Plugin != "" {
+			name := n.Plugin
+			if name == "obfs" {
+				name = "obfs-local"
+			}
+			if name != "obfs-local" && name != "v2ray-plugin" {
+				return node, errors.New("Shadowsocks 插件 " + n.Plugin + " 不受支持")
+			}
+			s.extra["plugin"], s.extra["plugin_opts"] = name, pluginOptions(n.PluginOpts)
+		}
+	}
+	return node, s.apply(&node)
+}
+
+// pluginOptions renders Clash plugin-opts as the SIP003 "k=v;k=v" string.
+func pluginOptions(options map[string]any) string {
+	keys := make([]string, 0, len(options))
+	for key := range options {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var parts []string
+	for _, key := range keys {
+		value := fmt.Sprint(options[key])
+		switch key {
+		case "mode":
+			if value == "http" || value == "tls" {
+				key = "obfs"
+			}
+		case "tls":
+			if value == "true" {
+				parts = append(parts, "tls")
+			}
+			continue
+		}
+		parts = append(parts, key+"="+value)
+	}
+	return strings.Join(parts, ";")
 }
 
 func readBounded(reader io.Reader) ([]byte, error) {
@@ -132,7 +266,7 @@ func fetch(ctx context.Context, source *url.URL) ([]byte, error) {
 	return readBounded(response.Body)
 }
 
-func Import(ctx context.Context, input io.Reader, base engine.Config) (Result, error) {
+func Import(ctx context.Context, input io.Reader, base engine.Config, impl backend.Backend) (Result, error) {
 	data, err := readBounded(input)
 	if err != nil {
 		return Result{}, err
@@ -151,16 +285,20 @@ func Import(ctx context.Context, input io.Reader, base engine.Config) (Result, e
 		}
 	}
 	if config, err := engine.Decode(strings.NewReader(raw)); strings.HasPrefix(raw, "{") && err == nil {
-		if _, err := engine.New(config); err != nil {
+		if err := engine.Validate(config, impl); err != nil {
 			return Result{}, fmt.Errorf("HopWay 配置无效：%w", err)
 		}
 		return Result{Config: config, Added: len(config.Nodes), Notes: []string{"已导入完整 JSON 配置"}}, nil
 	}
 
-	result := Result{Config: base, Notes: []string{}, names: map[string]bool{"DIRECT": true, "REJECT": true, "SELECT": true}, seen: make(map[string]bool)}
+	result := Result{Config: base, Notes: []string{}, names: map[string]bool{"DIRECT": true, "REJECT": true, "SELECT": true},
+		seen: make(map[string]bool), check: impl.Check, renamed: map[string]string{}}
 	for _, node := range base.Nodes {
 		result.names[node.Name] = true
 		result.seen[identity(node)] = true
+	}
+	for _, g := range base.Groups {
+		result.names[g.Name] = true // shared links must not shadow existing groups
 	}
 	if decoded, err := decodeBase64(strings.Join(strings.Fields(raw), "")); err == nil && isLinks(string(decoded)) {
 		raw = string(decoded)
@@ -168,6 +306,9 @@ func Import(ctx context.Context, input io.Reader, base engine.Config) (Result, e
 	if isLinks(raw) {
 		for _, line := range strings.Fields(raw) {
 			node, err := parseLink(line)
+			if err == nil && node.Name == "" {
+				node.Name, _ = url.PathUnescape(node.Name)
+			}
 			result.add(node, err)
 		}
 	} else {
@@ -183,13 +324,14 @@ func Import(ctx context.Context, input io.Reader, base engine.Config) (Result, e
 				continue
 			}
 			node, err := proxy.convert()
-			if err != nil {
-				node.Name = proxy.Name
-			}
-			result.add(node, err)
+			node.Name = proxy.Name
+			result.addNamed(proxy.Name, node, err)
 		}
-		if len(profile.Groups) != 0 || len(profile.Rules) != 0 || profile.Providers.Kind != 0 {
-			result.Notes = append(result.Notes, "本次只导入内联节点，原有规则保持不变。Clash 策略组、规则和远程节点集未导入")
+		if profile.Providers.Kind != 0 {
+			result.Notes = append(result.Notes, "远程节点集（proxy-providers）暂未导入")
+		}
+		if len(profile.Groups) != 0 {
+			result.importClash(profile)
 		}
 	}
 	if result.Added == 0 && result.Skipped == 0 {
@@ -200,11 +342,186 @@ func Import(ctx context.Context, input io.Reader, base engine.Config) (Result, e
 	}
 	if len(base.Nodes) == 0 && len(result.Config.Nodes) != 0 && result.Config.Selected == "DIRECT" {
 		result.Config.Selected = result.Config.Nodes[0].Name
+		if len(result.Config.Groups) != 0 {
+			result.Config.Selected = result.Config.Groups[0].Name
+		}
 	}
-	if _, err := engine.New(result.Config); err != nil {
+	if err := engine.Validate(result.Config, impl); err != nil {
 		return Result{}, err
 	}
 	return result, nil
+}
+
+// importClash replaces groups and rules with the profile's, mapping names
+// through any renames made while adding nodes.
+func (result *Result) importClash(profile clash) {
+	var groups []engine.Group
+	declared := map[string]bool{}
+	var parsed []clashGroup
+	for _, entry := range profile.Groups {
+		var g clashGroup
+		if entry.Decode(&g) == nil && g.Name != "" {
+			parsed = append(parsed, g)
+			declared[g.Name] = true
+		}
+	}
+	nodeNames := map[string]bool{"DIRECT": true, "REJECT": true, "SELECT": true}
+	for _, node := range result.Config.Nodes {
+		nodeNames[node.Name] = true
+	}
+	groupName := map[string]string{}
+	taken := map[string]bool{}
+	for _, g := range parsed {
+		name := g.Name
+		for i := 2; nodeNames[name] || taken[name]; i++ {
+			name = fmt.Sprintf("%s (%d)", g.Name, i)
+		}
+		groupName[g.Name], taken[name] = name, true
+	}
+	resolve := func(member string) string {
+		switch strings.ToUpper(member) {
+		case "DIRECT":
+			return "DIRECT"
+		case "REJECT", "REJECT-DROP", "PASS":
+			return "REJECT"
+		}
+		if name := groupName[member]; name != "" {
+			return name
+		}
+		return result.renamed[member]
+	}
+	health := &engine.Health{}
+	dropped := 0
+	for _, g := range parsed {
+		kind := g.Type
+		switch kind {
+		case "select", "url-test", "fallback":
+		case "load-balance":
+			kind = "url-test"
+			result.Notes = append(result.Notes, "负载均衡组「"+g.Name+"」按最低延迟处理")
+		default:
+			dropped++
+			continue
+		}
+		var members []string
+		seen := map[string]bool{}
+		for _, member := range g.Proxies {
+			if name := resolve(member); name != "" && !seen[name] {
+				members = append(members, name)
+				seen[name] = true
+			}
+		}
+		if len(g.Use) != 0 {
+			result.Notes = append(result.Notes, "策略组「"+g.Name+"」引用的远程节点集未导入")
+		}
+		if len(members) == 0 {
+			dropped++
+			delete(groupName, g.Name)
+			continue
+		}
+		if kind != "select" && health.URL == "" && g.URL != "" {
+			health.URL, health.Interval = g.URL, max(g.Interval, 30)
+		}
+		groups = append(groups, engine.Group{Name: groupName[g.Name], Type: kind, Members: members, Tolerance: g.Tolerance})
+	}
+	// Dropping a group can empty another group that only pointed at it.
+	for {
+		valid := map[string]bool{}
+		for _, g := range groups {
+			valid[g.Name] = true
+		}
+		kept := groups[:0]
+		for _, g := range groups {
+			members := g.Members[:0:0]
+			for _, member := range g.Members {
+				if !taken[member] || valid[member] {
+					members = append(members, member)
+				}
+			}
+			g.Members = members
+			if len(members) != 0 {
+				kept = append(kept, g)
+			} else {
+				dropped++
+			}
+		}
+		if len(kept) == len(groups) && len(valid) == len(kept) {
+			groups = kept
+			break
+		}
+		groups = kept
+	}
+	if dropped > 0 {
+		result.Notes = append(result.Notes, fmt.Sprintf("%d 个策略组无法导入", dropped))
+	}
+	rules, skipped := convertRules(profile.Rules, func(target string) string {
+		name := resolve(target)
+		if name == "" || (taken[name] && !isGroupName(groups, name)) {
+			return ""
+		}
+		return name
+	})
+	if skipped > 0 {
+		result.Notes = append(result.Notes, fmt.Sprintf("%d 条规则未导入（GEOIP、RULE-SET 等类型暂不支持）", skipped))
+	}
+	result.Config.Groups, result.Config.Rules = groups, rules
+	if health.URL != "" {
+		result.Config.Health = health
+	}
+	result.Config.Mode = "rule"
+	result.Notes = append(result.Notes, fmt.Sprintf("已导入 %d 个策略组、%d 条规则，替换原有分组和规则", len(groups), len(rules)))
+}
+
+func isGroupName(groups []engine.Group, name string) bool {
+	for _, g := range groups {
+		if g.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func convertRules(lines []string, target func(string) string) ([]engine.Rule, int) {
+	var rules []engine.Rule
+	skipped := 0
+	var final *engine.Rule
+	for _, line := range lines {
+		parts := strings.Split(line, ",")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		kind := strings.ToUpper(parts[0])
+		if kind == "MATCH" || kind == "FINAL" {
+			if len(parts) >= 2 {
+				if via := target(parts[1]); via != "" {
+					final = &engine.Rule{Type: engine.RuleMatch, Via: via}
+				}
+			}
+			break // nothing after MATCH can apply
+		}
+		if len(parts) < 3 {
+			skipped++
+			continue
+		}
+		types := map[string]string{"DOMAIN": engine.RuleDomain, "DOMAIN-SUFFIX": engine.RuleDomainSuffix,
+			"DOMAIN-KEYWORD": engine.RuleDomainKeyword, "IP-CIDR": engine.RuleIPCIDR, "IP-CIDR6": engine.RuleIPCIDR}
+		ruleType, via := types[kind], target(parts[2])
+		if ruleType == "" || via == "" {
+			skipped++
+			continue
+		}
+		rule := engine.Rule{Type: ruleType, Value: parts[1], Via: via}
+		for _, option := range parts[3:] {
+			if strings.EqualFold(option, "no-resolve") {
+				rule.NoResolve = true
+			}
+		}
+		rules = append(rules, rule)
+	}
+	if final != nil {
+		rules = append(rules, *final)
+	}
+	return rules, skipped
 }
 
 func isLinks(data string) bool {
@@ -213,8 +530,15 @@ func isLinks(data string) bool {
 }
 
 func (result *Result) add(node outbound.Node, err error) {
+	result.addNamed(node.Name, node, err)
+}
+
+func (result *Result) addNamed(original string, node outbound.Node, err error) {
 	if err == nil {
 		err = node.Validate()
+	}
+	if err == nil && result.check != nil {
+		err = result.check(node)
 	}
 	if err != nil {
 		result.Skipped++
@@ -247,6 +571,9 @@ func (result *Result) add(node outbound.Node, err error) {
 	}
 	result.names[node.Name] = true
 	result.seen[key] = true
+	if _, exists := result.renamed[original]; original != "" && !exists {
+		result.renamed[original] = node.Name // Clash resolves duplicates to the first
+	}
 	result.Config.Nodes = append(result.Config.Nodes, node)
 	result.Added++
 }
