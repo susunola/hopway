@@ -85,6 +85,7 @@ private struct Dashboard: View {
     @State private var testingRoute = false
     @State private var showsRouteTester = false
     @State private var showsAutoRouting = false
+    @State private var showsPolicyDetails = false
     @State private var page: DashboardPage = .overview
     @State private var showsLinkImport = false
     @State private var importLink = ""
@@ -126,7 +127,6 @@ private struct Dashboard: View {
                                 }
                                 routingPresets
                                 policySummary
-                                policies
                             }
                             .padding(.bottom, 12)
                         }
@@ -170,7 +170,6 @@ private struct Dashboard: View {
         }
         .tint(HopAppearance.accent)
         .frame(minWidth: 880, minHeight: 525)
-        .sheet(isPresented: $showsAutoRouting) { AutoRoutingSheet(core: core) }
         .onChange(of: core.importCount) { _, _ in
             if page != .subscriptions { page = .nodes }
         }
@@ -395,6 +394,7 @@ private struct Dashboard: View {
                         .accessibilityLabel("配置按地区自动")
                         .disabled(core.phase != .running || !ready)
                         .help(core.phase == .stopped ? "启动代理后可配置地区与服务商。" : "设置地区与首选服务商")
+                        .sheet(isPresented: $showsAutoRouting) { AutoRoutingSheet(core: core) }
                 } else if !selected {
                     Button("使用") { core.selectRoutingPreset(preset.rawValue) }
                         .accessibilityLabel("使用" + title)
@@ -443,6 +443,11 @@ private struct Dashboard: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .fixedSize()
+                    if !(profile.groups ?? []).isEmpty || !(profile.ruleSets ?? []).isEmpty {
+                        Button("策略详情…") { showsPolicyDetails = true }
+                            .fixedSize()
+                            .sheet(isPresented: $showsPolicyDetails) { policyDetails }
+                    }
                 }
             }
             if let defaults = status?.ruleDefaults, status?.policy.mode == "rule" {
@@ -462,6 +467,21 @@ private struct Dashboard: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .hopPanel()
+    }
+
+    private var policyDetails: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                HopPageHeading(title: "策略详情", detail: "查看配置带入的策略组和规则集。")
+                Spacer(minLength: 10)
+                Button("完成") { showsPolicyDetails = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+            Divider()
+            ScrollView { policies }
+        }
+        .padding(22)
+        .frame(width: 560, height: 430)
     }
 
     private var policies: some View {
@@ -529,7 +549,6 @@ private struct Dashboard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .hopPanel()
     }
 
     private func groupMembers(_ names: [String]) -> some View {
