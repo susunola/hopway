@@ -254,7 +254,7 @@ func TestRemoteRuleSetCacheAndRefresh(t *testing.T) {
 		return core
 	}
 	via := func(core *Engine, host string) string {
-		name, _ := core.route(context.Background(), host, core.policy, nil)
+		name, _, _ := core.route(context.Background(), host, core.policy, nil)
 		return name
 	}
 

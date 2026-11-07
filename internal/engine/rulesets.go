@@ -42,6 +42,7 @@ const (
 	RuleRuleSet             = "rule-set"
 	defaultRuleSetInterval  = 86400
 	maxRuleSetSize          = 32 << 20
+	maxProfileRuleSetCost   = 256 << 20
 	ruleSetCheck            = 10 * time.Minute
 	ruleSetDownloadDeadline = 60 * time.Second
 )
@@ -55,6 +56,8 @@ type ruleSetState struct {
 	updated time.Time
 	err     string
 }
+
+var errRuleSetProfileBudget = errors.New("rule sets exceed the profile's combined compilation budget")
 
 type ruleSetKey struct {
 	digest           [sha256.Size]byte
@@ -129,12 +132,18 @@ func (engine *Engine) openRuleSets(ctx context.Context, config Config, indexes R
 				content := indexes[key]
 				if content == nil {
 					content, err = ruleset.ParseContext(ctx, state.format, state.Behavior, data)
-					if err == nil && indexes != nil {
-						indexes[key] = content
-					}
 				}
 				if err == nil {
+					if engine.ruleSetCost+content.MemoryCost() > maxProfileRuleSetCost {
+						return fmt.Errorf("rule-set %q: %w", rs.Name, errRuleSetProfileBudget)
+					}
 					state.digest, state.content, state.updated = key.digest, content, updated
+					engine.ruleSetCost += content.MemoryCost()
+					if indexes != nil {
+						indexes[key] = content
+					}
+				} else if rs.URL != "" {
+					state.err = err.Error()
 				}
 			}
 			if err != nil && rs.Path != "" {
@@ -349,6 +358,10 @@ func (engine *Engine) refreshRuleSet(ctx context.Context, state *ruleSetState, e
 	if content.Entries == 0 {
 		return errors.New("rule set has no usable entries")
 	}
+	cost := engine.ruleSetCost - state.content.MemoryCost() + content.MemoryCost()
+	if cost > maxProfileRuleSetCost {
+		return errRuleSetProfileBudget
+	}
 	path := engine.cachePath(state)
 	var staged string
 	if path != "" {
@@ -376,6 +389,7 @@ func (engine *Engine) refreshRuleSet(ctx context.Context, state *ruleSetState, e
 	if state.content != content {
 		engine.rules.replaceRuleSet(state.slot, content)
 		state.content, state.digest = content, digest
+		engine.ruleSetCost = cost
 	}
 	state.updated = updated
 	return nil

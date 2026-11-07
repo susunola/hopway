@@ -12,10 +12,17 @@ import (
 	"io"
 	"net/netip"
 	"regexp"
+	"regexp/syntax"
 	"strings"
-
-	"go.yaml.in/yaml/v3"
 )
+
+const (
+	maxCompileCost     = 128 << 20
+	maxRegexLength     = 2048
+	maxRegexComplexity = 8192
+)
+
+var errRuleSetBudget = errors.New("rule set exceeds the compilation budget")
 
 // Content is one compiled list. It is immutable once built.
 type Content struct {
@@ -31,6 +38,24 @@ type Content struct {
 	ipSets     []interface{ Contains(netip.Addr) bool }
 	Entries    int // usable entries
 	Skipped    int // entries of kinds HopWay cannot match (ports, processes, ...)
+	cost       uint64
+}
+
+// MemoryCost is a conservative accounting weight, not a measurement of the
+// Go heap. It covers objects that can grow much faster than the input bytes.
+func (c *Content) MemoryCost() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.cost
+}
+
+func (c *Content) charge(cost uint64) error {
+	if cost > maxCompileCost-c.cost {
+		return errRuleSetBudget
+	}
+	c.cost += cost
+	return nil
 }
 
 func newContent() *Content {
@@ -70,6 +95,20 @@ func (c *Content) addKeyword(value string) {
 }
 
 func (c *Content) addRegex(value string) error {
+	if len(value) > maxRegexLength {
+		return errRuleSetBudget
+	}
+	expression, err := syntax.Parse(value, syntax.Perl)
+	if err != nil {
+		return err
+	}
+	complexity := regexComplexity(expression)
+	if complexity > maxRegexComplexity {
+		return errRuleSetBudget
+	}
+	if err := c.charge(uint64(512 + complexity*128)); err != nil {
+		return err
+	}
 	re, err := regexp.Compile(value)
 	if err != nil {
 		return err
@@ -77,6 +116,21 @@ func (c *Content) addRegex(value string) error {
 	c.regexes = append(c.regexes, re)
 	c.Entries++
 	return nil
+}
+
+func regexComplexity(expression *syntax.Regexp) int {
+	size := 1 + len(expression.Rune)
+	for _, sub := range expression.Sub {
+		size += regexComplexity(sub)
+	}
+	if expression.Op == syntax.OpRepeat {
+		count := expression.Max
+		if count < 0 {
+			count = expression.Min + 1
+		}
+		size *= max(count, 1)
+	}
+	return min(size, maxRegexComplexity+1)
 }
 
 func (c *Content) addCIDR(value string) error {
@@ -260,22 +314,8 @@ func ParseContext(ctx context.Context, format, behavior string, data []byte) (*C
 	c := newContent()
 	reader := contextReader{ctx, bytes.NewReader(data)}
 	if format == FormatYAML || (format == "" && bytes.Contains(data, []byte("payload:"))) {
-		var doc struct {
-			Payload []string `yaml:"payload"`
-		}
-		if err := yaml.NewDecoder(reader).Decode(&doc); err != nil && err != io.EOF {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, errors.New("rule-set YAML must contain a payload list")
-		}
-		for _, line := range doc.Payload {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if err := c.addLine(behavior, line); err != nil {
-				return nil, err
-			}
+		if err := c.parseYAML(ctx, behavior, data); err != nil {
+			return nil, err
 		}
 	} else {
 		scanner := bufio.NewScanner(reader)
@@ -303,6 +343,9 @@ func (c *Content) addLine(behavior, line string) error {
 	if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
 		return nil
 	}
+	if err := c.charge(96 + uint64(len(line))); err != nil {
+		return err
+	}
 	var err error
 	switch behavior {
 	case BehaviorDomain:
@@ -320,18 +363,22 @@ func (c *Content) addLine(behavior, line string) error {
 		return fmt.Errorf("unsupported rule-set behavior %q", behavior)
 	}
 	if err != nil {
+		if errors.Is(err, errRuleSetBudget) {
+			return err
+		}
 		c.Skipped++
 	}
 	return nil
 }
 
 func (c *Content) addClassical(line string) error {
-	parts := strings.Split(line, ",")
-	if len(parts) < 2 {
+	kind, fields, ok := strings.Cut(line, ",")
+	if !ok {
 		return errors.New("malformed")
 	}
-	value := strings.TrimSpace(parts[1])
-	switch strings.ToUpper(strings.TrimSpace(parts[0])) {
+	value, _, _ := strings.Cut(fields, ",")
+	value = strings.TrimSpace(value)
+	switch strings.ToUpper(strings.TrimSpace(kind)) {
 	case "DOMAIN":
 		c.addDomain(value)
 	case "DOMAIN-SUFFIX":

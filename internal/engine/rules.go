@@ -229,7 +229,11 @@ func (m *matcher) match(host string, resolve func(string) []netip.Addr, owner fu
 		contents = *m.snapshot.Load()
 	}
 	best := m.final
-	if addr, err := netip.ParseAddr(host); err == nil {
+	var addr netip.Addr
+	if strings.IndexByte(host, ':') >= 0 || couldBeIPv4(host) {
+		addr, _ = netip.ParseAddr(host)
+	}
+	if addr.IsValid() {
 		addr = addr.WithZone("")
 		best = min(best, m.ip.lookup(addr))
 		best = m.matchSetIP(contents, best, addr, false)
@@ -273,6 +277,19 @@ func (m *matcher) match(host string, resolve func(string) []netip.Addr, owner fu
 		}
 	}
 	return found(best)
+}
+
+// A DNS name does not need to construct netip's parse error on every match.
+func couldBeIPv4(host string) bool {
+	if len(host) < 7 || len(host) > 15 {
+		return false
+	}
+	for i := range len(host) {
+		if c := host[i]; c != '.' && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveCould reports whether an IP rule that may resolve names sits before best.

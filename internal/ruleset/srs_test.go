@@ -5,6 +5,8 @@ package ruleset
 import (
 	"bytes"
 	"compress/zlib"
+	"encoding/binary"
+	"errors"
 	"net/netip"
 	"strings"
 	"testing"
@@ -13,6 +15,41 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 )
+
+func encodeSRSFixture(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	buffer.Write(srs.MagicBytes[:])
+	buffer.WriteByte(C.RuleSetVersionCurrent)
+	compressed := zlib.NewWriter(&buffer)
+	if _, err := compressed.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buffer.Bytes()
+}
+
+func TestSRSDenseNestedRecordsAreRejected(t *testing.T) {
+	payload := binary.AppendUvarint([]byte{1, 1, 1}, 100_000)
+	payload = append(payload, bytes.Repeat([]byte{0, srsEnd, 0}, 100_000)...)
+	payload = append(payload, 0)
+	if content, err := Parse(FormatSRS, "", encodeSRSFixture(t, payload)); content != nil || !errors.Is(err, errRuleSetBudget) {
+		t.Fatalf("dense nested SRS returned %v, %v", content, err)
+	}
+}
+
+func TestSRSRejectsDisconnectedSuccinctTree(t *testing.T) {
+	payload := []byte{1, 0, srsDomain, 0, 1}
+	payload = binary.BigEndian.AppendUint64(payload, 3) // two leaves
+	payload = append(payload, 1)
+	payload = binary.BigEndian.AppendUint64(payload, 5) // a node follows the closed root
+	payload = append(payload, 1, 'a', srsEnd, 0)
+	if content, err := Parse(FormatSRS, "", encodeSRSFixture(t, payload)); content != nil || err == nil || !strings.Contains(err.Error(), "disconnected") {
+		t.Fatalf("disconnected SRS returned %v, %v", content, err)
+	}
+}
 
 func TestSRSRejectsExpansionBeyondLimit(t *testing.T) {
 	var buffer bytes.Buffer
@@ -43,6 +80,7 @@ func TestSRS(t *testing.T) {
 			IPCIDR: []string{"1.0.1.0/24", "240e::/20"},
 		}},
 		{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{Domain: []string{"port-only.cn"}, Port: []uint16{443}}},
+		{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultHeadlessRule{Domain: []string{"source-only.cn"}, SourceIPCIDR: []string{"192.0.2.0/24"}}},
 	}}
 	var buffer bytes.Buffer
 	if err := srs.Write(&buffer, plain, C.RuleSetVersionCurrent); err != nil {
@@ -52,11 +90,11 @@ func TestSRS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if content.Skipped != 1 {
-		t.Fatalf("a port-restricted rule must be skipped, got %+v", content)
+	if content.Skipped != 2 {
+		t.Fatalf("port- and source-restricted rules must be skipped, got %+v", content)
 	}
 	for host, want := range map[string]bool{"exact.cn": true, "www.baidu.com": true, "baidu.com": true, "sub.cn": false,
-		"a.sub.cn": true, "m.taobao.com": true, "port-only.cn": false} {
+		"a.sub.cn": true, "m.taobao.com": true, "port-only.cn": false, "source-only.cn": false} {
 		if content.MatchDomain(host) != want {
 			t.Errorf("%s: want %v", host, want)
 		}

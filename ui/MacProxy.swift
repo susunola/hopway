@@ -334,6 +334,12 @@ private struct Dashboard: View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
+            if let defaults = status?.ruleDefaults {
+                Text("本次加载后 · MATCH \(defaults.explicitMatch.formatted()) 次 · 未命中直连 \(defaults.implicit.formatted()) 次")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
             if core.profileReadFailed {
                 Label("配置读取失败，请在设置中检查已保存的配置。", systemImage: "exclamationmark.circle")
                     .font(.caption)

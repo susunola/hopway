@@ -4,14 +4,18 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"slices"
 	"testing"
+	"time"
 
 	"mac-proxy/internal/process"
+	"mac-proxy/internal/ruleset"
 )
 
 func TestRuleSemantics(t *testing.T) {
 	rules := []Rule{
 		{Type: RuleDomain, Value: "exact.example.com", Via: "A"},
+		{Type: RuleDomain, Value: "1.2.3.test", Via: "A"},
 		{Type: RuleDomainKeyword, Value: "track", Via: "REJECT"},
 		{Type: RuleDomainSuffix, Value: "example.com", Via: "B"},
 		{Type: RuleIPCIDR, Value: "10.0.0.0/8", Via: "C", NoResolve: true},
@@ -33,6 +37,7 @@ func TestRuleSemantics(t *testing.T) {
 	cases := []struct{ host, via string }{
 		{"exact.example.com", "A"},
 		{"EXACT.example.com.", "A"},
+		{"1.2.3.test", "A"},
 		{"a.example.com", "B"},
 		{"example.com", "B"},
 		{"notexample.com", "G"},
@@ -54,7 +59,7 @@ func TestRuleSemantics(t *testing.T) {
 			t.Errorf("%s: got %s, want %s", c.host, got, c.via)
 		}
 	}
-	// a.example.com matched rule 3 before any resolvable IP rule: no lookup.
+	// a.example.com matched a domain rule before any resolvable IP rule: no lookup.
 	resolved = 0
 	m.match("a.example.com", resolve, nil)
 	if resolved != 0 {
@@ -138,6 +143,68 @@ func BenchmarkMatchRuleCounts(b *testing.B) {
 	}
 }
 
+func BenchmarkCompoundRuleMatch(b *testing.B) {
+	content, err := ruleset.Parse(ruleset.FormatText, ruleset.BehaviorClassical, []byte("DOMAIN,listed.example\nIP-CIDR,192.0.2.0/24\n"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	sets := []*ruleSetState{{RuleSet: RuleSet{Name: "mixed"}, content: content}}
+	m, err := newMatcher([]Rule{
+		{Type: RuleProcessName, Value: "relay", Via: "DIRECT"},
+		{Type: RuleRuleSet, Value: "mixed", Via: "REJECT"},
+		{Type: RuleMatch, Via: "DIRECT"},
+	}, func(string) bool { return true }, sets)
+	if err != nil {
+		b.Fatal(err)
+	}
+	addresses := []netip.Addr{netip.MustParseAddr("192.0.2.10")}
+	resolve := func(string) []netip.Addr { return addresses }
+	application := process.Owner{Name: "unknown"}
+	owner := func() *process.Owner { return &application }
+	hosts := []string{"listed.example", "unlisted.example", "192.0.2.10"}
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		if result := m.match(hosts[i%len(hosts)], resolve, owner); result != 1 {
+			b.Fatalf("unexpected route %d", result)
+		}
+		i++
+	}
+}
+
+func BenchmarkPolicyDepth(b *testing.B) {
+	for _, depth := range []int{1, 4, 8} {
+		b.Run(fmt.Sprint(depth), func(b *testing.B) {
+			config := Default()
+			name := "DIRECT"
+			for level := range depth {
+				group := fmt.Sprintf("level-%d", level)
+				config.Groups = append(config.Groups, Group{Name: group, Type: GroupSelect, Members: []string{name}})
+				name = group
+			}
+			proxy, err := New(config, nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			var samples [16384]time.Duration
+			i := 0
+			for b.Loop() {
+				start := time.Now()
+				result := proxy.choices(name)
+				samples[i%len(samples)] = time.Since(start)
+				if len(result) != 1 || len(result[0].route) != depth || result[0].via != "DIRECT" {
+					b.Fatal("unexpected nested route")
+				}
+				i++
+			}
+			observed := samples[:min(i, len(samples))]
+			slices.Sort(observed)
+			b.ReportMetric(float64(observed[(len(observed)-1)*95/100].Nanoseconds()), "p95-ns")
+		})
+	}
+}
+
 func TestProcessRules(t *testing.T) {
 	rules := []Rule{
 		{Type: RuleDomainSuffix, Value: "early.test", Via: "A"},
@@ -190,7 +257,7 @@ func TestScopedIPv6RouteRespectsLocalInterfaceAndExplicitRejection(t *testing.T)
 		{"fe80::124%en9", "auto", "proxy", "DIRECT"},
 		{"2001:db8::2", "global", "proxy", "proxy"},
 	} {
-		if got, _ := e.route(context.Background(), sample.host, Policy{Mode: sample.mode, Selected: sample.selected}, nil); got != sample.want {
+		if got, _, _ := e.route(context.Background(), sample.host, Policy{Mode: sample.mode, Selected: sample.selected}, nil); got != sample.want {
 			t.Errorf("%s in %s mode via %s, want %s", sample.host, sample.mode, got, sample.want)
 		}
 	}

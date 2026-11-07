@@ -212,6 +212,11 @@ struct ProxyStatus: Decodable, Equatable {
         var id: String { name }
     }
 
+    struct RuleDefaults: Decodable, Equatable {
+        let explicitMatch: UInt64
+        let implicit: UInt64
+    }
+
     struct UDPDropCounts: Decodable, Equatable {
         let invalid: UInt64
         let fragmented: UInt64
@@ -231,6 +236,7 @@ struct ProxyStatus: Decodable, Equatable {
     let groups: [PolicyGroup]?
     let subscriptions: [Subscription]?
     let ruleSets: [RuleSet]?
+    let ruleDefaults: RuleDefaults?
     let systemProxy: SystemProxy?
     let tun: TUN?
     let nodes: [Node]

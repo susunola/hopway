@@ -1,9 +1,41 @@
 package ruleset
 
 import (
+	"bytes"
+	"errors"
 	"net/netip"
+	"strings"
 	"testing"
 )
+
+func TestLargeYAMLBlockPayloadMatchesNormalDecoder(t *testing.T) {
+	const sample = "payload: # fixture\n  - '+.alpha.test' # note\n  - \"*.beta.test\"\n  - gamma.test\n  - raw#fragment.test\n  - null\n"
+	data := append([]byte(sample), bytes.Repeat([]byte("# pad for a large rule set\n"), 100_000)...)
+	large, err := Parse(FormatYAML, BehaviorDomain, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	small, err := Parse(FormatYAML, BehaviorDomain, []byte(sample))
+	if err != nil || large.Entries != small.Entries {
+		t.Fatalf("large and small YAML disagree: %d, %v, %v", large.Entries, small, err)
+	}
+	for _, name := range []string{"alpha.test", "one.alpha.test", "beta.test", "one.beta.test", "gamma.test", "raw#fragment.test", "null"} {
+		if large.MatchDomain(name) != small.MatchDomain(name) {
+			t.Errorf("large and small YAML disagree for %s", name)
+		}
+	}
+}
+
+func TestRuleSetRejectsExpensiveYAMLAndRegex(t *testing.T) {
+	flow := []byte("payload: [\n" + strings.Repeat("  [],\n", maxGeneralYAMLSize/6) + "]")
+	if content, err := Parse(FormatYAML, BehaviorDomain, flow); content != nil || err == nil || !strings.Contains(err.Error(), "block payload") {
+		t.Fatalf("large YAML flow collection returned %v, %v", content, err)
+	}
+	data := []byte("DOMAIN,valid.test\nDOMAIN-REGEX,(abcdefghijklmno){1000}\n")
+	if content, err := Parse(FormatText, BehaviorClassical, data); content != nil || !errors.Is(err, errRuleSetBudget) {
+		t.Fatalf("expensive regex returned %v, %v", content, err)
+	}
+}
 
 func TestClashFormats(t *testing.T) {
 	domain, err := Parse(FormatYAML, BehaviorDomain, []byte("payload:\n  - '+.google.com'\n  - '.only-sub.test'\n  - 'exact.test'\n  - '*.wild.test'\n"))

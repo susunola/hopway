@@ -164,6 +164,12 @@ type Status struct {
 	SessionTraffic *trafficCount                 `json:"sessionTraffic,omitempty"`
 	UDPDrops       map[string]wire.UDPDropCounts `json:"udpDrops,omitempty"`
 	Resources      *ResourceStatus               `json:"resources,omitempty"`
+	RuleDefaults   RuleDefaults                  `json:"ruleDefaults"`
+}
+
+type RuleDefaults struct {
+	ExplicitMatch uint64 `json:"explicitMatch"`
+	Implicit      uint64 `json:"implicit"`
 }
 
 type Engine struct {
@@ -212,6 +218,9 @@ type Engine struct {
 	lookupProcessUDP func(client, server netip.AddrPort) (*process.Owner, error)
 	dataDir          string
 	ruleSets         []*ruleSetState
+	ruleSetCost      uint64
+	explicitMatch    atomic.Uint64
+	implicitDefault  atomic.Uint64
 }
 
 const (
@@ -526,42 +535,66 @@ func resolveForRules(ctx context.Context, host string) []netip.Addr {
 }
 
 // route picks the outbound name for host. Rules are immutable after New.
-func (engine *Engine) route(ctx context.Context, host string, policy Policy, owner func() *process.Owner) (string, string) {
+type ruleOutcome uint8
+
+const (
+	specificRoute ruleOutcome = iota
+	explicitMatch
+	implicitDefault
+)
+
+func (rule Rule) outcome() ruleOutcome {
+	if rule.Type == RuleMatch {
+		return explicitMatch
+	}
+	return specificRoute
+}
+
+func (engine *Engine) countRuleOutcome(outcome ruleOutcome) {
+	switch outcome {
+	case explicitMatch:
+		engine.explicitMatch.Add(1)
+	case implicitDefault:
+		engine.implicitDefault.Add(1)
+	}
+}
+
+func (engine *Engine) route(ctx context.Context, host string, policy Policy, owner func() *process.Owner) (string, string, ruleOutcome) {
 	if strings.Contains(host, "%") {
 		if addr, err := netip.ParseAddr(host); err == nil && wire.IsScopedLinkLocal(addr) {
 			if policy.Mode == "global" && policy.Selected == "REJECT" {
-				return "REJECT", "global mode"
+				return "REJECT", "global mode", specificRoute
 			}
 			if policy.Mode == "rule" {
 				index := engine.rules.match(host, nil, owner)
 				if index >= 0 {
 					rule := engine.rules.rules[index]
 					if rule.Via == "REJECT" || rule.Via == "SELECT" && policy.Selected == "REJECT" {
-						return "REJECT", rule.String()
+						return "REJECT", rule.String(), rule.outcome()
 					}
 				}
 			}
-			return "DIRECT", "IPv6 link-local interface"
+			return "DIRECT", "IPv6 link-local interface", specificRoute
 		}
 	}
 	switch policy.Mode {
 	case "direct":
-		return "DIRECT", "direct mode"
+		return "DIRECT", "direct mode", specificRoute
 	case "auto":
-		return "AUTO", "automatic · " + policy.Auto.Region
+		return "AUTO", "automatic · " + policy.Auto.Region, specificRoute
 	case "global":
-		return policy.Selected, "global mode"
+		return policy.Selected, "global mode", specificRoute
 	}
 	index := engine.rules.match(host, func(name string) []netip.Addr { return resolveForRules(ctx, name) }, owner)
 	if index < 0 {
-		return "DIRECT", "default"
+		return "DIRECT", "default", implicitDefault
 	}
 	rule := engine.rules.rules[index]
 	via := rule.Via
 	if via == "SELECT" {
 		via = policy.Selected
 	}
-	return via, rule.String()
+	return via, rule.String(), rule.outcome()
 }
 
 // Decide reports the outbound a connection to target would use, without
@@ -584,7 +617,7 @@ func (engine *Engine) ExplainContext(ctx context.Context, target string) (RouteD
 	engine.mu.Lock()
 	policy := engine.policy
 	engine.mu.Unlock()
-	via, rule := engine.route(ctx, host, policy, nil)
+	via, rule, _ := engine.route(ctx, host, policy, nil)
 	if err := ctx.Err(); err != nil {
 		return RouteDecision{}, err
 	}
@@ -638,11 +671,12 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		}
 		return owner
 	}
-	via, rule := engine.route(ctx, host, policy, lookup)
+	via, rule, outcome := engine.route(ctx, host, policy, lookup)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	record.Rule = rule
+	engine.countRuleOutcome(outcome)
 	engine.mu.Lock()
 	candidates := engine.choices(via)
 	engine.mu.Unlock()
@@ -796,11 +830,12 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 		}
 		return owner
 	}
-	via, rule := engine.route(ctx, host, policy, lookup)
+	via, rule, outcome := engine.route(ctx, host, policy, lookup)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	record.Rule = rule
+	engine.countRuleOutcome(outcome)
 	engine.mu.Lock()
 	candidates := engine.choices(via)
 	engine.mu.Unlock()
@@ -1090,7 +1125,8 @@ func (engine *Engine) status(includeConnections bool) Status {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	status := Status{Backend: engine.backend, Policy: engine.policy, Active: len(engine.live) + len(engine.livePackets),
-		RuleSets: engine.ruleSetStatus(), SessionTraffic: engine.traffic.sessionTotals()}
+		RuleSets: engine.ruleSetStatus(), SessionTraffic: engine.traffic.sessionTotals(),
+		RuleDefaults: RuleDefaults{ExplicitMatch: engine.explicitMatch.Load(), Implicit: engine.implicitDefault.Load()}}
 	if engine.budget != nil {
 		status.Resources = engine.budget.status()
 	}
