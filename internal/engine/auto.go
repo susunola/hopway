@@ -92,6 +92,7 @@ func (engine *Engine) MonitorAuto(ctx context.Context) {
 		if state != nil {
 			state.unavailable = engine.unavailableProviders(state.config)
 			state.orderedCandidates = state.candidates()
+			epoch := engine.networkEpoch.Load()
 			probeCtx, cancel := context.WithCancel(ctx)
 			state.cancel, state.probing = cancel, true
 			engine.mu.Unlock()
@@ -114,7 +115,7 @@ func (engine *Engine) MonitorAuto(ctx context.Context) {
 			engine.mu.Lock()
 			if engine.auto == state {
 				state.probing, state.cancel = false, nil
-				if err == nil {
+				if err == nil && engine.networkEpoch.Load() == epoch {
 					state.apply(measurements)
 				}
 			}

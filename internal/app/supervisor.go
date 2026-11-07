@@ -68,20 +68,22 @@ type Supervisor struct {
 	ports         []int
 	lease         *os.File
 
-	ledger     *engine.TrafficLedger
-	refreshMu  sync.Mutex
-	current    atomic.Pointer[engine.Engine]
-	mu         sync.Mutex // serializes reloads; guards the fields below
-	loaded     profile.Loaded
-	autoPolicy *engine.Policy
-	subErr     map[string]string
-	subMeta    map[string]SubscriptionStatus // nodes and update time of each snapshot
-	started    time.Time
-	ctx        context.Context
-	cancel     context.CancelFunc
-	closing    bool
-	closeOnce  sync.Once
-	retiring   sync.WaitGroup
+	ledger        *engine.TrafficLedger
+	refreshMu     sync.Mutex
+	current       atomic.Pointer[engine.Engine]
+	mu            sync.Mutex // serializes reloads; guards the fields below
+	loaded        profile.Loaded
+	autoPolicy    *engine.Policy
+	subErr        map[string]string
+	subMeta       map[string]SubscriptionStatus // nodes and update time of each snapshot
+	started       time.Time
+	ctx           context.Context
+	cancel        context.CancelFunc
+	networkCtx    context.Context
+	cancelNetwork context.CancelFunc
+	closing       bool
+	closeOnce     sync.Once
+	retiring      sync.WaitGroup
 
 	proxyMu     sync.Mutex
 	proxy       *sysproxy.Manager
@@ -133,6 +135,7 @@ func Open(path, dataDir string, impl backend.Backend) (*Supervisor, error) {
 		return nil, errors.Join(err, recoveryErr)
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.networkCtx, s.cancelNetwork = context.WithCancel(s.ctx)
 	s.loaded = loaded
 	s.loadAutoPolicy()
 	s.readSnapshotMeta()
@@ -352,7 +355,12 @@ func (s *Supervisor) networkChanged(event netmon.Event) {
 		s.tunMu.Unlock()
 		return
 	}
-	s.current.Load().NetworkChanged()
+	s.mu.Lock()
+	s.cancelNetwork()
+	s.networkCtx, s.cancelNetwork = context.WithCancel(s.ctx)
+	current := s.current.Load()
+	s.mu.Unlock()
+	current.NetworkChanged()
 	if s.tunDevice != nil {
 		s.tunDevice.ResetNetwork()
 	}
@@ -538,21 +546,29 @@ func (s *Supervisor) RefreshSubscription(ctx context.Context, id string) {
 }
 
 func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id string) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stop := context.AfterFunc(s.ctx, cancel)
-	defer stop()
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
-	if ctx.Err() != nil || s.isClosing() {
+	if ctx.Err() != nil {
 		return
 	}
 	s.mu.Lock()
-	user := s.loaded.User
-	subs := user.Subscriptions
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	network := s.networkCtx
+	subs := s.loaded.User.Subscriptions
 	s.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(network, cancel)
+	defer stop()
 	changed := false
 	for _, sub := range subs {
+		if ctx.Err() != nil || network.Err() != nil {
+			break
+		}
 		if sub.Paused || (id != "" && sub.Key() != id) {
 			continue
 		}
@@ -572,28 +588,52 @@ func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id st
 			},
 			ForceAttemptHTTP2: true,
 		}
-		snapshot, err := profile.RefreshSnapshot(ctx, user, sub, s.dataDir, s.impl, transport)
+		snapshot, _, err := profile.Fetch(ctx, sub, s.impl, transport)
 		transport.CloseIdleConnections()
 		s.mu.Lock()
+		// Check the generation and the subscription again under the same
+		// lock that serializes network events and profile changes.
+		if ctx.Err() != nil || s.closing || network != s.networkCtx {
+			s.mu.Unlock()
+			break
+		}
+		current, exists := s.currentSubscription(sub)
+		if !exists {
+			s.mu.Unlock()
+			continue
+		}
+		if err == nil {
+			err = profile.CommitRefresh(s.loaded.User, current, snapshot, s.dataDir, s.impl)
+		}
 		if err != nil {
-			s.subErr[sub.Name] = err.Error()
+			s.subErr[current.Name] = err.Error()
 		} else {
-			delete(s.subErr, sub.Name)
-			s.subMeta[sub.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated, Usage: snapshot.Usage}
+			delete(s.subErr, current.Name)
+			s.subMeta[current.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated, Usage: snapshot.Usage}
 			changed = true
 		}
 		s.mu.Unlock()
-		if ctx.Err() != nil {
-			return
-		}
 	}
 	if changed {
-		if err := s.Reload(); err != nil {
-			s.mu.Lock()
-			s.loaded.Warnings = append(s.loaded.Warnings, "订阅已更新，但新配置无法应用："+err.Error())
-			s.mu.Unlock()
+		s.mu.Lock()
+		if !s.closing {
+			if err := s.reloadLocked(); err != nil {
+				s.loaded.Warnings = append(s.loaded.Warnings, "订阅已更新，但新配置无法应用："+err.Error())
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+// currentSubscription is called with mu held. A rename does not invalidate
+// the download, but replacing or pausing the source does.
+func (s *Supervisor) currentSubscription(previous engine.Subscription) (engine.Subscription, bool) {
+	for _, current := range s.loaded.User.Subscriptions {
+		if !current.Paused && current.Key() == previous.Key() && current.URL == previous.URL && current.Agent == previous.Agent {
+			return current, true
 		}
 	}
+	return engine.Subscription{}, false
 }
 
 func (s *Supervisor) autoPolicyPath() string {

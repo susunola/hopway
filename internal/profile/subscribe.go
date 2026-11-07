@@ -35,10 +35,22 @@ func RefreshSnapshot(ctx context.Context, user engine.Config, sub engine.Subscri
 	if err != nil {
 		return nil, err
 	}
-	if err := prepareSnapshot(user, sub, snapshot, dataDir, impl); err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return snapshot, SaveSnapshot(dataDir, sub, snapshot)
+	if err := CommitRefresh(user, sub, snapshot, dataDir, impl); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
+// CommitRefresh validates a downloaded snapshot against the current profile
+// before atomically replacing the last good copy.
+func CommitRefresh(user engine.Config, sub engine.Subscription, snapshot *Snapshot, dataDir string, impl backend.Backend) error {
+	if err := prepareSnapshot(user, sub, snapshot, dataDir, impl); err != nil {
+		return err
+	}
+	return SaveSnapshot(dataDir, sub, snapshot)
 }
 
 func prepareSnapshot(user engine.Config, sub engine.Subscription, snapshot *Snapshot, dataDir string, impl backend.Backend) error {

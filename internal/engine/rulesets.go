@@ -128,7 +128,21 @@ func (engine *Engine) ruleSetLoop(ctx context.Context) {
 
 // RefreshRuleSets downloads remote sets that are stale (or all, if force).
 func (engine *Engine) RefreshRuleSets(ctx context.Context, force bool) {
+	engine.ruleRefreshMu.Lock()
+	defer engine.ruleRefreshMu.Unlock()
+	engine.mu.Lock()
+	network, epoch := engine.networkCtx, engine.networkEpoch.Load()
+	engine.mu.Unlock()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if network != nil {
+		stop := context.AfterFunc(network, cancel)
+		defer stop()
+	}
 	for _, state := range engine.ruleSets {
+		if ctx.Err() != nil || (network != nil && network.Err() != nil) {
+			return
+		}
 		engine.mu.Lock()
 		stale := state.URL != "" && (force || state.set.Load() == nil ||
 			time.Since(state.updated) > time.Duration(state.Interval)*time.Second)
@@ -136,20 +150,21 @@ func (engine *Engine) RefreshRuleSets(ctx context.Context, force bool) {
 		if !stale {
 			continue
 		}
-		err := engine.downloadRuleSet(ctx, state)
+		err := engine.downloadRuleSet(ctx, state, epoch)
 		engine.mu.Lock()
+		if ctx.Err() != nil || engine.closed || engine.networkEpoch.Load() != epoch {
+			engine.mu.Unlock()
+			return
+		}
 		state.err = ""
 		if err != nil {
 			state.err = err.Error() // keep serving the previous copy
 		}
 		engine.mu.Unlock()
-		if ctx.Err() != nil {
-			return
-		}
 	}
 }
 
-func (engine *Engine) downloadRuleSet(ctx context.Context, state *ruleSetState) error {
+func (engine *Engine) downloadRuleSet(ctx context.Context, state *ruleSetState, epoch uint64) error {
 	ctx, cancel := context.WithTimeout(ctx, ruleSetDownloadDeadline)
 	defer cancel()
 	transport := &http.Transport{
@@ -186,43 +201,74 @@ func (engine *Engine) downloadRuleSet(ctx context.Context, state *ruleSetState) 
 	if content.Entries == 0 {
 		return errors.New("rule set has no usable entries")
 	}
-	if path := engine.cachePath(state); path != "" {
-		if err := WriteAtomic(path, data); err != nil {
+	path := engine.cachePath(state)
+	var staged string
+	if path != "" {
+		staged, err = stageWrite(path, data)
+		if err != nil {
+			return fmt.Errorf("cache: %w", err)
+		}
+		defer os.Remove(staged)
+	}
+	// Disk I/O and parsing stay outside the routing lock. Only publishing the
+	// prepared file and the new matcher are serialized with a network change.
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if engine.closed || engine.networkEpoch.Load() != epoch {
+		return context.Canceled
+	}
+	if staged != "" {
+		if err := os.Rename(staged, path); err != nil {
 			return fmt.Errorf("cache: %w", err)
 		}
 	}
 	state.set.Store(content)
-	engine.mu.Lock()
 	state.updated = time.Now()
-	engine.mu.Unlock()
 	return nil
 }
 
 // WriteAtomic replaces path so a crash never leaves a half-written file.
 func WriteAtomic(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	staged, err := stageWrite(path, data)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmp.Name())
+	defer os.Remove(staged)
+	return os.Rename(staged, path)
+}
+
+func stageWrite(path string, data []byte) (name string, err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if err != nil {
+			os.Remove(tmp.Name())
+		}
+	}()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
-		return err
+		return "", err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return "", err
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return err
+		return "", err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return "", err
 	}
-	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return tmp.Name(), nil
 }
 
 func (engine *Engine) ruleSetStatus() []RuleSetStatus {

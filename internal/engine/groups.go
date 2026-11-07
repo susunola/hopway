@@ -268,8 +268,12 @@ func (engine *Engine) ProbeResults(ctx context.Context, names []string, emit fun
 func (engine *Engine) probeNodes(ctx context.Context, names []string, emit func(ProbeResult) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	if engine.ctx != nil {
-		stop := context.AfterFunc(engine.ctx, cancel)
+	engine.mu.Lock()
+	network := engine.networkCtx
+	epoch := engine.networkEpoch.Load()
+	engine.mu.Unlock()
+	if network != nil {
+		stop := context.AfterFunc(network, cancel)
 		defer stop()
 	}
 	var emitMu sync.Mutex
@@ -302,11 +306,12 @@ func (engine *Engine) probeNodes(ctx context.Context, names []string, emit func(
 						h.alive, h.latency, h.err = true, previous.latency, ""
 					}
 				}
-				if ctx.Err() == nil {
+				current := ctx.Err() == nil && engine.networkEpoch.Load() == epoch
+				if current {
 					engine.health[name] = h
 				}
 				engine.mu.Unlock()
-				if emit != nil && ctx.Err() == nil {
+				if emit != nil && current {
 					result := ProbeResult{Name: name, Failure: h.err}
 					if h.alive {
 						result.Milliseconds = max(h.latency.Milliseconds(), 1)
@@ -335,6 +340,9 @@ schedule:
 	wait.Wait()
 	if emitErr != nil {
 		return emitErr
+	}
+	if engine.networkEpoch.Load() != epoch {
+		return context.Canceled
 	}
 	return ctx.Err()
 }

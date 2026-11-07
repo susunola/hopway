@@ -162,6 +162,7 @@ type Engine struct {
 	backend       string
 	instance      backend.Instance
 	dialers       map[string]backend.Dialer
+	dialSlots     map[string]chan struct{}
 	types         map[string]string
 	servers       map[string]string
 	order         []string
@@ -176,6 +177,10 @@ type Engine struct {
 	ports         map[uint16]bool
 	ctx           context.Context
 	stop          context.CancelFunc
+	networkCtx    context.Context
+	cancelNetwork context.CancelFunc
+	networkEpoch  atomic.Uint64
+	ruleRefreshMu sync.Mutex
 	closed        bool
 	closeOnce     sync.Once
 	closeErr      error
@@ -187,9 +192,10 @@ type Engine struct {
 }
 
 const (
-	dialTimeout    = 10 * time.Second
-	attemptTimeout = 5 * time.Second
-	maxAttempts    = 3
+	dialTimeout       = 10 * time.Second
+	attemptTimeout    = 5 * time.Second
+	maxAttempts       = 3
+	endpointDialLimit = 64
 )
 
 // New builds an engine; localPorts are HopWay's own listeners, which no
@@ -202,7 +208,7 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 	engine := &Engine{subscriptions: config.Subscriptions, autoWake: make(chan struct{}, 1), dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL,
-		lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
+		dialSlots: make(map[string]chan struct{}), lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
 	}
 	for _, port := range localPorts {
 		engine.ports[uint16(port)] = true
@@ -261,11 +267,21 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 	if err != nil {
 		return nil, err
 	}
+	slots := make(map[string]chan struct{})
 	for _, node := range config.Nodes {
 		engine.dialers[node.Name], _ = engine.instance.Dialer(node.Name)
+		endpoint := strings.ToLower(node.Server)
+		if endpoint == "" {
+			endpoint = node.Name
+		}
+		if slots[endpoint] == nil {
+			slots[endpoint] = make(chan struct{}, endpointDialLimit)
+		}
+		engine.dialSlots[node.Name] = slots[endpoint]
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	engine.ctx, engine.stop = ctx, cancel
+	engine.networkCtx, engine.cancelNetwork = context.WithCancel(ctx)
 	go engine.MonitorAuto(ctx)
 	if len(engine.autoMembers()) != 0 {
 		go engine.healthLoop(ctx, time.Duration(interval)*time.Second)
@@ -301,12 +317,24 @@ func (engine *Engine) NetworkChanged() {
 		engine.mu.Unlock()
 		return
 	}
+	engine.networkEpoch.Add(1)
+	if engine.cancelNetwork != nil {
+		engine.cancelNetwork()
+		engine.networkCtx, engine.cancelNetwork = context.WithCancel(engine.ctx)
+	}
 	backend.Resolver.Flush()
 	if engine.instance != nil {
 		engine.instance.ResetConnections()
 	}
-	for _, h := range engine.health {
-		h.checked = time.Time{} // unknown again until probed
+	clear(engine.health)
+	if state := engine.auto; state != nil {
+		clear(state.health)
+		state.challenger, state.challengerWins = "", 0
+		state.orderedCandidates = state.candidates()
+		select {
+		case engine.autoWake <- struct{}{}:
+		default:
+		}
 	}
 	engine.mu.Unlock()
 	if members := engine.autoMembers(); len(members) != 0 && engine.ctx != nil {
@@ -653,7 +681,30 @@ func (engine *Engine) dialPacketOnce(ctx context.Context, via, target string) (n
 	if !ok {
 		return nil, backend.ErrNoUDP
 	}
+	slot, err := engine.acquireDialSlot(via)
+	if err != nil {
+		return nil, err
+	}
+	if slot != nil {
+		defer func() { <-slot }()
+	}
 	return dialer.ListenPacket(ctx, target)
+}
+
+var errEndpointBusy = errors.New("proxy endpoint has too many unfinished connections")
+
+// A saturated endpoint fails fast so the next candidate can still dial.
+func (engine *Engine) acquireDialSlot(via string) (chan struct{}, error) {
+	slot := engine.dialSlots[via]
+	if slot == nil {
+		return nil, nil
+	}
+	select {
+	case slot <- struct{}{}:
+		return slot, nil
+	default:
+		return nil, errEndpointBusy
+	}
 }
 
 type trackedPacket struct {
@@ -704,10 +755,18 @@ func (conn *trackedPacket) Close() error {
 
 // dialOnce dials through one node and fills in stage timings.
 func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *Record) (net.Conn, error) {
+	slot, err := engine.acquireDialSlot(via)
+	if err != nil {
+		record.Stage = trace.StageConnect
+		return nil, err
+	}
+	if slot != nil {
+		defer func() { <-slot }()
+	}
+	epoch := engine.networkEpoch.Load()
 	ctx, t := trace.With(ctx)
 	start := time.Now()
 	var conn net.Conn
-	var err error
 	switch via {
 	case "DIRECT":
 		conn, err = backend.NetDial(ctx, "tcp", target, engine.guard)
@@ -747,6 +806,10 @@ func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *
 	}
 	if via != "DIRECT" && via != "REJECT" {
 		engine.mu.Lock()
+		if engine.networkEpoch.Load() != epoch {
+			engine.mu.Unlock()
+			return conn, err
+		}
 		h := engine.health[via]
 		if err != nil && record.Stage != trace.StageRoute {
 			if h == nil {

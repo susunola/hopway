@@ -1,12 +1,15 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/ruleset"
@@ -52,9 +55,17 @@ func TestRemoteRuleSetCacheAndRefresh(t *testing.T) {
 	var body atomic.Value
 	body.Store("payload:\n  - '+.blocked.test'\n")
 	var hits atomic.Int32
+	var hold atomic.Bool
+	started, canceled := make(chan struct{}), make(chan struct{})
 	listener, _ := net.Listen("tcp", "127.0.0.1:0")
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
+		if hold.CompareAndSwap(true, false) {
+			close(started)
+			<-r.Context().Done()
+			close(canceled)
+			return
+		}
 		if body.Load().(string) == "" {
 			http.Error(w, "gone", http.StatusBadGateway)
 			return
@@ -104,11 +115,55 @@ func TestRemoteRuleSetCacheAndRefresh(t *testing.T) {
 	if via(core, "a.blocked.test") != "REJECT" || status.Error == "" {
 		t.Fatalf("failed refresh must keep the old copy and report the error: %+v", status)
 	}
+	cachePath := core.cachePath(core.ruleSets[0])
+	previous, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body.Store("payload: [")
+	core.RefreshRuleSets(context.Background(), true)
+	status = core.Status().RuleSets[0]
+	if after, err := os.ReadFile(cachePath); err != nil || !bytes.Equal(after, previous) ||
+		via(core, "a.blocked.test") != "REJECT" || status.Error == "" {
+		t.Fatalf("malformed response replaced the cached rule set or was not reported: %+v", status)
+	}
 
 	// A new list replaces the old one in place.
 	body.Store("payload:\n  - '+.other.test'\n")
 	core.RefreshRuleSets(context.Background(), true)
 	if via(core, "a.blocked.test") != "DIRECT" || via(core, "x.other.test") != "REJECT" {
 		t.Fatal("refreshed content not swapped in")
+	}
+
+	// A slow download started on the old network is canceled and is not
+	// reported as a provider failure or applied to the active matcher.
+	good := core.Status().RuleSets[0]
+	hold.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		core.RefreshRuleSets(ctx, true)
+	}()
+	wait := func(event <-chan struct{}, message string) {
+		t.Helper()
+		select {
+		case <-event:
+		case <-ctx.Done():
+			t.Fatal(message)
+		}
+	}
+	wait(started, "rule set download did not reach the server")
+	core.NetworkChanged()
+	wait(canceled, "rule set HTTP request survived network change")
+	wait(finished, "old rule set refresh did not exit")
+	if got := core.Status().RuleSets[0]; got != good || via(core, "x.other.test") != "REJECT" {
+		t.Fatalf("canceled refresh changed last good rule set: %+v", got)
+	}
+	body.Store("payload:\n  - '+.new.test'\n")
+	core.RefreshRuleSets(ctx, true)
+	if via(core, "x.new.test") != "REJECT" || via(core, "x.other.test") != "DIRECT" {
+		t.Fatal("rule set did not refresh on the new network")
 	}
 }
