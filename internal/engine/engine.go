@@ -110,6 +110,7 @@ type Record struct {
 	Stage       string   `json:"stage,omitempty"`
 	Server      string   `json:"server,omitempty"`
 	Shared      bool     `json:"shared,omitempty"`      // rode a multiplexed session, no socket of its own
+	Network     string   `json:"network,omitempty"`     // "udp" for datagram sessions
 	Process     string   `json:"process,omitempty"`     // app or executable name
 	ProcessPath string   `json:"processPath,omitempty"` // executable path
 	PID         uint32   `json:"pid,omitempty"`
@@ -131,27 +132,29 @@ type Status struct {
 }
 
 type Engine struct {
-	mu       sync.Mutex
-	policy   Policy
-	backend  string
-	instance backend.Instance
-	dialers  map[string]backend.Dialer
-	types    map[string]string
-	servers  map[string]string
-	order    []string
-	groups   map[string]*group
-	health   map[string]*nodeHealth
-	rules    *matcher
-	probeURL string
-	sequence uint64
-	live     map[uint64]*tracked
-	recent   []Record
-	ports    map[uint16]bool
-	stop     context.CancelFunc
+	mu          sync.Mutex
+	policy      Policy
+	backend     string
+	instance    backend.Instance
+	dialers     map[string]backend.Dialer
+	types       map[string]string
+	servers     map[string]string
+	order       []string
+	groups      map[string]*group
+	health      map[string]*nodeHealth
+	rules       *matcher
+	probeURL    string
+	sequence    uint64
+	live        map[uint64]*tracked
+	livePackets map[uint64]*trackedPacket
+	recent      []Record
+	ports       map[uint16]bool
+	stop        context.CancelFunc
 
-	lookupProcess func(client, server netip.AddrPort) (*process.Owner, error)
-	dataDir       string
-	ruleSets      []*ruleSetState
+	lookupProcess    func(client, server netip.AddrPort) (*process.Owner, error)
+	lookupProcessUDP func(client, server netip.AddrPort) (*process.Owner, error)
+	dataDir          string
+	ruleSets         []*ruleSetState
 }
 
 const (
@@ -169,8 +172,8 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 	}
 	engine := &Engine{dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
-		live: make(map[uint64]*tracked), ports: make(map[uint16]bool), probeURL: defaultProbeURL,
-		lookupProcess: process.Lookup,
+		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL,
+		lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
 	}
 	for _, port := range localPorts {
 		engine.ports[uint16(port)] = true
@@ -464,6 +467,119 @@ func (record *Record) setOwner(owner *process.Owner) {
 	}
 }
 
+// DialPacket opens a UDP session for traffic to target, routed and
+// recorded like TCP. The returned connection's WriteTo takes M.Socksaddr
+// destinations (names allowed); ReadFrom reports the address written to.
+func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (net.PacketConn, error) {
+	host, _, err := wire.Split(target)
+	if err != nil {
+		return nil, err
+	}
+	engine.mu.Lock()
+	engine.sequence++
+	record := Record{ID: engine.sequence, Start: time.Now().UnixMilli(), Target: target, Inbound: inbound, State: "active", Network: "udp"}
+	policy := engine.policy
+	engine.mu.Unlock()
+	addrs, local := peer.From(ctx)
+	local = local && addrs.Local
+	var owner *process.Owner
+	looked := false
+	lookup := func() *process.Owner {
+		if !looked && local {
+			looked = true
+			owner, _ = engine.lookupProcessUDP(addrs.Client, addrs.Server)
+		}
+		return owner
+	}
+	via, rule := engine.route(host, policy, lookup)
+	record.Rule = rule
+	engine.mu.Lock()
+	candidates := engine.choices(via)
+	engine.mu.Unlock()
+	if len(candidates) > maxAttempts {
+		candidates = candidates[:maxAttempts]
+	}
+	var conn net.PacketConn
+	for i, candidate := range candidates {
+		record.Via, record.Route, record.Attempts = candidate.via, candidate.route, i+1
+		conn, err = engine.dialPacketOnce(ctx, candidate.via, target)
+		if err == nil || errors.Is(err, outbound.ErrRejected) || ctx.Err() != nil {
+			break
+		}
+	}
+	if local {
+		lookup()
+	}
+	record.setOwner(owner)
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if err != nil {
+		record.State, record.Error = "failed", describe(err)
+		if errors.Is(err, outbound.ErrRejected) {
+			record.State, record.Stage = "blocked", trace.StageRoute
+		}
+		engine.remember(record)
+		return nil, err
+	}
+	tracked := &trackedPacket{PacketConn: conn, engine: engine, record: record}
+	engine.livePackets[record.ID] = tracked
+	return tracked, nil
+}
+
+func (engine *Engine) dialPacketOnce(ctx context.Context, via, target string) (net.PacketConn, error) {
+	switch via {
+	case "DIRECT":
+		return backend.DirectPacket(ctx, target, engine.guard)
+	case "REJECT":
+		return nil, outbound.ErrRejected
+	}
+	dialer, ok := engine.dialers[via].(backend.PacketDialer)
+	if !ok {
+		return nil, backend.ErrNoUDP
+	}
+	return dialer.ListenPacket(ctx, target)
+}
+
+type trackedPacket struct {
+	net.PacketConn
+	engine     *Engine
+	record     Record
+	sent, recv atomic.Uint64
+	once       sync.Once
+}
+
+func (conn *trackedPacket) ReadFrom(data []byte) (int, net.Addr, error) {
+	n, addr, err := conn.PacketConn.ReadFrom(data)
+	conn.recv.Add(uint64(max(n, 0)))
+	return n, addr, err
+}
+
+func (conn *trackedPacket) WriteTo(data []byte, addr net.Addr) (int, error) {
+	n, err := conn.PacketConn.WriteTo(data, addr)
+	conn.sent.Add(uint64(max(n, 0)))
+	return n, err
+}
+
+func (conn *trackedPacket) snapshot() Record {
+	record := conn.record
+	record.Sent, record.Recv = conn.sent.Load(), conn.recv.Load()
+	return record
+}
+
+func (conn *trackedPacket) Close() error {
+	var err error
+	conn.once.Do(func() {
+		err = conn.PacketConn.Close()
+		conn.engine.mu.Lock()
+		defer conn.engine.mu.Unlock()
+		record := conn.snapshot()
+		record.State = "closed"
+		delete(conn.engine.livePackets, record.ID)
+		conn.engine.remember(record)
+	})
+	return err
+}
+
 // dialOnce dials through one node and fills in stage timings.
 func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *Record) (net.Conn, error) {
 	ctx, t := trace.With(ctx)
@@ -547,9 +663,12 @@ func (engine *Engine) Status() Status {
 	for _, conn := range engine.live {
 		records = append(records, conn.snapshot())
 	}
+	for _, conn := range engine.livePackets {
+		records = append(records, conn.snapshot())
+	}
 	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
 	records = append(records, engine.recent...)
-	status := Status{Backend: engine.backend, Policy: engine.policy, Connections: records, Active: len(engine.live),
+	status := Status{Backend: engine.backend, Policy: engine.policy, Connections: records, Active: len(engine.live) + len(engine.livePackets),
 		RuleSets: engine.ruleSetStatus()}
 	for _, name := range engine.order {
 		summary := NodeSummary{Name: name, Type: engine.types[name]}

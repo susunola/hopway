@@ -24,6 +24,13 @@ type Dialer interface {
 	DialContext(ctx context.Context, target string) (net.Conn, error)
 }
 
+// PacketDialer is implemented by dialers that can carry UDP.
+type PacketDialer interface {
+	ListenPacket(ctx context.Context, target string) (net.PacketConn, error)
+}
+
+var ErrNoUDP = errors.New("this node does not carry UDP")
+
 type DialerFunc func(ctx context.Context, target string) (net.Conn, error)
 
 func (f DialerFunc) DialContext(ctx context.Context, target string) (net.Conn, error) {

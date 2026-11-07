@@ -93,25 +93,49 @@ func (SingBox) Open(nodes []outbound.Node, guard Guard) (Instance, error) {
 			instance.Close()
 			return nil, nodeError(node.Name, errors.New("outbound was not created"))
 		}
-		result.dialers[node.Name] = DialerFunc(func(ctx context.Context, target string) (net.Conn, error) {
-			destination := M.ParseSocksaddr(target)
-			if !destination.IsValid() {
-				return nil, errors.New("invalid destination")
-			}
-			conn, err := out.DialContext(ctx, N.NetworkTCP, destination)
-			if err != nil {
-				return nil, err
-			}
-			if N.NeedHandshakeForWrite(conn) {
-				conn = newHandshakeConn(conn)
-			}
-			if chunked {
-				conn = &chunkConn{conn}
-			}
-			return conn, nil
-		})
+		result.dialers[node.Name] = &singDialer{out: out, chunked: chunked}
 	}
 	return result, nil
+}
+
+type singDialer struct {
+	out     adapter.Outbound
+	chunked bool
+}
+
+func (d *singDialer) DialContext(ctx context.Context, target string) (net.Conn, error) {
+	destination := M.ParseSocksaddr(target)
+	if !destination.IsValid() {
+		return nil, errors.New("invalid destination")
+	}
+	conn, err := d.out.DialContext(ctx, N.NetworkTCP, destination)
+	if err != nil {
+		return nil, err
+	}
+	if N.NeedHandshakeForWrite(conn) {
+		conn = newHandshakeConn(conn)
+	}
+	if d.chunked {
+		conn = &chunkConn{conn}
+	}
+	return conn, nil
+}
+
+// ListenPacket opens a UDP session through the node. Datagrams are written
+// with WriteTo to M.Socksaddr destinations, so names are resolved remotely.
+func (d *singDialer) ListenPacket(ctx context.Context, target string) (net.PacketConn, error) {
+	supported := false
+	for _, network := range d.out.Network() {
+		supported = supported || network == N.NetworkUDP
+	}
+	if !supported {
+		return nil, ErrNoUDP
+	}
+	destination := M.ParseSocksaddr(target)
+	if !destination.IsValid() {
+		return nil, errors.New("invalid destination")
+	}
+	return d.out.ListenPacket(ctx, destination)
 }
 
 func (instance *singInstance) Dialer(name string) (Dialer, bool) {

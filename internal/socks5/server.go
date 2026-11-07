@@ -1,4 +1,5 @@
-// Package socks5 implements a local, unauthenticated SOCKS5 TCP inbound.
+// Package socks5 implements a local, unauthenticated SOCKS5 inbound with
+// CONNECT and UDP ASSOCIATE.
 package socks5
 
 import (
@@ -7,20 +8,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mac-proxy/internal/peer"
 	"net"
 	"slices"
 	"syscall"
 	"time"
 
 	"mac-proxy/internal/outbound"
+	"mac-proxy/internal/peer"
 	"mac-proxy/internal/wire"
 )
 
 const (
-	version = 5
-	noAuth  = 0
-	connect = 1
+	version      = 5
+	noAuth       = 0
+	connect      = 1
+	udpAssociate = 3
 
 	addressIPv4 = 1
 	addressIPv6 = 4
@@ -35,7 +37,13 @@ const (
 )
 
 // Handle serves one SOCKS5 client. The caller owns client and closes it on return.
-func Handle(client *net.TCPConn, dial func(context.Context, string, string) (net.Conn, error)) error {
+type DialFunc func(context.Context, string, string) (net.Conn, error)
+type DialPacketFunc func(context.Context, string, string) (net.PacketConn, error)
+
+func Handle(client *net.TCPConn, dial DialFunc) error { return HandleWithUDP(client, dial, nil) }
+
+// HandleWithUDP serves one client; dialPacket enables UDP ASSOCIATE.
+func HandleWithUDP(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc) error {
 	if err := client.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return err
 	}
@@ -43,7 +51,10 @@ func Handle(client *net.TCPConn, dial func(context.Context, string, string) (net
 		return fmt.Errorf("negotiate: %w", err)
 	}
 
-	target, reply, err := readRequest(client)
+	command, target, reply, err := readRequest(client, dialPacket != nil)
+	if err == nil && command == udpAssociate {
+		return associate(client, dialPacket)
+	}
 	if err != nil {
 		if reply != replySuccess {
 			return errors.Join(err, writeReply(client, reply, nil))
@@ -92,26 +103,27 @@ func negotiate(client io.ReadWriter) error {
 	return err
 }
 
-func readRequest(reader io.Reader) (target string, reply byte, err error) {
+func readRequest(reader io.Reader, allowUDP bool) (command byte, target string, reply byte, err error) {
 	var header [4]byte
 	if _, err := io.ReadFull(reader, header[:]); err != nil {
-		return "", replySuccess, err
+		return 0, "", replySuccess, err
 	}
 	if header[0] != version || header[2] != 0 {
-		return "", replyFailure, errors.New("invalid request header")
+		return 0, "", replyFailure, errors.New("invalid request header")
 	}
-	if header[1] != connect {
-		return "", replyUnsupportedCommand, fmt.Errorf("unsupported command %d", header[1])
+	command = header[1]
+	if command != connect && !(command == udpAssociate && allowUDP) {
+		return command, "", replyUnsupportedCommand, fmt.Errorf("unsupported command %d", header[1])
 	}
 
 	target, err = wire.ReadAddress(reader, header[3])
 	if errors.Is(err, wire.ErrAddressType) {
-		return "", replyUnsupportedAddress, err
+		return command, "", replyUnsupportedAddress, err
 	}
 	if err != nil {
-		return "", replyFailure, err
+		return command, "", replyFailure, err
 	}
-	return target, replySuccess, nil
+	return command, target, replySuccess, nil
 }
 
 func writeReply(writer io.Writer, reply byte, bound *net.TCPAddr) error {

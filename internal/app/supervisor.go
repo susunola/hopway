@@ -208,7 +208,7 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 		}
 		options.FD, options.Name = fd, name
 	}
-	device, err := tun.Start(options, s.Dial, func(target string) string { return s.current.Load().Decide(target) })
+	device, err := tun.Start(options, s.Dial, s.DialPacket)
 	if err != nil {
 		return err
 	}
@@ -278,6 +278,10 @@ func (s *Supervisor) Engine() *engine.Engine { return s.current.Load() }
 
 func (s *Supervisor) Dial(ctx context.Context, inbound, target string) (net.Conn, error) {
 	return s.current.Load().Dial(ctx, inbound, target)
+}
+
+func (s *Supervisor) DialPacket(ctx context.Context, inbound, target string) (net.PacketConn, error) {
+	return s.current.Load().DialPacket(ctx, inbound, target)
 }
 
 func (s *Supervisor) Close() {

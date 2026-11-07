@@ -53,6 +53,9 @@ struct ProxyStatus: Decodable {
         let firstByteMs: Int?
         let process: String?
         let processPath: String?
+        let network: String?
+
+        var inboundLabel: String { network == "udp" ? inbound + " · UDP" : inbound }
 
         /// Where the connection failed and how long each stage took, for the tooltip.
         var diagnosis: String {

@@ -20,7 +20,12 @@ var (
 // Lookup finds the process owning the TCP socket client that is connected to
 // server. On macOS this reads net.inet.tcp.pcblist_n (cached briefly by
 // sing-box) and resolves the executable with proc_pidpath.
-func Lookup(client, server netip.AddrPort) (*Owner, error) {
+func Lookup(client, server netip.AddrPort) (*Owner, error) { return lookup("tcp", client, server) }
+
+// LookupUDP finds the process owning a UDP socket.
+func LookupUDP(client, server netip.AddrPort) (*Owner, error) { return lookup("udp", client, server) }
+
+func lookup(network string, client, server netip.AddrPort) (*Owner, error) {
 	// A logger is required: the Linux searcher logs through it unconditionally.
 	searcherOnce.Do(func() {
 		searcher, searcherErr = sbprocess.NewSearcher(sbprocess.Config{Logger: log.NewNOPFactory().Logger()})
@@ -28,7 +33,7 @@ func Lookup(client, server netip.AddrPort) (*Owner, error) {
 	if searcherErr != nil {
 		return nil, searcherErr
 	}
-	info, err := sbprocess.FindProcessInfo(searcher, context.Background(), "tcp", client, server)
+	info, err := sbprocess.FindProcessInfo(searcher, context.Background(), network, client, server)
 	if err != nil {
 		return nil, err
 	}

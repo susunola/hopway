@@ -34,6 +34,6 @@
 
 后续：
 
-5. 经代理节点转发 UDP（sing-box 的 `ListenPacket`），覆盖 QUIC、游戏和语音通话。
+5. ~~经代理节点转发 UDP~~：已完成。TUN 和 SOCKS5 UDP ASSOCIATE 两个入口都支持，8 种协议都做过互通测试。
 6. IPv6 fake-ip，以及 TUN 下的 IPv6 路由。
 7. 常驻的特权服务（SMAppService），免去每次开启 TUN 都要输入密码。

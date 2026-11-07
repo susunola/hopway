@@ -357,5 +357,5 @@ func (engine *Engine) Restore(runtime Runtime) {
 func (engine *Engine) Active() int {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	return len(engine.live)
+	return len(engine.live) + len(engine.livePackets)
 }
