@@ -451,7 +451,7 @@ private struct Dashboard: View {
                 }
             }
             if let defaults = status?.ruleDefaults, status?.policy.mode == "rule" {
-                DisclosureGroup("规则命中统计") {
+                HopDisclosure("规则命中统计") {
                     Text("兜底规则 \(defaults.explicitMatch.formatted()) 次 · 未命中直连 \(defaults.implicit.formatted()) 次")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -472,7 +472,7 @@ private struct Dashboard: View {
     private var policyDetails: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                HopPageHeading(title: "策略详情", detail: "查看配置带入的策略组和规则集。")
+                HopPageHeading(title: "策略详情", detail: "手动组可以换成员，自动组由内核选路。")
                 Spacer(minLength: 10)
                 Button("完成") { showsPolicyDetails = false }
                     .keyboardShortcut(.cancelAction)
@@ -486,41 +486,35 @@ private struct Dashboard: View {
 
     private var policies: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("策略组").font(.headline)
-            if let status = core.status, let groups = status.groups, !groups.isEmpty {
-                ForEach(groups) { group in
-                    if group.id != groups.first?.id { Divider() }
-                    VStack(alignment: .leading, spacing: 7) {
-                        Text(group.name + " · " + group.typeLabel).font(.callout.weight(.semibold))
-                        if group.type == "select" {
-                            Picker("使用的成员", selection: Binding(
-                                get: { group.selected ?? group.now },
-                                set: { core.selectInGroup(group.name, member: $0) }
-                            )) {
-                                ForEach(group.members, id: \.self) { Text(core.memberLabel($0)).tag($0) }
-                            }
-                            .labelsHidden()
-                            .frame(width: 260, alignment: .leading)
-                            .help(core.memberLabel(group.selected ?? group.now))
-                            .disabled(core.phase != .running || core.statusReadFailed)
-                        } else {
-                            Text("正在使用 " + core.memberLabel(group.now))
-                                .font(.callout).monospacedDigit()
-                            groupMembers(group.members)
+            if let groups = core.status?.groups, !groups.isEmpty {
+                let manual = groups.filter { $0.type == "select" }
+                let automatic = groups.filter { $0.type != "select" }
+                if !manual.isEmpty {
+                    Text("手动切换").font(.headline)
+                    ForEach(manual) { group in
+                        if group.id != manual.first?.id { Divider() }
+                        manualGroup(group)
+                    }
+                }
+                if !automatic.isEmpty {
+                    if !manual.isEmpty { Divider() }
+                    HopDisclosure("自动与备用分组（\(automatic.count)）") {
+                        ForEach(automatic) { group in
+                            inspectGroup(group.name, current: group.now, members: group.members)
                         }
                     }
+                    .font(.callout)
                 }
             } else if let groups = core.configuredProfile?.groups, !groups.isEmpty {
-                ForEach(groups) { group in
-                    if group.id != groups.first?.id { Divider() }
-                    VStack(alignment: .leading, spacing: 7) {
-                        Text(group.name).font(.callout.weight(.semibold))
-                        if let selected = group.selected {
-                            Text("配置成员 " + selected).font(.callout).foregroundStyle(.secondary)
-                        }
-                        groupMembers(group.members)
+                Text("启动代理后可在此切换手动组成员。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                HopDisclosure("已保存的分组（\(groups.count)）") {
+                    ForEach(groups) { group in
+                        inspectGroup(group.name, current: group.selected, members: group.members)
                     }
                 }
+                .font(.callout)
             } else {
                 Text(core.configuredProfile == nil ? "正在读取已保存的策略。" : "当前配置没有策略组。")
                     .foregroundStyle(.secondary)
@@ -529,7 +523,7 @@ private struct Dashboard: View {
 
             if let sets = core.status?.ruleSets, !sets.isEmpty {
                 Divider()
-                DisclosureGroup("规则集（\(sets.count)）") {
+                HopDisclosure("规则集（\(sets.count)）") {
                     VStack(alignment: .leading, spacing: 7) {
                         Button("更新规则集") { core.trigger("rulesets/refresh", done: "正在更新规则集…") }
                             .disabled(core.phase != .running || core.statusReadFailed || core.refreshing)
@@ -537,11 +531,10 @@ private struct Dashboard: View {
                             sourceRow(item.name, detail: "\(item.entries) 条", updated: item.updated, error: item.error)
                         }
                     }
-                    .padding(.top, 6)
                 }
             } else if let names = core.configuredProfile?.ruleSets, !names.isEmpty {
                 Divider()
-                DisclosureGroup("规则集（\(names.count)）") {
+                HopDisclosure("规则集（\(names.count)）") {
                     ForEach(names, id: \.self) { name in
                         Text(name).font(.callout)
                     }
@@ -551,13 +544,27 @@ private struct Dashboard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func groupMembers(_ names: [String]) -> some View {
-        DisclosureGroup("\(names.count) 个成员") {
-            Text(names.map { core.memberLabel($0) }.joined(separator: "，"))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
+    private func manualGroup(_ group: ProxyStatus.PolicyGroup) -> some View {
+        let selected = group.selected ?? group.now
+        return HStack(spacing: 12) {
+            Text(group.name).font(.callout.weight(.medium)).lineLimit(1).help(group.name)
                 .frame(maxWidth: .infinity, alignment: .leading)
+            HopSelectionMenu(title: "切换 \(group.name)", value: core.memberLabel(selected), labelWidth: 153,
+                             selection: Binding(get: { selected }, set: { core.selectInGroup(group.name, member: $0) })) {
+                ForEach(group.members, id: \.self) { Text(core.memberLabel($0)).tag($0) }
+            }
+            .disabled(core.phase != .running || core.statusReadFailed)
+        }
+    }
+
+    private func inspectGroup(_ name: String, current: String?, members: [String]) -> some View {
+        HopDisclosure(name) {
+            if let current, !current.isEmpty {
+                Text((core.phase == .running ? "组内当前 · " : "默认成员 · ") + core.memberLabel(current))
+            }
+            Text("\(members.count) 个成员")
+            Text(members.map { core.memberLabel($0) }.joined(separator: "，"))
+                .textSelection(.enabled)
         }
         .font(.callout)
     }

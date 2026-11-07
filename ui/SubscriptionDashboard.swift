@@ -150,14 +150,18 @@ struct SubscriptionDashboard: View {
         let warning = (ratio ?? 0) >= 0.8
         let nodeSync = max(runtime?.updated ?? 0, core.configuredProfile?.snapshotAt?[subscription.id] ?? 0)
         return VStack(alignment: .leading, spacing: 9) {
-            HStack(alignment: .firstTextBaseline, spacing: 9) {
-                Text(subscription.name).font(.headline).lineLimit(1)
-                if subscription.isPaused {
-                    Text("已暂停").font(.caption).foregroundStyle(.secondary)
-                } else if let nodes = subscription.nodes {
-                    Text("\(nodes.count) 个节点").foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(subscription.name).font(.headline).lineLimit(1).help(subscription.name)
+                    if subscription.isPaused {
+                        Text("已暂停").font(.caption).foregroundStyle(.secondary).fixedSize()
+                    } else if let nodes = subscription.nodes {
+                        Text("\(nodes.count) 个节点").foregroundStyle(.secondary).fixedSize()
+                    }
                 }
-                Spacer(minLength: 8)
+                Divider().frame(height: 24)
+                syncSummary(nodeSync: nodeSync, quotaSync: meter?.updatedAt, checked: runtime?.checked)
+                Spacer(minLength: 6)
                 if let used {
                     Text(trafficBytes(used))
                         .font(.system(.title2, design: .rounded).weight(.semibold).monospacedDigit())
@@ -225,33 +229,28 @@ struct SubscriptionDashboard: View {
                 }
                 .font(.caption)
             }
-            DisclosureGroup("同步详情") {
-                VStack(alignment: .leading, spacing: 4) {
-                    syncLabels(nodeSync: nodeSync, quotaSync: meter?.updatedAt, checked: runtime?.checked)
-                }
-                .padding(.top, 4)
-            }
-            .font(.caption)
-            .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    @ViewBuilder
-    private func syncLabels(nodeSync: Double, quotaSync: Int64?, checked: Double?) -> some View {
-        if nodeSync > 0 {
-            Text("节点同步 " + Date(timeIntervalSince1970: nodeSync / 1000).formatted(date: .abbreviated, time: .shortened))
-        } else {
-            Text("节点暂无同步记录")
+    private func syncSummary(nodeSync: Double, quotaSync: Int64?, checked: Double?) -> some View {
+        let nodes = nodeSync > 0 ? Date(timeIntervalSince1970: nodeSync / 1000) : nil
+        let quota = quotaSync.flatMap { $0 > 0 ? Date(timeIntervalSince1970: Double($0)) : nil }
+        let compact = Date.FormatStyle().month(.defaultDigits).day(.defaultDigits)
+            .hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
+        let nodeDetail = nodes.map { "节点同步 " + $0.formatted(date: .abbreviated, time: .shortened) } ?? "节点待同步"
+        let quotaDetail = quota.map { "额度更新 " + $0.formatted(date: .abbreviated, time: .shortened) }
+        let checkDetail = checked.flatMap { time in
+            time > nodeSync ? "已检查 · 节点未变更 " + Date(timeIntervalSince1970: time / 1000).formatted(date: .abbreviated, time: .shortened) : nil
         }
-        if let checked, checked > nodeSync {
-            Text("已检查 · 节点未变更 " + Date(timeIntervalSince1970: checked / 1000).formatted(date: .abbreviated, time: .shortened))
+        return VStack(alignment: .leading, spacing: 2) {
+            Text(nodes.map { "节点同步 " + $0.formatted(compact) } ?? "节点待同步")
+            if let quota { Text("额度更新 " + quota.formatted(compact)) }
         }
-        if let quotaSync, quotaSync > 0 {
-            Text("额度更新 " + Date(timeIntervalSince1970: Double(quotaSync)).formatted(date: .abbreviated, time: .shortened))
-        } else {
-            Text("额度暂无更新记录")
-        }
+        .font(.caption.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .fixedSize()
+        .help([nodeDetail, quotaDetail, checkDetail].compactMap { $0 }.joined(separator: "\n"))
     }
 
     private func expirationText(_ date: Date) -> String {

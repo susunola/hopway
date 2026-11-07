@@ -165,7 +165,7 @@ struct ConnectionsDashboard: View {
                     .textSelection(.enabled)
                     .help(explanation)
             }
-            DisclosureGroup("诊断详情") {
+            HopDisclosure("诊断详情") {
                 VStack(alignment: .leading, spacing: 6) {
                     let context = [row.process.map { "应用 \($0)" }, row.server.map { "服务器 \($0)" },
                                    row.start.map { Date(timeIntervalSince1970: $0 / 1000).formatted(date: .omitted, time: .standard) }]
@@ -182,7 +182,6 @@ struct ConnectionsDashboard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
-                .padding(.top, 5)
             }
         }
         .font(.callout)

@@ -46,6 +46,27 @@ struct HopLabeledControl<Content: View>: View {
     }
 }
 
+struct HopDisclosure<Content: View>: View {
+    let title: String
+    let content: Content
+
+    init(_ title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: 6) { content }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 5)
+        } label: {
+            Text(title).lineLimit(1).help(title)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 struct HopSelectionMenu<Value: Hashable, Options: View>: View {
     let title: String
     let value: String

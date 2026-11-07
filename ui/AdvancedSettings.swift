@@ -282,12 +282,11 @@ struct AdvancedSettingsPanel: View {
                 }
                 hint("填 0 自动分配端口。重启代理后生效。")
                 if let endpoint = core.endpoint, core.phase == .running, !core.statusReadFailed {
-                    DisclosureGroup("手动接入地址") {
+                    HopDisclosure("手动接入地址") {
                         fieldRow {
                             copyAddress("SOCKS5", address: endpoint.socks)
                             copyAddress("HTTP", address: endpoint.http)
                         }
-                        .padding(.top, 6)
                     }
                 }
             }
