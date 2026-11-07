@@ -260,6 +260,9 @@ func NewWithResourceBudget(config Config, impl backend.Backend, budget *Resource
 		engine.servers[node.Name] = node.Server
 		engine.order = append(engine.order, node.Name)
 	}
+	if err := validateNodeReferences(config.Nodes); err != nil {
+		return nil, err
+	}
 	groups, err := validateGroups(config.Groups, func(name string) bool { return engine.types[name] != "" })
 	if err != nil {
 		return nil, err

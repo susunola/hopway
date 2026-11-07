@@ -2,11 +2,13 @@
 """Exercise the packaged UDP capacity and reload on isolated loopback sockets."""
 
 from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
 from pathlib import Path
 import selectors
 import socket
+import statistics
 import struct
 import subprocess
 import sys
@@ -36,7 +38,7 @@ def udp_association(stack, socks):
     return client, relay
 
 
-def exchange(association, target, payload, fragment=0):
+def exchange(association, target, payload, fragment=0, attempts=4):
     client, relay = association
     host, port = target
     header = bytes((0, 0, fragment, 1)) + socket.inet_aton(host) + struct.pack("!H", port)
@@ -44,7 +46,7 @@ def exchange(association, target, payload, fragment=0):
         client.sendto(header + payload, relay)
         return 0
     expected = header + payload
-    for retry in range(4):
+    for retry in range(attempts):
         client.sendto(expected, relay)
         deadline = time.monotonic() + 0.5
         while (left := deadline - time.monotonic()) > 0:
@@ -57,6 +59,79 @@ def exchange(association, target, payload, fragment=0):
             if data == expected:
                 return retry
     raise TimeoutError(f"no relay reply for {payload!r} at target {target}")
+
+
+def measure_active_reload(ready, control, association, target):
+    tcp_address = ready["http"].rsplit(":", 1)
+    with socket.socket() as origin, ExitStack() as stack, ThreadPoolExecutor(max_workers=3) as workers:
+        origin.bind(("127.0.0.1", 0))
+        origin.listen()
+        origin.settimeout(3)
+
+        def echo_tcp():
+            peer, _ = origin.accept()
+            with peer:
+                peer.settimeout(3)
+                while data := peer.recv(4096):
+                    peer.sendall(data)
+
+        echo = workers.submit(echo_tcp)
+        tcp = stack.enter_context(socket.create_connection((tcp_address[0], int(tcp_address[1])), timeout=3))
+        reader = stack.enter_context(tcp.makefile("rb"))
+        address = f"127.0.0.1:{origin.getsockname()[1]}"
+        tcp.sendall(f"CONNECT {address} HTTP/1.1\r\nHost: {address}\r\n\r\n".encode())
+        assert reader.readline().startswith(b"HTTP/1.1 200 ")
+        for line in reader:
+            if line == b"\r\n":
+                break
+
+        def exchange_tcp(seq):
+            payload = seq.to_bytes(8, "big")
+            tcp.sendall(payload)
+            assert reader.read(len(payload)) == payload
+
+        def exchange_udp(seq):
+            exchange(association, target, f"reload sample {seq}".encode(), attempts=1)
+
+        finished = threading.Event()
+
+        def sample(send, started):
+            timings = []
+            failures = 0
+            while not finished.is_set():
+                before = time.monotonic()
+                try:
+                    send(len(timings))
+                except (OSError, AssertionError):
+                    failures += 1
+                timings.append((time.monotonic() - before) * 1000)
+                started.set()
+                time.sleep(0.005)
+            return timings, failures
+
+        tcp_started, udp_started = threading.Event(), threading.Event()
+        tcp_results = workers.submit(sample, exchange_tcp, tcp_started)
+        udp_results = workers.submit(sample, exchange_udp, udp_started)
+        reloads = []
+        try:
+            assert tcp_started.wait(3) and udp_started.wait(3)
+            for _ in range(12):
+                before = time.monotonic()
+                code, response = control("POST", "/reload")
+                reloads.append((time.monotonic() - before) * 1000)
+                assert code == 204, (code, response)
+                time.sleep(0.025)
+        finally:
+            finished.set()
+            tcp_timings, tcp_failures = tcp_results.result(timeout=5)
+            udp_timings, udp_failures = udp_results.result(timeout=5)
+            reader.close()
+            tcp.close()
+            echo.result(timeout=5)
+        print(f"12 reloads under traffic, reload median {statistics.median(reloads):.2f} ms, max {max(reloads):.2f} ms. "
+              f"TCP {len(tcp_timings)} samples, {tcp_failures} failures, max {max(tcp_timings):.2f} ms. "
+              f"UDP {len(udp_timings)} samples, {udp_failures} failures without retries, max {max(udp_timings):.2f} ms.")
+        assert tcp_timings and udp_timings and not (tcp_failures or udp_failures)
 
 
 def main(core):
@@ -165,6 +240,7 @@ def main(core):
         assert status()["udpDrops"]["SOCKS5"]["fragmented"] == 1
         print("Reload shared the cap, retired the oldest session and preserved a recent one")
         print("Control API counted the fragment while the association remained usable")
+        measure_active_reload(ready, control, fresh, targets[0])
 
 
 if __name__ == "__main__":

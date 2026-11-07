@@ -252,7 +252,7 @@ func Subscribe(ctx context.Context, user engine.Config, rawURL, dataDir string, 
 		return importer.Result{}, err
 	}
 	defer release()
-	if err := plan.prepare(dataDir, impl); err != nil {
+	if err := plan.prepare(dataDir, impl, &user); err != nil {
 		return importer.Result{}, err
 	}
 	if _, err := plan.stage(dataDir); err != nil {
@@ -266,7 +266,7 @@ func PreviewSubscription(ctx context.Context, user engine.Config, rawURL, dataDi
 	if err != nil {
 		return importer.Result{}, err
 	}
-	if err := plan.prepare(dataDir, impl); err != nil {
+	if err := plan.prepare(dataDir, impl, &user); err != nil {
 		return importer.Result{}, err
 	}
 	return plan.result, nil
@@ -280,7 +280,7 @@ type subscriptionImport struct {
 	preview  bool
 }
 
-func (plan *subscriptionImport) prepare(dataDir string, impl backend.Backend) error {
+func (plan *subscriptionImport) prepare(dataDir string, impl backend.Backend, baseline *engine.Config) error {
 	user := plan.result.Config
 	sub := user.Subscriptions[plan.index]
 	previous, _ := LoadSnapshot(dataDir, sub)
@@ -289,7 +289,7 @@ func (plan *subscriptionImport) prepare(dataDir string, impl backend.Backend) er
 	}
 	updateUsage(sub, plan.snapshot, previous)
 	validate := func(config engine.Config) error { return engine.Validate(config, impl) }
-	_, err := validateConfig(user, dataDir, validate, sub.Name, plan.snapshot)
+	_, err := validateConfig(user, dataDir, validate, sub.Name, plan.snapshot, baseline)
 	return err
 }
 

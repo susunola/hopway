@@ -551,6 +551,9 @@ private struct Dashboard: View {
                     LabeledContent("配置应用时间", value: Date(timeIntervalSince1970: applied / 1000)
                         .formatted(date: .abbreviated, time: .shortened))
                 }
+                if let retirement = core.status?.retirement {
+                    LabeledContent("旧内核回收", value: "处理中 \(retirement.pending) · 强制关闭 \(retirement.forced) · 清理超时 \(retirement.slow)")
+                }
                 if let notice = core.configurationNotice, core.phase == .running {
                     Label(notice, systemImage: "clock").foregroundStyle(.orange)
                 }

@@ -241,6 +241,12 @@ struct ProxyStatus: Decodable {
     let reloaded: Double?
     let revision: String?
     let profileFallback: Bool?
+    struct Retirement: Decodable {
+        let pending: UInt64
+        let forced: UInt64
+        let slow: UInt64
+    }
+    let retirement: Retirement?
 }
 
 struct ProfileInspection: Decodable {

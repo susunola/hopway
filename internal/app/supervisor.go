@@ -65,6 +65,7 @@ type Status struct {
 	Reloaded        int64                `json:"reloaded,omitempty"` // unix ms of the running configuration
 	Revision        string               `json:"revision,omitempty"`
 	ProfileFallback bool                 `json:"profileFallback,omitempty"`
+	Retirement      RetirementStatus     `json:"retirement,omitzero"`
 }
 
 type Supervisor struct {
@@ -91,6 +92,7 @@ type Supervisor struct {
 	closing          bool
 	closeOnce        sync.Once
 	retiring         sync.WaitGroup
+	retirement       retirement
 
 	proxyMu     sync.Mutex
 	proxy       *sysproxy.Manager
@@ -112,10 +114,6 @@ var ErrTUNBusy = errors.New("正在处理另一项增强模式操作")
 // TUNSupported is true where HopWay can create the device: macOS through
 // the privileged helper, Linux when running as root.
 var TUNSupported = runtime.GOOS == "darwin" || (runtime.GOOS == "linux" && os.Geteuid() == 0)
-
-// Retirement: an engine replaced by a reload keeps serving its open
-// connections and is closed once they finish, or after this long.
-const retireAfter = 10 * time.Minute
 
 var ErrProfileInUse = errors.New("HopWay 已在使用此配置")
 
@@ -499,7 +497,7 @@ func (s *Supervisor) reloadLocked(expected string) error {
 		}
 		defer release()
 	}
-	loaded, err := profile.Check(s.path, s.dataDir, s.validate)
+	loaded, err := profile.CheckReplacement(s.path, s.dataDir, s.loaded, s.validate)
 	if err != nil {
 		return err
 	}
@@ -525,6 +523,8 @@ func (s *Supervisor) reloadLocked(expected string) error {
 	}
 	if err := profile.SaveLastGood(s.path, s.dataDir, &loaded); err != nil {
 		loaded.Warnings = append(loaded.Warnings, "无法保存回滚配置")
+	} else if err := profile.PruneSnapshots(s.path, s.dataDir); err != nil {
+		loaded.Warnings = append(loaded.Warnings, "无法清理过期订阅缓存")
 	}
 	s.loaded = loaded
 	s.readSnapshotMeta()
@@ -534,35 +534,19 @@ func (s *Supervisor) reloadLocked(expected string) error {
 	if old != nil {
 		old.BeginDrain()
 		s.retiring.Add(1)
+		s.retirement.pending.Add(1)
 		go func() {
 			defer s.retiring.Done()
-			retire(s.ctx, old)
+			s.retirement.retire(s.ctx, old)
 		}()
 	}
 	return nil
 }
 
-func retire(ctx context.Context, old *engine.Engine) {
-	defer old.Close()
-	deadline := time.NewTimer(retireAfter)
-	defer deadline.Stop()
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for old.Active() > 0 {
-		select {
-		case <-ctx.Done():
-			return
-		case <-deadline.C:
-			return
-		case <-ticker.C:
-		}
-	}
-}
-
 func (s *Supervisor) Status() Status {
 	s.mu.Lock()
 	core := s.current.Load()
-	status := Status{Revision: s.loaded.Revision, ProfileFallback: s.loaded.Fallback}
+	status := Status{Revision: s.loaded.Revision, ProfileFallback: s.loaded.Fallback, Retirement: s.retirement.status()}
 	status.Warnings = s.loaded.Warnings
 	status.SystemProxy = SystemProxyStatus{Supported: SystemProxySupported, Enabled: s.proxy.Enabled(),
 		Error: s.proxyErr, Recovered: s.recovered}

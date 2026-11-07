@@ -94,12 +94,17 @@ func saveSnapshot(dataDir string, sub engine.Subscription, snapshot *Snapshot) e
 // user's final "match" rule (if any) stays last, and references that no
 // snapshot provides yet are dropped with a warning instead of failing.
 func Merge(user engine.Config, snapshots map[string]*Snapshot) (engine.Config, []string) {
+	return merge(user, snapshots, nil)
+}
+
+func merge(user engine.Config, snapshots map[string]*Snapshot, owners map[referenceTarget]string) (engine.Config, []string) {
 	merged := user
 	merged.Subscriptions = append([]engine.Subscription(nil), user.Subscriptions...)
 	// Before subscriptions used snapshots, their nodes were embedded in the
 	// user file. Keep them as a fallback until all their owners have snapshots.
 	oldOwned := map[string]bool{}
 	retain := map[string]bool{}
+	legacyOwners := map[string]string{}
 	for _, name := range user.SubscriptionNodes {
 		oldOwned[name] = true
 	}
@@ -108,6 +113,9 @@ func Merge(user engine.Config, snapshots map[string]*Snapshot) (engine.Config, [
 			oldOwned[name] = true
 			if !sub.Paused && snapshots[sub.Name] == nil {
 				retain[name] = true
+				if owners != nil {
+					legacyOwners[name] = sub.Key()
+				}
 			}
 		}
 	}
@@ -115,6 +123,9 @@ func Merge(user engine.Config, snapshots map[string]*Snapshot) (engine.Config, [
 	for _, node := range user.Nodes {
 		if !oldOwned[node.Name] || retain[node.Name] {
 			merged.Nodes = append(merged.Nodes, node)
+			if key := legacyOwners[node.Name]; key != "" {
+				owners[referenceTarget{name: node.Name}] = key
+			}
 		}
 	}
 	merged.Groups = append([]engine.Group(nil), user.Groups...)
@@ -153,12 +164,15 @@ func Merge(user engine.Config, snapshots map[string]*Snapshot) (engine.Config, [
 		if snapshot == nil {
 			continue
 		}
+		key := sub.Key()
 		merged.Subscriptions[i].Nodes = nil
 		if snapshot.Usage != nil {
 			merged.Subscriptions[i].Usage = snapshot.Usage
 			merged.Subscriptions[i].UsageSamples = snapshot.Samples
 		}
 		rename := map[string]string{}
+		firstNode := len(merged.Nodes)
+		renamedNodes := false
 		unique := func(name string, used map[string]bool) string {
 			candidate := name
 			for i := 2; used[candidate]; i++ {
@@ -171,11 +185,23 @@ func Merge(user engine.Config, snapshots map[string]*Snapshot) (engine.Config, [
 			original := node.Name
 			node.Name = unique(original, taken)
 			rename[original] = node.Name
+			renamedNodes = renamedNodes || node.Name != original
 			merged.Nodes = append(merged.Nodes, node)
+			if owners != nil {
+				owners[referenceTarget{name: node.Name}] = key
+			}
 			merged.Subscriptions[i].Nodes = append(merged.Subscriptions[i].Nodes, node.Name)
+		}
+		if renamedNodes {
+			for j := firstNode; j < len(merged.Nodes); j++ {
+				remapDetour(&merged.Nodes[j], rename)
+			}
 		}
 		for _, group := range snapshot.Groups {
 			rename[group.Name] = unique(group.Name, taken)
+			if owners != nil {
+				owners[referenceTarget{name: rename[group.Name]}] = key
+			}
 		}
 		mapName := func(name string) string {
 			if mapped, ok := rename[name]; ok {
@@ -204,6 +230,9 @@ func Merge(user engine.Config, snapshots map[string]*Snapshot) (engine.Config, [
 			set.Name = unique(original, setNames)
 			setRename[original] = set.Name
 			merged.RuleSets = append(merged.RuleSets, set)
+			if owners != nil {
+				owners[referenceTarget{ruleSet: true, name: set.Name}] = key
+			}
 		}
 		for _, rule := range snapshot.Rules {
 			rule.Via = mapName(rule.Via)
@@ -240,6 +269,21 @@ func Merge(user engine.Config, snapshots map[string]*Snapshot) (engine.Config, [
 	}
 	warnings = append(warnings, prune(&merged)...)
 	return merged, warnings
+}
+
+func remapDetour(node *outbound.Node, names map[string]string) {
+	if len(node.Options) == 0 {
+		return
+	}
+	var options map[string]json.RawMessage
+	var detour string
+	if json.Unmarshal(node.Options, &options) != nil || json.Unmarshal(options["detour"], &detour) != nil {
+		return // The engine reports malformed options during validation.
+	}
+	if mapped := names[detour]; mapped != "" && mapped != detour {
+		options["detour"], _ = json.Marshal(mapped)
+		node.Options, _ = json.Marshal(options)
+	}
 }
 
 // prune drops references to outbounds that do not exist, which happens when
@@ -327,10 +371,12 @@ func Load(path, dataDir string, validate func(engine.Config) error) (Loaded, err
 		}
 		defer release()
 	}
-	loaded, err := load(path, dataDir, validate)
+	loaded, err := load(path, dataDir, validate, previousDocument(path, dataDir))
 	if err == nil {
 		if err := SaveLastGood(path, dataDir, &loaded); err != nil {
 			loaded.Warnings = append(loaded.Warnings, "无法保存回滚配置")
+		} else if err := PruneSnapshots(path, dataDir); err != nil {
+			loaded.Warnings = append(loaded.Warnings, "无法清理过期订阅缓存")
 		}
 		loaded.document = nil
 		return loaded, nil
@@ -338,7 +384,7 @@ func Load(path, dataDir string, validate func(engine.Config) error) (Loaded, err
 	if dataDir == "" {
 		return Loaded{}, err
 	}
-	fallback, fallbackErr := load(lastGoodPath(dataDir), dataDir, validate)
+	fallback, fallbackErr := load(lastGoodPath(dataDir), dataDir, validate, nil)
 	if fallbackErr != nil {
 		return Loaded{}, err
 	}
@@ -366,10 +412,27 @@ func SaveLastGood(path, dataDir string, loaded *Loaded) error {
 
 // Check validates path with its subscriptions, without any fallback.
 func Check(path, dataDir string, validate func(engine.Config) error) (Loaded, error) {
-	return load(path, dataDir, validate)
+	return load(path, dataDir, validate, previousDocument(path, dataDir))
 }
 
-func load(path, dataDir string, validate func(engine.Config) error) (Loaded, error) {
+func previousDocument(path, dataDir string) *Document {
+	if path == "" || dataDir == "" {
+		return nil
+	}
+	document, err := ReadDocument(lastGoodPath(dataDir))
+	if err != nil || document.Bytes == nil {
+		return nil
+	}
+	return &document
+}
+
+// CheckReplacement validates a newly edited on-disk profile against the
+// current running configuration, while allowing a refresh of the same file.
+func CheckReplacement(path, dataDir string, running Loaded, validate func(engine.Config) error) (Loaded, error) {
+	return load(path, dataDir, validate, &Document{Revision: running.Revision, config: &running.User})
+}
+
+func load(path, dataDir string, validate func(engine.Config) error, previous *Document) (Loaded, error) {
 	document, err := ReadDocument(path)
 	if err != nil {
 		return Loaded{}, err
@@ -381,13 +444,19 @@ func load(path, dataDir string, validate func(engine.Config) error) (Loaded, err
 	if err != nil {
 		return Loaded{}, err
 	}
-	loaded, err := validateConfig(user, dataDir, validate, "", nil)
+	var baseline *engine.Config
+	if previous != nil && previous.Revision != document.Revision {
+		if config, err := previous.Config(); err == nil {
+			baseline = &config
+		}
+	}
+	loaded, err := validateConfig(user, dataDir, validate, "", nil, baseline)
 	loaded.Revision, loaded.document = document.Revision, document.Bytes
 	return loaded, err
 }
 
 // validateConfig may use a staged snapshot that is still invisible to readers.
-func validateConfig(user engine.Config, dataDir string, validate func(engine.Config) error, stagedName string, staged *Snapshot) (Loaded, error) {
+func validateConfig(user engine.Config, dataDir string, validate func(engine.Config) error, stagedName string, staged *Snapshot, previous *engine.Config) (Loaded, error) {
 	user.DataDir = dataDir
 	if n := user.SubscriptionRefreshMin; n != 0 && (n < 10 || n > 10080) {
 		return Loaded{}, errors.New("subscriptionRefreshMin must be between 10 and 10080")
@@ -414,6 +483,11 @@ func validateConfig(user engine.Config, dataDir string, validate func(engine.Con
 		updated[sub.Key()] = snapshot.Updated
 	}
 	merged, mergeWarnings := Merge(user, snapshots)
+	if previous != nil {
+		if err := validateReferences(user, merged, *previous, dataDir, stagedName); err != nil {
+			return Loaded{}, err
+		}
+	}
 	merged.DataDir = dataDir
 	if err := validate(merged); err != nil {
 		return Loaded{}, err

@@ -23,6 +23,7 @@ var ErrConfigurationChanged = errors.New("磁盘配置已更新，当前操作�
 type Document struct {
 	Bytes    []byte
 	Revision string
+	config   *engine.Config
 }
 
 func ReadDocument(path string) (Document, error) {
@@ -40,6 +41,9 @@ func ReadDocument(path string) (Document, error) {
 }
 
 func (doc Document) Config() (engine.Config, error) {
+	if doc.config != nil {
+		return *doc.config, nil
+	}
 	if doc.Bytes == nil {
 		return engine.Default(), nil
 	}
@@ -78,15 +82,20 @@ func CommitConfig(ctx context.Context, path, dataDir, expected string, data []by
 		return "", err
 	}
 	defer release()
-	if _, err := readExpected(path, expected); err != nil {
+	doc, err := readExpected(path, expected)
+	if err != nil {
 		return "", err
+	}
+	previous, err := doc.Config()
+	if err != nil {
+		previous = engine.Default()
 	}
 	config, err := engine.Decode(bytes.NewReader(data))
 	if err != nil {
 		return "", err
 	}
 	validate := func(config engine.Config) error { return engine.Validate(config, impl) }
-	if _, err := validateConfig(config, dataDir, validate, "", nil); err != nil {
+	if _, err := validateConfig(config, dataDir, validate, "", nil, &previous); err != nil {
 		return "", err
 	}
 	return writeDocument(ctx, path, expected, data)
@@ -142,7 +151,7 @@ func CommitImport(ctx context.Context, path, dataDir, expected, raw string, impl
 	}
 	var stagedPath string
 	if plan != nil {
-		if err := plan.prepare(dataDir, impl); err != nil {
+		if err := plan.prepare(dataDir, impl, &base); err != nil {
 			return ImportReceipt{}, err
 		}
 		stagedPath, err = plan.stage(dataDir)
@@ -152,7 +161,7 @@ func CommitImport(ctx context.Context, path, dataDir, expected, raw string, impl
 		result = plan.result
 	} else {
 		validate := func(config engine.Config) error { return engine.Validate(config, impl) }
-		if _, err := validateConfig(result.Config, dataDir, validate, "", nil); err != nil {
+		if _, err := validateConfig(result.Config, dataDir, validate, "", nil, &base); err != nil {
 			return ImportReceipt{}, err
 		}
 	}
