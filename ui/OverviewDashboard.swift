@@ -30,30 +30,38 @@ struct OverviewDashboard: View {
     private var busy: Bool { core.phase == .starting || core.phase == .stopping || core.saving }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("概览")
-                    .font(.system(size: 27, weight: .semibold))
-                    .accessibilityAddTraits(.isHeader)
-                    .padding(.bottom, 2)
-                proxyControl
-                if core.statusReadFailed {
-                    Label(core.statusReadAt.map { "状态读取失败，显示 " + $0.formatted(date: .omitted, time: .standard) + " 的记录" }
-                          ?? "暂时无法读取内核状态", systemImage: "exclamationmark.circle")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
-                routing
-                localAccess
-                traffic
-                subscriptionsOverview
-            }
-            .padding(.bottom, 16)
+        ViewThatFits(in: .vertical) {
+            content(chartHeight: 120)
+                .fixedSize(horizontal: false, vertical: true)
+            content(chartHeight: 80)
+                .fixedSize(horizontal: false, vertical: true)
+            ScrollView { content(chartHeight: 80) }
         }
         .onChange(of: core.saved, initial: true) { _, text in
             configuration = try? JSONDecoder().decode(ConfigurationSummary.self, from: Data(text.utf8))
         }
         .sheet(isPresented: $showsAuto) { AutoRoutingSheet(core: core) }
+    }
+
+    private func content(chartHeight: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("概览")
+                .font(.system(size: 27, weight: .semibold))
+                .accessibilityAddTraits(.isHeader)
+                .padding(.bottom, 2)
+            proxyControl
+            if core.statusReadFailed {
+                Label(core.statusReadAt.map { "状态读取失败，显示 " + $0.formatted(date: .omitted, time: .standard) + " 的记录" }
+                      ?? "暂时无法读取内核状态", systemImage: "exclamationmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            routing
+            localAccess
+            traffic(chartHeight: chartHeight)
+            subscriptionsOverview
+        }
+        .padding(.bottom, 16)
     }
 
     private var proxyControl: some View {
@@ -271,7 +279,7 @@ struct OverviewDashboard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var traffic: some View {
+    private func traffic(chartHeight: CGFloat) -> some View {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .current
         let today = calendar.startOfDay(for: .now)
@@ -280,7 +288,6 @@ struct OverviewDashboard: View {
         let todayCount = days.last?.count
         let rates = running ? core.liveTraffic : nil
         let ratePlaceholder = running ? "等待采样" : core.phase.rawValue
-        let chartHeight: CGFloat = 120
 
         return VStack(alignment: .leading, spacing: 11) {
             HStack(spacing: 8) {
