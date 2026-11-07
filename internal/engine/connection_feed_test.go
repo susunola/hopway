@@ -137,6 +137,46 @@ func TestConnectionFeedEvictionAndStaleCursor(t *testing.T) {
 	}
 }
 
+func TestConnectionHistoryCanBeBoundedOrDisabled(t *testing.T) {
+	config := Default()
+	config.ConnectionHistory = ConnectionHistoryConfig{Limit: 2, RetentionMin: 1}
+	core, err := New(config, backend.Native{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	core.mu.Lock()
+	core.remember(Record{ID: 1})
+	core.remember(Record{ID: 2})
+	core.remember(Record{ID: 3})
+	core.mu.Unlock()
+	recent := core.Connections(nil).Records
+	if core.recentTTL != time.Minute || len(recent) != 2 || recent[0].ID != 2 || recent[1].ID != 3 {
+		t.Fatalf("unexpected history: %+v", recent)
+	}
+
+	config.ConnectionHistory.Disabled = true
+	noHistory, err := New(config, backend.Native{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer noHistory.Close()
+	conn, err := noHistory.Dial(context.Background(), "fixture", listenConnectionFixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	active := noHistory.Connections(nil)
+	if len(active.Records) != 1 {
+		t.Fatalf("active connection missing: %+v", active)
+	}
+	conn.Close()
+	closed := noHistory.Connections(&active.Cursor)
+	if len(closed.Records) != 0 || len(closed.Removed) != 1 || closed.Removed[0] != active.Records[0].ID {
+		t.Fatalf("closing must remove the row without retaining details: %+v", closed)
+	}
+}
+
 func TestBurstReleasesConnectionTrackingStorage(t *testing.T) {
 	address := listenConnectionFixture(t)
 	core, err := New(Default(), backend.Native{})

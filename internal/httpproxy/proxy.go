@@ -32,6 +32,12 @@ func fail(writer http.ResponseWriter, err error) {
 }
 
 func failure(err error) (int, string) {
+	if errors.Is(err, wire.ErrConnectionLimit) {
+		return http.StatusServiceUnavailable, "Proxy connection limit reached"
+	}
+	if wire.DescriptorExhausted(err) {
+		return http.StatusServiceUnavailable, "Proxy file descriptor limit reached"
+	}
 	if errors.Is(err, outbound.ErrRejected) {
 		return http.StatusForbidden, "Blocked by routing policy"
 	}

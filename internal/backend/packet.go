@@ -19,7 +19,7 @@ var ErrPacketCongested = errors.New("UDP outbound is congested")
 
 func PacketDropReason(err error) wire.UDPDropReason {
 	switch {
-	case errors.Is(err, ErrPacketCongested):
+	case errors.Is(err, ErrPacketCongested), errors.Is(err, wire.ErrConnectionLimit), wire.DescriptorExhausted(err):
 		return wire.UDPQueueFull
 	case errors.Is(err, outbound.ErrRejected):
 		return wire.UDPPolicy

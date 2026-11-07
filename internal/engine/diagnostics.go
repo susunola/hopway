@@ -16,6 +16,7 @@ import (
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/outbound"
 	"mac-proxy/internal/trace"
+	"mac-proxy/internal/wire"
 )
 
 type DialFailure struct {
@@ -77,6 +78,9 @@ func diagnoseDial(err error, stage string) DialFailure {
 		return failure("endpoint-busy", errEndpointBusy.Error())
 	case errors.Is(err, backend.ErrPacketCongested):
 		return failure("packet-busy", backend.ErrPacketCongested.Error())
+	case wire.DescriptorExhausted(err):
+		stage = trace.StageConnect
+		return failure("fd-exhausted", "proxy file descriptor limit reached")
 	case errors.Is(err, backend.ErrNoUDP):
 		return failure("udp-unsupported", backend.ErrNoUDP.Error())
 	case errors.As(err, &hostError):

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"sort"
 	"time"
 )
@@ -10,6 +11,32 @@ const (
 	recentConnectionLimit = 300
 	recentConnectionTTL   = 15 * time.Minute
 )
+
+type ConnectionHistoryConfig struct {
+	Disabled     bool `json:"disabled,omitempty"`
+	Limit        int  `json:"limit,omitempty"`
+	RetentionMin int  `json:"retentionMin,omitempty"`
+}
+
+func (config ConnectionHistoryConfig) limits() (int, time.Duration, error) {
+	if config.Limit < 0 || config.Limit > 1000 {
+		return 0, 0, errors.New("connectionHistory.limit must be between 1 and 1000, or 0 for the default")
+	}
+	if config.RetentionMin < 0 || config.RetentionMin > 120 {
+		return 0, 0, errors.New("connectionHistory.retentionMin must be between 1 and 120, or 0 for the default")
+	}
+	limit, ttl := recentConnectionLimit, recentConnectionTTL
+	if config.Limit != 0 {
+		limit = config.Limit
+	}
+	if config.RetentionMin != 0 {
+		ttl = time.Duration(config.RetentionMin) * time.Minute
+	}
+	if config.Disabled {
+		limit = 0
+	}
+	return limit, ttl, nil
+}
 
 // Go maps retain buckets after deletion. Compact only after a large peak
 // has subsided, and keep small indices for ordinary connection churn.
@@ -135,7 +162,7 @@ func (engine *Engine) connectionSnapshot() []Record {
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
 	for i := range engine.recent.size {
-		entry := engine.recent.entries[(engine.recent.first+i)%recentConnectionLimit]
+		entry := engine.recent.entries[(engine.recent.first+i)%engine.recentLimit]
 		records = append(records, entry.record)
 	}
 	return records
@@ -166,24 +193,24 @@ func (engine *Engine) removeOldestRecord() {
 	delete(recent.byID, entry.record.ID)
 	engine.journal.mark(entry.record.ID, true)
 	*entry = recentEntry{}
-	recent.first = (recent.first + 1) % recentConnectionLimit
+	recent.first = (recent.first + 1) % engine.recentLimit
 	recent.size--
 }
 
 func (engine *Engine) remember(record Record) {
+	engine.journal.mark(record.ID, true)
+	if engine.recentLimit == 0 {
+		return
+	}
 	recent := &engine.recent
 	if recent.byID == nil {
 		recent.byID = make(map[uint64]int)
 	}
-	if recent.size == recentConnectionLimit {
+	if recent.size == engine.recentLimit {
 		engine.removeOldestRecord()
 	}
-	ttl := engine.recentTTL
-	if ttl <= 0 {
-		ttl = recentConnectionTTL
-	}
-	index := (recent.first + recent.size) % recentConnectionLimit
-	entry := recentEntry{record: record, expires: time.Now().Add(ttl)}
+	index := (recent.first + recent.size) % engine.recentLimit
+	entry := recentEntry{record: record, expires: time.Now().Add(engine.recentTTL)}
 	if index == len(recent.entries) {
 		recent.entries = append(recent.entries, entry)
 	} else {
@@ -191,7 +218,6 @@ func (engine *Engine) remember(record Record) {
 	}
 	recent.byID[record.ID] = index
 	recent.size++
-	engine.journal.mark(record.ID, true)
 	if engine.recentTimer == nil && !engine.closed {
 		engine.scheduleRecentExpiry()
 	}

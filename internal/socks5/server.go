@@ -45,10 +45,11 @@ func Handle(client *net.TCPConn, dial DialFunc) error { return HandleWithUDP(cli
 
 // HandleWithUDP serves one client; dialPacket enables UDP ASSOCIATE.
 func HandleWithUDP(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc) error {
-	return handleWithUDP(client, dial, dialPacket, udpSessionIdle)
+	return HandleWithUDPTimeout(client, dial, dialPacket, udpSessionIdle)
 }
 
-func handleWithUDP(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc, idle time.Duration) error {
+// HandleWithUDPTimeout serves one client with a custom UDP session idle timeout.
+func HandleWithUDPTimeout(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc, idle time.Duration) error {
 	if err := client.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return err
 	}

@@ -47,6 +47,7 @@ enum DialDiagnostic {
             "tls-untrusted": "TLS 证书不受信任", "tls-certificate": "TLS 证书校验失败",
             "proxy-auth": "上游代理认证失败", "endpoint-cooldown": "出站端点冷却中",
             "endpoint-busy": "出站拨号槽已满", "connection-refused": "服务器拒绝连接",
+            "fd-exhausted": "本机文件描述符额度用尽",
             "target-refused": "目标服务拒绝连接", "timeout": "连接超时",
             "connection-reset": "连接被对端重置", "broken-pipe": "连接已断开",
             "unreachable": "网络或主机不可达", "canceled": "已取消"
@@ -246,11 +247,15 @@ struct ProxyStatus: Decodable, Equatable {
     let sessionTraffic: TrafficHistory.Count?
     let udpDrops: [String: UDPDropCounts]?
     struct Resources: Decodable, Equatable {
+        let connections: Int?
+        let connectionLimit: Int?
+        let connectionsRefused: UInt64?
         let udpSessions: Int
         let udpSessionLimit: Int
         let udpOpening: Int
         let udpOpenLimit: Int
         let endpointDialLimit: Int
+        let udpIdleTimeoutSec: Int?
     }
     let resources: Resources?
     let reloaded: Double?
@@ -341,6 +346,7 @@ final class CoreModel: ObservableObject {
     @Published private(set) var verification: String?
     @Published private(set) var saving = false
     @Published private(set) var refreshing = false
+    @Published private(set) var exportingProfile = false
     @Published private(set) var updatingPolicy = false
     @Published private var requestedTUNOperation: String?
     @Published private(set) var trafficHistory: TrafficHistory?
@@ -377,6 +383,7 @@ final class CoreModel: ObservableObject {
     private var refreshID: UUID?
     private var terminationObserver: NSObjectProtocol?
     private var watchingConnections = false
+    private var connectionRequest: Task<Void, Never>?
     private var connectionCursor: UInt64?
     private var connectionRecords: [UInt64: ProxyStatus.Connection] = [:]
 
@@ -697,6 +704,27 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    func exportProfile(cpu: Bool) {
+        guard let info = endpoint, isRunning(info), !exportingProfile else { return }
+        let kind = cpu ? "cpu" : "heap"
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "HopWay-\(kind).pprof"
+        guard panel.runModal() == .OK, let destination = panel.url, isRunning(info) else { return }
+        exportingProfile = true
+        Task {
+            defer { exportingProfile = false }
+            do {
+                var query = [URLQueryItem(name: "kind", value: kind)]
+                if cpu { query.append(URLQueryItem(name: "seconds", value: "3")) }
+                let data = try await call(info, path: "diagnostics/profile", method: "POST", query: query)
+                try data.write(to: destination, options: .atomic)
+                message = "诊断样本已导出。"
+            } catch {
+                message = "导出诊断失败 · " + error.localizedDescription
+            }
+        }
+    }
+
     struct RouteDecision: Decodable {
         let rule: String
         let path: [String]?
@@ -729,11 +757,21 @@ final class CoreModel: ObservableObject {
         statusRequest?.cancel()
         statusRequest = nil
         statusRequestedAgain = false
+        cancelConnectionRequest()
     }
 
     func watchConnections(_ enabled: Bool) {
         watchingConnections = enabled
-        if enabled, let info = endpoint { Task { await refresh(info) } }
+        if enabled {
+            if let info = endpoint { Task { await refresh(info) } }
+        } else {
+            cancelConnectionRequest()
+        }
+    }
+
+    private func cancelConnectionRequest() {
+        connectionRequest?.cancel()
+        connectionRequest = nil
     }
 
     private func isRunning(_ info: Endpoint) -> Bool {
@@ -772,6 +810,7 @@ final class CoreModel: ObservableObject {
             statusReadAt = .now
             clearStatusFailure()
             if status?.generation != snapshot.generation {
+                cancelConnectionRequest()
                 connectionRecords.removeAll()
                 connectionCursor = nil
                 connectionReadFailed = false
@@ -789,7 +828,7 @@ final class CoreModel: ObservableObject {
                 announcedRecovery = true
                 message = "上次异常退出时留下的系统代理设置已自动还原。"
             }
-            if watchingConnections { await readConnectionFeed(info, generation: snapshot.generation) }
+            requestConnectionFeed(info, generation: snapshot.generation)
         } catch {
             guard isRunning(info) else { return }
             if !statusReadFailed { statusReadFailed = true }
@@ -800,7 +839,16 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    private func requestConnectionFeed(_ info: Endpoint, generation: UInt64) {
+        guard watchingConnections, connectionRequest == nil else { return }
+        connectionRequest = Task { [weak self] in
+            await self?.readConnectionFeed(info, generation: generation)
+            if !Task.isCancelled { self?.connectionRequest = nil }
+        }
+    }
+
     private func readConnectionFeed(_ info: Endpoint, generation: UInt64) async {
+        guard isRunning(info), watchingConnections else { return }
         let query: [URLQueryItem] = connectionCursor.map { cursor in
             [URLQueryItem(name: "generation", value: String(generation)),
              URLQueryItem(name: "cursor", value: String(cursor))]

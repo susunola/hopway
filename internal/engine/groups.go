@@ -16,6 +16,7 @@ import (
 
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/trace"
+	"mac-proxy/internal/wire"
 )
 
 // Group types.
@@ -444,7 +445,8 @@ func (engine *Engine) probe(ctx context.Context, name string) ProbeResult {
 	dialer = engine.limitProbeDial(name, dialer)
 	latency, err := probeTarget(primary, dialer, target)
 	var primaryErr error
-	if err != nil && ctx.Err() == nil && engine.probeFallback != "" && !errors.Is(err, errEndpointBusy) && !errors.Is(err, backend.ErrEndpointCooling) {
+	if err != nil && ctx.Err() == nil && engine.probeFallback != "" && !errors.Is(err, errEndpointBusy) &&
+		!errors.Is(err, backend.ErrEndpointCooling) && !wire.DescriptorExhausted(err) {
 		primaryErr = err
 		target = engine.probeFallback
 		latency, err = probeTarget(ctx, dialer, target)
@@ -481,7 +483,7 @@ func inconclusiveProbe(err error) bool {
 	var probe *probeFailure
 	return errors.As(err, &status) || errors.As(err, &probe) && probe.stage == trace.StageUpstream ||
 		errors.Is(err, errEndpointBusy) || errors.Is(err, backend.ErrEndpointCooling) ||
-		errors.Is(err, syscall.ENETDOWN) || errors.Is(err, syscall.ENETUNREACH)
+		errors.Is(err, syscall.ENETDOWN) || errors.Is(err, syscall.ENETUNREACH) || wire.DescriptorExhausted(err)
 }
 
 func probeTarget(ctx context.Context, dialer backend.Dialer, target string) (time.Duration, error) {

@@ -307,11 +307,12 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 	s.mu.Lock()
 	closing := s.closing
 	t := s.loaded.Merged.TUN
+	idle := s.loaded.Merged.Resources.UDPIdleTimeout()
 	s.mu.Unlock()
 	if closing {
 		return net.ErrClosed
 	}
-	options := tun.Options{}
+	options := tun.Options{UDPIdleTimeout: idle}
 	if t != nil {
 		options.MTU, options.IPv6 = t.MTU, t.IPv6
 	}

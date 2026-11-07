@@ -92,9 +92,9 @@ func TestTUNOneWayDownloadRefreshesNATLifetime(t *testing.T) {
 	target := M.ParseSocksaddr("198.51.100.1:443")
 	conn := &tunDownloadFixture{refreshed: make(chan time.Duration, 1), closed: make(chan struct{})}
 	outbound := &tunDownloadOutbound{tunPacketOutbound: tunPacketOutbound{closed: make(chan struct{})}, destination: target}
-	options := Options{}
+	options := Options{UDPIdleTimeout: 24 * time.Second}
 	options.defaults()
-	service := &Service{fake: NewFakeIP(options.FakeRange),
+	service := &Service{options: options, fake: NewFakeIP(options.FakeRange),
 		dialPacket: func(context.Context, string, string) (net.PacketConn, error) { return outbound, nil }}
 	finished := make(chan struct{})
 	go func() {
@@ -107,8 +107,8 @@ func TestTUNOneWayDownloadRefreshesNATLifetime(t *testing.T) {
 	}()
 	select {
 	case got := <-conn.refreshed:
-		if got != tunUDPIdle {
-			t.Fatalf("NAT lifetime refreshed to %v, want %v", got, tunUDPIdle)
+		if got != options.UDPIdleTimeout {
+			t.Fatalf("NAT lifetime refreshed to %v, want %v", got, options.UDPIdleTimeout)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("a downstream packet did not extend the UDP session lifetime")

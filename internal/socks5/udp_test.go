@@ -36,7 +36,7 @@ func openUDPAssociationWithIdle(t *testing.T, dial DialPacketFunc, idle time.Dur
 			return
 		}
 		defer conn.Close()
-		served <- handleWithUDP(conn, nil, dial, idle)
+		served <- HandleWithUDPTimeout(conn, nil, dial, idle)
 	}()
 	client, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
 	if err != nil {

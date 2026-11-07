@@ -20,9 +20,14 @@ struct AdvancedSettingsDraft {
         var autoRouteInterval = ""
         var subscriptionRefresh = ""
         var ruleSetRefresh = ""
+        var connectionLimit = ""
         var udpSessionLimit = ""
         var udpOpenLimit = ""
         var endpointDialLimit = ""
+        var udpIdleTimeout = ""
+        var connectionHistory = true
+        var historyLimit = ""
+        var historyRetention = ""
     }
 
     let source: String
@@ -38,6 +43,7 @@ struct AdvancedSettingsDraft {
         let health = config["health"] as? [String: Any] ?? [:]
         let performance = config["performance"] as? [String: Any] ?? [:]
         let resources = config["resources"] as? [String: Any] ?? [:]
+        let history = config["connectionHistory"] as? [String: Any] ?? [:]
         let loaded = Values(
             socksPort: String(config["socksPort"] as? Int ?? 1080),
             httpPort: String(config["httpPort"] as? Int ?? 8080),
@@ -56,9 +62,14 @@ struct AdvancedSettingsDraft {
             autoRouteInterval: Self.nonzeroText(performance["autoRouteIntervalSec"]),
             subscriptionRefresh: Self.nonzeroText(config["subscriptionRefreshMin"]),
             ruleSetRefresh: Self.nonzeroText(config["ruleSetRefreshMin"]),
+            connectionLimit: Self.nonzeroText(resources["connectionLimit"]),
             udpSessionLimit: Self.nonzeroText(resources["udpSessionLimit"]),
             udpOpenLimit: Self.nonzeroText(resources["udpOpenLimit"]),
-            endpointDialLimit: Self.nonzeroText(resources["endpointDialLimit"])
+            endpointDialLimit: Self.nonzeroText(resources["endpointDialLimit"]),
+            udpIdleTimeout: Self.nonzeroText(resources["udpIdleTimeoutSec"]),
+            connectionHistory: history["disabled"] as? Bool != true,
+            historyLimit: Self.nonzeroText(history["limit"]),
+            historyRetention: Self.nonzeroText(history["retentionMin"])
         )
         self.source = source
         original = loaded
@@ -126,15 +137,31 @@ struct AdvancedSettingsDraft {
 
         var resources = config["resources"] as? [String: Any] ?? [:]
         let resourceFields: [(key: String, value: KeyPath<Values, String>, label: String, range: ClosedRange<Int>)] = [
+            ("connectionLimit", \.connectionLimit, "代理连接总上限", 16...4096),
             ("udpSessionLimit", \.udpSessionLimit, "UDP 会话上限", 32...1024),
             ("udpOpenLimit", \.udpOpenLimit, "UDP 并发建连上限", 1...64),
-            ("endpointDialLimit", \.endpointDialLimit, "每端点拨号并发", 4...64)
+            ("endpointDialLimit", \.endpointDialLimit, "每端点拨号并发", 4...64),
+            ("udpIdleTimeoutSec", \.udpIdleTimeout, "UDP 空闲回收时间", 15...1800)
         ]
         for field in resourceFields where values[keyPath: field.value] != original[keyPath: field.value] {
             let limit = try number(values[keyPath: field.value], in: field.range, label: field.label, blank: 0)
             resources[field.key] = limit == 0 ? nil : limit
         }
         config["resources"] = resources.isEmpty ? nil : resources
+
+        var history = config["connectionHistory"] as? [String: Any] ?? [:]
+        if values.connectionHistory != original.connectionHistory {
+            history["disabled"] = values.connectionHistory ? nil : true
+        }
+        if values.historyLimit != original.historyLimit {
+            let limit = try number(values.historyLimit, in: 1...1000, label: "连接记录条数上限", blank: 0)
+            history["limit"] = limit == 0 ? nil : limit
+        }
+        if values.historyRetention != original.historyRetention {
+            let minutes = try number(values.historyRetention, in: 1...120, label: "连接记录保留时间", blank: 0)
+            history["retentionMin"] = minutes == 0 ? nil : minutes
+        }
+        config["connectionHistory"] = history.isEmpty ? nil : history
 
         var performance = config["performance"] as? [String: Any] ?? [:]
         let fields: [(key: String, value: KeyPath<Values, String>, label: String, range: ClosedRange<Int>)] = [
@@ -186,9 +213,17 @@ struct AdvancedSettingsDraft {
 }
 
 struct AdvancedSettingsPanel: View {
+    private enum Category: String, CaseIterable {
+        case access = "接入与端口"
+        case performance = "连接性能"
+        case probes = "测速与选路"
+        case data = "刷新与记录"
+    }
+
     @ObservedObject var core: CoreModel
     @Binding var draft: AdvancedSettingsDraft?
     let editJSON: () -> Void
+    @State private var category = Category.performance
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -202,8 +237,15 @@ struct AdvancedSettingsPanel: View {
                 Label("请先保存或还原 JSON 草稿，再编辑高级选项。", systemImage: "doc.badge.clock")
                     .foregroundStyle(.orange)
             } else if let fields = Binding($draft) {
-                Text("留空使用默认值。端口和连接资源上限在下次启动时应用。")
+                Text("留空使用默认值。各分组的改动一并保存。")
                     .font(.caption).foregroundStyle(.secondary)
+                Picker("配置分类", selection: $category) {
+                    ForEach(Category.allCases, id: \.self) { category in
+                        Text(category.rawValue).tag(category)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
                 Divider()
                 controls(fields.values)
                     .disabled(core.saving)
@@ -239,7 +281,17 @@ struct AdvancedSettingsPanel: View {
         }
     }
 
+    @ViewBuilder
     private func controls(_ values: Binding<AdvancedSettingsDraft.Values>) -> some View {
+        switch category {
+        case .access: accessControls(values)
+        case .performance: performanceControls(values)
+        case .probes: probeControls(values)
+        case .data: dataControls(values)
+        }
+    }
+
+    private func performanceControls(_ values: Binding<AdvancedSettingsDraft.Values>) -> some View {
         VStack(alignment: .leading, spacing: 13) {
             section("连接与故障切换", icon: "arrow.triangle.branch") {
                 fieldRow {
@@ -252,30 +304,48 @@ struct AdvancedSettingsPanel: View {
             Divider()
             section("连接资源上限", icon: "gauge.with.dots.needle.33percent") {
                 if let active = core.status?.resources, core.phase == .running, !core.statusReadFailed {
+                    if let used = active.connections, let limit = active.connectionLimit {
+                        hint("总额度占用 \(used) / \(limit) · 因总上限拒绝 \(active.connectionsRefused ?? 0) 次")
+                    }
                     hint("运行中 · UDP 会话 \(active.udpSessions) / \(active.udpSessionLimit) · UDP 正在建连 \(active.udpOpening) / \(active.udpOpenLimit) · 每端点上限 \(active.endpointDialLimit)")
+                    if let idle = active.udpIdleTimeoutSec {
+                        hint("运行中 · UDP 空闲 \(idle) 秒后回收")
+                    }
                 }
+                fieldRow {
+                    field("代理连接总上限（16–4096）", text: values.connectionLimit, prompt: "4096")
+                    field("UDP 空闲回收（秒，15–1800）", text: values.udpIdleTimeout, prompt: "300")
+                }
+                hint("TCP 和 UDP 共用，正在建立的连接也占额度。满额时拒绝新建，已有连接继续传输。")
                 fieldRow {
                     field("UDP 会话上限", text: values.udpSessionLimit, prompt: "1024")
                     field("UDP 并发建连上限", text: values.udpOpenLimit, prompt: "64")
                     field("每端点拨号并发", text: values.endpointDialLimit, prompt: "64")
                 }
                 hint("可填范围依次为 32–1024、1–64、4–64。UDP 会话满时回收最久未活动的会话。同一地址和端口的 TCP、UDP 建连及测速共用端点额度。")
+                hint("空闲回收适用于 SOCKS5 和 TUN。此组资源设置在重启代理后生效。")
             }
-            Divider()
-            section("测速与自动选路", icon: "speedometer") {
-                field("首选测速地址", text: values.probeURL, prompt: "随订阅或默认")
-                field("备用测速地址", text: values.fallbackURL, prompt: "可留空")
-                fieldRow {
-                    field("单节点测速时限（毫秒）", text: values.probeTimeout, prompt: "6000")
-                    field("每批测速并发", text: values.probeConcurrency, prompt: "8")
-                }
-                fieldRow {
-                    field("策略组测速间隔（秒）", text: values.probeInterval, prompt: "随订阅或 300")
-                    field("自动选路复测间隔（秒）", text: values.autoRouteInterval, prompt: "60")
-                }
-                hint("单节点时限涵盖首选和备用测速地址。策略组测速与按地区、服务商自动选路各自计时。")
+        }
+    }
+
+    private func probeControls(_ values: Binding<AdvancedSettingsDraft.Values>) -> some View {
+        section("测速与自动选路", icon: "speedometer") {
+            field("首选测速地址", text: values.probeURL, prompt: "随订阅或默认")
+            field("备用测速地址", text: values.fallbackURL, prompt: "可留空")
+            fieldRow {
+                field("单节点测速时限（毫秒）", text: values.probeTimeout, prompt: "6000")
+                field("每批测速并发", text: values.probeConcurrency, prompt: "8")
             }
-            Divider()
+            fieldRow {
+                field("策略组测速间隔（秒）", text: values.probeInterval, prompt: "随订阅或 300")
+                field("自动选路复测间隔（秒）", text: values.autoRouteInterval, prompt: "60")
+            }
+            hint("单节点时限涵盖首选和备用测速地址。策略组测速与按地区、服务商自动选路各自计时。")
+        }
+    }
+
+    private func dataControls(_ values: Binding<AdvancedSettingsDraft.Values>) -> some View {
+        VStack(alignment: .leading, spacing: 13) {
             section("后台刷新", icon: "arrow.clockwise") {
                 fieldRow {
                     field("订阅刷新间隔（分钟）", text: values.subscriptionRefresh, prompt: "360")
@@ -284,21 +354,34 @@ struct AdvancedSettingsPanel: View {
                 hint("内核运行时每 10 分钟检查是否到期。来源单独指定的刷新间隔优先，保存后可热加载。")
             }
             Divider()
-            section("本机端口与 TUN", icon: "network") {
+            section("最近连接记录", icon: "clock.arrow.circlepath") {
+                Toggle("保留已结束连接", isOn: values.connectionHistory)
                 fieldRow {
-                    field("SOCKS5 端口", text: values.socksPort, prompt: "1080")
-                    field("HTTP 端口", text: values.httpPort, prompt: "8080")
+                    field("条数上限（1–1000）", text: values.historyLimit, prompt: "300")
+                    field("保留时间（分钟，1–120）", text: values.historyRetention, prompt: "15")
                 }
-                hint("端口填 0 自动分配。修改后重启代理生效。")
-                fieldRow {
-                    Toggle("启动时接管系统代理", isOn: values.systemProxy)
-                    Toggle("启动时开启 TUN", isOn: values.tunEnabled)
-                    Toggle("TUN 接管 IPv6", isOn: values.ipv6)
-                }
-                field("TUN MTU", text: values.mtu, prompt: "9000")
-                    .frame(maxWidth: 190)
-                hint("重新开启 TUN 后应用 MTU 和 IPv6。自定义 MTU 需要新版 TUN 助手。")
+                .disabled(!values.connectionHistory.wrappedValue)
+                hint("记录只保存在内存中，按时间或条数回收。关闭后，连接页只显示活动连接。流量统计独立累计。")
+                hint("保存后可热加载，连接记录会从新内核开始累计。")
             }
+        }
+    }
+
+    private func accessControls(_ values: Binding<AdvancedSettingsDraft.Values>) -> some View {
+        section("本机端口与 TUN", icon: "network") {
+            fieldRow {
+                field("SOCKS5 端口", text: values.socksPort, prompt: "1080")
+                field("HTTP 端口", text: values.httpPort, prompt: "8080")
+            }
+            hint("端口填 0 自动分配。修改后重启代理生效。")
+            fieldRow {
+                Toggle("启动时接管系统代理", isOn: values.systemProxy)
+                Toggle("启动时开启 TUN", isOn: values.tunEnabled)
+                Toggle("TUN 接管 IPv6", isOn: values.ipv6)
+            }
+            field("TUN MTU", text: values.mtu, prompt: "9000")
+                .frame(maxWidth: 190)
+            hint("重新开启 TUN 后应用 MTU 和 IPv6。自定义 MTU 需要新版 TUN 助手。")
         }
     }
 

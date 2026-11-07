@@ -53,6 +53,13 @@ type Service struct {
 
 const tunUDPIdle = 5 * time.Minute
 
+func (o Options) udpIdleTimeout() time.Duration {
+	if o.UDPIdleTimeout <= 0 {
+		return tunUDPIdle
+	}
+	return o.UDPIdleTimeout
+}
+
 func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) {
 	options.defaults()
 	fd := options.FD
@@ -124,7 +131,7 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 	}
 	fd = 0 // the TUN device now owns the descriptor
 	s.stack, err = stun.NewStack("system", stun.StackOptions{
-		Context: s.ctx, Tun: s.device, TunOptions: tunOptions, UDPTimeout: tunUDPIdle,
+		Context: s.ctx, Tun: s.device, TunOptions: tunOptions, UDPTimeout: options.udpIdleTimeout(),
 		// The first packet selects the outbound. Separate destinations
 		// must not share that choice even if the app uses one UDP socket.
 		UDPMapping: stun.NATMappingAddressAndPortDependent, UDPNATMax: 1024,
@@ -425,7 +432,7 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 			}
 			// The NAT table already refreshes uploads. Refresh downloads
 			// here and let the table, rather than a second timer, own expiry.
-			if lifetime != nil && !lifetime.SetTimeout(tunUDPIdle) {
+			if lifetime != nil && !lifetime.SetTimeout(s.options.udpIdleTimeout()) {
 				finish(nil)
 				return
 			}

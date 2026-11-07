@@ -4,21 +4,23 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"time"
 )
 
 const DefaultMTU = 9000
 
 type Options struct {
-	FD           int // a device opened by the privileged helper; 0 creates one (needs root)
-	Name         string
-	MTU          uint32
-	Address      netip.Prefix // the device's own address
-	AutoRoute    bool
-	RouteAddress []netip.Prefix // limits auto-route to these ranges (default: everything)
-	FakeRange    netip.Prefix
-	UpstreamDNS  []string // host:port servers for HopWay's own lookups and forwarded queries
-	LocalDNS     []string // system resolvers, before adding public fallback servers
-	IPv6         bool     // give the device an IPv6 address, route ::/0 and answer AAAA with fake IPv6
+	FD             int // a device opened by the privileged helper; 0 creates one (needs root)
+	Name           string
+	MTU            uint32
+	Address        netip.Prefix // the device's own address
+	AutoRoute      bool
+	RouteAddress   []netip.Prefix // limits auto-route to these ranges (default: everything)
+	FakeRange      netip.Prefix
+	UpstreamDNS    []string // host:port servers for HopWay's own lookups and forwarded queries
+	LocalDNS       []string // system resolvers, before adding public fallback servers
+	IPv6           bool     // give the device an IPv6 address, route ::/0 and answer AAAA with fake IPv6
+	UDPIdleTimeout time.Duration
 }
 
 var defaultAddress6 = netip.MustParsePrefix("fdfe:dcba:9876::1/126")

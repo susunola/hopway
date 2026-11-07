@@ -45,10 +45,11 @@ type Config struct {
 	// SystemProxy points macOS's proxy settings at HopWay while it runs.
 	SystemProxy bool `json:"systemProxy,omitempty"`
 	// TUN captures all traffic through a virtual network device.
-	TUN             *TUNConfig        `json:"tun,omitempty"`
-	MaxDialAttempts int               `json:"maxDialAttempts,omitempty"`
-	Performance     PerformanceConfig `json:"performance,omitzero"`
-	Resources       ResourceLimits    `json:"resources,omitzero"`
+	TUN               *TUNConfig              `json:"tun,omitempty"`
+	MaxDialAttempts   int                     `json:"maxDialAttempts,omitempty"`
+	Performance       PerformanceConfig       `json:"performance,omitzero"`
+	Resources         ResourceLimits          `json:"resources,omitzero"`
+	ConnectionHistory ConnectionHistoryConfig `json:"connectionHistory,omitzero"`
 
 	// DataDir holds caches (downloaded rule sets). Set by the caller, not saved.
 	DataDir string `json:"-"`
@@ -201,6 +202,7 @@ type Engine struct {
 	peakUDP       int
 	budget        *ResourceBudget
 	recent        recentRecords
+	recentLimit   int
 	recentTimer   *time.Timer
 	recentTTL     time.Duration
 	journal       connectionJournal
@@ -271,10 +273,15 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 	if err != nil {
 		return nil, err
 	}
+	recentLimit, recentTTL, err := config.ConnectionHistory.limits()
+	if err != nil {
+		return nil, err
+	}
 	engine := &Engine{subscriptions: config.Subscriptions, autoWake: make(chan struct{}, 1), dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL, probeFallback: defaultProbeFallback,
 		dialSlots: make(map[string]*endpointSlots), attempts: attempts, performance: performance,
+		recentLimit: recentLimit, recentTTL: recentTTL,
 		lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
 	}
 	for _, port := range localPorts {
@@ -648,6 +655,16 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		engine.mu.Unlock()
 		return nil, net.ErrClosed
 	}
+	if !engine.budget.reserveConnection() {
+		engine.mu.Unlock()
+		return nil, wire.ErrConnectionLimit
+	}
+	trackedOwnsSlot := false
+	defer func() {
+		if !trackedOwnsSlot {
+			engine.budget.releaseConnection()
+		}
+	}()
 	engine.sequence++
 	record := Record{ID: engine.sequence, Start: time.Now().UnixMilli(), Target: target, Inbound: inbound, State: "active"}
 	policy := engine.policy
@@ -698,7 +715,7 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		if err != nil {
 			record.recordAttemptFailure(err)
 		}
-		if err == nil || ctx.Err() != nil {
+		if err == nil || ctx.Err() != nil || wire.DescriptorExhausted(err) {
 			break
 		}
 		// Only fail over when the node itself is at fault; a dead target
@@ -742,6 +759,7 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	}
 	record.Stage, record.Error, record.FailureCode = "", "", ""
 	tracked := &tracked{Conn: conn, engine: engine, record: record, opened: time.Now()}
+	trackedOwnsSlot = true
 	engine.live[record.ID] = tracked
 	engine.peakTCP = max(engine.peakTCP, len(engine.live))
 	engine.journal.mark(record.ID, true)
@@ -811,6 +829,16 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 		engine.mu.Unlock()
 		return nil, net.ErrClosed
 	}
+	if !engine.budget.reserveConnection() {
+		engine.mu.Unlock()
+		return nil, wire.ErrConnectionLimit
+	}
+	trackedOwnsSlot := false
+	defer func() {
+		if !trackedOwnsSlot {
+			engine.budget.releaseConnection()
+		}
+	}()
 	engine.sequence++
 	record := Record{ID: engine.sequence, Start: time.Now().UnixMilli(), Target: target, Inbound: inbound, State: "active", Network: "udp"}
 	policy := engine.policy
@@ -853,7 +881,8 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 		if err != nil {
 			record.recordAttemptFailure(err)
 		}
-		if err == nil || errors.Is(err, outbound.ErrRejected) || ctx.Err() != nil || record.Stage == trace.StageUpstream {
+		if err == nil || errors.Is(err, outbound.ErrRejected) || ctx.Err() != nil ||
+			record.Stage == trace.StageUpstream || wire.DescriptorExhausted(err) {
 			break
 		}
 	}
@@ -883,6 +912,7 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 	}
 	record.Stage, record.Error, record.FailureCode = "", "", ""
 	tracked := &trackedPacket{PacketConn: conn, engine: engine, record: record, outbound: exit}
+	trackedOwnsSlot = true
 	evicted := engine.budget.admit(tracked)
 	engine.livePackets[record.ID] = tracked
 	engine.peakUDP = max(engine.peakUDP, len(engine.livePackets))
@@ -1014,6 +1044,7 @@ func (conn *trackedPacket) snapshot() Record {
 func (conn *trackedPacket) Close() error {
 	var err error
 	conn.once.Do(func() {
+		defer conn.engine.budget.releaseConnection()
 		conn.closed.Store(true)
 		err = conn.PacketConn.Close()
 		conn.engine.budget.remove(conn)
@@ -1080,7 +1111,8 @@ func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *
 		}
 		record.setFailure(diagnoseDial(err, record.Stage))
 	}
-	if via != "DIRECT" && via != "REJECT" && !errors.Is(ctx.Err(), context.Canceled) && !errors.Is(err, backend.ErrEndpointCooling) {
+	if via != "DIRECT" && via != "REJECT" && !errors.Is(ctx.Err(), context.Canceled) &&
+		!errors.Is(err, backend.ErrEndpointCooling) && !wire.DescriptorExhausted(err) {
 		engine.mu.Lock()
 		if engine.networkEpoch.Load() != epoch {
 			engine.mu.Unlock()
@@ -1233,6 +1265,7 @@ func (conn *tracked) RecordRelayError(failure *wire.RelayError) {
 func (conn *tracked) Close() error {
 	var err error
 	conn.once.Do(func() {
+		defer conn.engine.budget.releaseConnection()
 		err = conn.Conn.Close()
 		conn.engine.mu.Lock()
 		defer conn.engine.mu.Unlock()

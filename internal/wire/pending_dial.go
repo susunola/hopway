@@ -6,8 +6,15 @@ import (
 	"errors"
 	"io"
 	"net"
+	"syscall"
 	"time"
 )
+
+var ErrConnectionLimit = errors.New("proxy connection limit reached")
+
+func DescriptorExhausted(err error) bool {
+	return errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)
+}
 
 // DialWithClient watches the ingress while opening a tunnel. It peeks into
 // a bounded buffer so any early payload can still be relayed, and it stops

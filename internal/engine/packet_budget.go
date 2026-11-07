@@ -10,20 +10,34 @@ import (
 // ResourceLimits bounds work shared by all generations of the proxy.
 // A zero field uses the default.
 type ResourceLimits struct {
+	ConnectionLimit   int `json:"connectionLimit,omitempty"`
 	UDPSessionLimit   int `json:"udpSessionLimit,omitempty"`
 	UDPOpenLimit      int `json:"udpOpenLimit,omitempty"`
 	EndpointDialLimit int `json:"endpointDialLimit,omitempty"`
+	UDPIdleTimeoutSec int `json:"udpIdleTimeoutSec,omitempty"`
+}
+
+func (limits ResourceLimits) UDPIdleTimeout() time.Duration {
+	if limits.UDPIdleTimeoutSec == 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(limits.UDPIdleTimeoutSec) * time.Second
 }
 
 func (limits ResourceLimits) effective() (ResourceLimits, error) {
+	if limits.UDPIdleTimeoutSec == 0 {
+		limits.UDPIdleTimeoutSec = int(limits.UDPIdleTimeout() / time.Second)
+	}
 	for _, field := range []struct {
 		name             string
 		value            *int
 		minimum, maximum int
 	}{
+		{"connectionLimit", &limits.ConnectionLimit, 16, connectionLimit},
 		{"udpSessionLimit", &limits.UDPSessionLimit, 32, packetSessionLimit},
 		{"udpOpenLimit", &limits.UDPOpenLimit, 1, packetOpenLimit},
 		{"endpointDialLimit", &limits.EndpointDialLimit, endpointProbeLimit, endpointDialLimit},
+		{"udpIdleTimeoutSec", &limits.UDPIdleTimeoutSec, 15, 1800},
 	} {
 		switch {
 		case *field.value == 0:
@@ -37,11 +51,14 @@ func (limits ResourceLimits) effective() (ResourceLimits, error) {
 
 type ResourceStatus struct {
 	ResourceLimits
-	UDPSessions int `json:"udpSessions"`
-	UDPOpening  int `json:"udpOpening"`
+	Connections        int    `json:"connections"`
+	ConnectionsRefused uint64 `json:"connectionsRefused"`
+	UDPSessions        int    `json:"udpSessions"`
+	UDPOpening         int    `json:"udpOpening"`
 }
 
 const (
+	connectionLimit     = 4096
 	packetSessionLimit  = 1024
 	packetOpenLimit     = 64
 	packetExitOpenLimit = 8
@@ -51,13 +68,16 @@ const (
 // ResourceBudget owns connection-opening and UDP limits, including engines that
 // are still draining connections after a configuration reload.
 type ResourceBudget struct {
-	dials       endpointBudget
-	mu          sync.Mutex
-	started     time.Time
-	sessions    map[*trackedPacket]struct{}
-	outbounds   map[string]*packetOutbound
-	opening     chan struct{}
-	maxSessions int
+	connections        chan struct{}
+	connectionsRefused atomic.Uint64
+	dials              endpointBudget
+	mu                 sync.Mutex
+	started            time.Time
+	sessions           map[*trackedPacket]struct{}
+	outbounds          map[string]*packetOutbound
+	opening            chan struct{}
+	maxSessions        int
+	udpIdleTimeoutSec  int
 }
 
 type packetOutbound struct {
@@ -77,15 +97,18 @@ func NewResourceBudget(config ResourceLimits) (*ResourceBudget, error) {
 
 func newResourceBudget(limits ResourceLimits) *ResourceBudget {
 	return &ResourceBudget{
+		connections: make(chan struct{}, limits.ConnectionLimit),
 		dials: endpointBudget{entries: make(map[string]*endpointSlots), maxOpening: limits.EndpointDialLimit,
 			probeOpening: make(chan struct{}, probeParallel), now: time.Now},
 		started: time.Now(), maxSessions: limits.UDPSessionLimit, opening: make(chan struct{}, limits.UDPOpenLimit),
-		sessions: make(map[*trackedPacket]struct{}), outbounds: make(map[string]*packetOutbound),
+		udpIdleTimeoutSec: limits.UDPIdleTimeoutSec,
+		sessions:          make(map[*trackedPacket]struct{}), outbounds: make(map[string]*packetOutbound),
 	}
 }
 
 func (b *ResourceBudget) limits() ResourceLimits {
-	return ResourceLimits{UDPSessionLimit: b.maxSessions, UDPOpenLimit: cap(b.opening), EndpointDialLimit: b.dials.maxOpening}
+	return ResourceLimits{ConnectionLimit: cap(b.connections), UDPSessionLimit: b.maxSessions,
+		UDPOpenLimit: cap(b.opening), EndpointDialLimit: b.dials.maxOpening, UDPIdleTimeoutSec: b.udpIdleTimeoutSec}
 }
 
 func (b *ResourceBudget) Matches(config ResourceLimits) bool {
@@ -96,8 +119,22 @@ func (b *ResourceBudget) Matches(config ResourceLimits) bool {
 func (b *ResourceBudget) status() *ResourceStatus {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return &ResourceStatus{ResourceLimits: b.limits(), UDPSessions: len(b.sessions), UDPOpening: len(b.opening)}
+	return &ResourceStatus{ResourceLimits: b.limits(), Connections: len(b.connections),
+		ConnectionsRefused: b.connectionsRefused.Load(), UDPSessions: len(b.sessions), UDPOpening: len(b.opening)}
 }
+
+// A slot covers the dial and the resulting connection, across engine generations.
+func (b *ResourceBudget) reserveConnection() bool {
+	select {
+	case b.connections <- struct{}{}:
+		return true
+	default:
+		b.connectionsRefused.Add(1)
+		return false
+	}
+}
+
+func (b *ResourceBudget) releaseConnection() { <-b.connections }
 
 func (b *ResourceBudget) retainOutbound(key string) *packetOutbound {
 	b.mu.Lock()

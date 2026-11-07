@@ -335,7 +335,7 @@ func TestResourceLimitsApplyOnlyOnRestart(t *testing.T) {
 	if err := s.Reload(); err != nil {
 		t.Fatalf("explicit defaults must reload: %v", err)
 	}
-	config.Resources = engine.ResourceLimits{UDPSessionLimit: 32, UDPOpenLimit: 1, EndpointDialLimit: 4}
+	config.Resources = engine.ResourceLimits{ConnectionLimit: 16, UDPSessionLimit: 32, UDPOpenLimit: 1, EndpointDialLimit: 4, UDPIdleTimeoutSec: 45}
 	save()
 	before := s.Engine()
 	if err := s.Reload(); !errors.Is(err, ErrResourcesChanged) || s.Engine() != before {

@@ -566,6 +566,14 @@ private struct Dashboard: View {
                 if let notice = core.configurationNotice, core.phase == .running {
                     Label(notice, systemImage: "clock").foregroundStyle(.orange)
                 }
+                if core.phase == .running {
+                    HStack {
+                        Button("导出 CPU 样本（3 秒）") { core.exportProfile(cpu: true) }
+                        Button("导出堆快照") { core.exportProfile(cpu: false) }
+                        if core.exportingProfile { ProgressView().controlSize(.small) }
+                    }
+                    .disabled(core.exportingProfile)
+                }
             } else if !core.profileReadFailed {
                 Text("正在读取已保存的配置。").foregroundStyle(.secondary)
             }

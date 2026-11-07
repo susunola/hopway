@@ -31,6 +31,7 @@ import (
 	"mac-proxy/internal/socks5"
 	"mac-proxy/internal/sysproxy"
 	"mac-proxy/internal/tun"
+	"mac-proxy/internal/wire"
 )
 
 type ready struct {
@@ -328,7 +329,9 @@ func run(path string, port int, check, managed bool) error {
 		return nil
 	}
 	serverErrors := make(chan error, 4)
-	go func() { serverErrors <- serveSOCKS(socks, supervisor.Dial, supervisor.DialPacket) }()
+	go func() {
+		serverErrors <- serveSOCKS(lifetime, socks, supervisor.Dial, supervisor.DialPacket, config.Resources.UDPIdleTimeout())
+	}()
 	httpServer := &http.Server{
 		Handler: httpproxy.Handler(supervisor.Dial), ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout: 30 * time.Second, MaxHeaderBytes: 64 << 10,
@@ -359,15 +362,30 @@ func run(path string, port int, check, managed bool) error {
 	}
 }
 
-func serveSOCKS(listener *net.TCPListener, dial socks5.DialFunc, dialPacket socks5.DialPacketFunc) error {
+func serveSOCKS(ctx context.Context, listener *net.TCPListener, dial socks5.DialFunc, dialPacket socks5.DialPacketFunc, idle time.Duration) error {
+	var delay time.Duration
 	for {
 		client, err := listener.AcceptTCP()
 		if err != nil {
-			return err
+			if !wire.DescriptorExhausted(err) {
+				return err
+			}
+			// An exhausted descriptor table can recover when any existing
+			// stream closes. Keep the listener and those streams alive.
+			delay = min(max(5*time.Millisecond, delay*2), time.Second)
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+				continue
+			case <-ctx.Done():
+				timer.Stop()
+				return nil
+			}
 		}
+		delay = 0
 		go func() {
 			defer client.Close()
-			socks5.HandleWithUDP(client, dial, dialPacket)
+			socks5.HandleWithUDPTimeout(client, dial, dialPacket, idle)
 		}()
 	}
 }
@@ -375,6 +393,10 @@ func serveSOCKS(listener *net.TCPListener, dial socks5.DialFunc, dialPacket sock
 func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	core := supervisor.Engine // the engine changes on reload; always use the current one
 	router := http.NewServeMux()
+	diagnosticSlot := make(chan struct{}, 1)
+	router.HandleFunc("POST /diagnostics/profile", func(writer http.ResponseWriter, request *http.Request) {
+		serveDiagnostic(supervisor, diagnosticSlot, writer, request)
+	})
 	router.HandleFunc("GET /status", func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		if request.URL.Query().Get("view") == "compact" {
