@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/netip"
 	"testing"
+
+	"mac-proxy/internal/process"
 )
 
 func TestRuleSemantics(t *testing.T) {
@@ -42,7 +44,7 @@ func TestRuleSemantics(t *testing.T) {
 		{"private.test", "G"}, // no-resolve rules never match resolved names
 	}
 	for _, c := range cases {
-		index := m.match(c.host, resolve)
+		index := m.match(c.host, resolve, nil)
 		got := "none"
 		if index >= 0 {
 			got = rules[index].Via
@@ -53,7 +55,7 @@ func TestRuleSemantics(t *testing.T) {
 	}
 	// a.example.com matched rule 3 before any resolvable IP rule: no lookup.
 	resolved = 0
-	m.match("a.example.com", resolve)
+	m.match("a.example.com", resolve, nil)
 	if resolved != 0 {
 		t.Fatal("resolved a name that a domain rule already decided")
 	}
@@ -97,6 +99,37 @@ func BenchmarkMatch100k(b *testing.B) {
 	hosts := []string{"www.site99996.example", "host50001.example", "unknown.example.org", "10.1.2.3", "2001:db8:42::1"}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		m.match(hosts[i%len(hosts)], nil)
+		m.match(hosts[i%len(hosts)], nil, nil)
+	}
+}
+
+func TestProcessRules(t *testing.T) {
+	rules := []Rule{
+		{Type: RuleDomainSuffix, Value: "early.test", Via: "A"},
+		{Type: RuleProcessName, Value: "Telegram.app", Via: "B"},
+		{Type: RuleProcessPath, Value: "/usr/local/bin/", Via: "C"},
+		{Type: RuleProcessPath, Value: "/usr/bin/curl", Via: "D"},
+		{Type: RuleMatch, Via: "E"},
+	}
+	m, err := newMatcher(rules, func(string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	owners := map[string]*process.Owner{
+		"telegram": {Name: "Telegram", App: "Telegram", Path: "/Applications/Telegram.app/Contents/MacOS/Telegram"},
+		"brew":     {Name: "wget", Path: "/usr/local/bin/wget"},
+		"curl":     {Name: "curl", Path: "/usr/bin/curl"},
+		"other":    {Name: "Safari", App: "Safari", Path: "/Applications/Safari.app/Contents/MacOS/Safari"},
+	}
+	for name, want := range map[string]string{"telegram": "B", "brew": "C", "curl": "D", "other": "E"} {
+		calls := 0
+		owner := func() *process.Owner { calls++; return owners[name] }
+		if got := rules[m.match("x.test", nil, owner)].Via; got != want || calls != 1 {
+			t.Errorf("%s: got %s (lookups %d), want %s", name, got, calls, want)
+		}
+	}
+	calls := 0
+	if got := rules[m.match("a.early.test", nil, func() *process.Owner { calls++; return nil })].Via; got != "A" || calls != 0 {
+		t.Errorf("an earlier domain rule must win without a process lookup (got %s, %d lookups)", got, calls)
 	}
 }

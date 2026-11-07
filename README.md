@@ -63,6 +63,8 @@ curl --noproxy "" --proxy http://127.0.0.1:8080 https://example.com/
   "rules": [
     { "type": "domain-keyword", "value": "ads", "via": "REJECT" },
     { "type": "domain-suffix", "value": "openai.com", "via": "Auto" },
+    { "type": "process-name", "value": "Telegram", "via": "Proxy" },
+    { "type": "process-path", "value": "/Applications/Steam.app/", "via": "DIRECT" },
     { "type": "ip-cidr", "value": "192.168.0.0/16", "via": "DIRECT", "noResolve": true },
     { "type": "ip-cidr", "value": "203.0.113.0/24", "via": "Backup" },
     { "type": "match", "via": "SELECT" }
@@ -74,11 +76,12 @@ curl --noproxy "" --proxy http://127.0.0.1:8080 https://example.com/
 - 自动组的成员按 `health` 定期测速。测速之外，节点在连接时出现 DNS、连接或握手失败也会立即标记为不可用。经过自动组的连接如果因节点本身失败，会在同一次请求内换下一个成员重试（最多 3 次），对应用透明。目标站点本身不可达时不会重试。
 - `rule` 模式按顺序取第一条匹配的规则，未匹配时走 `DIRECT`。规则在加载时建立索引，十万条规则的匹配耗时仍在一微秒以内。`SELECT` 表示当前选定出站。
 - 目标是域名时，只有当排在最前的候选规则是 IP 规则时，内核才解析这个域名（每次连接最多解析一次）；带 `noResolve` 的 IP 规则只匹配客户端直接提交的 IP。
+- `process-name` 匹配发起连接的应用：可以填可执行文件名，也可以填 `.app` 包名（不区分大小写）。例如填 `Google Chrome`，就能匹配它的所有 Helper 进程。`process-path` 匹配可执行文件的完整路径；以 `/` 结尾时匹配该目录下的所有程序。识别进程不需要 TUN：内核根据本机应用连接到 HopWay 时使用的端口，在系统连接表（macOS 上是 `net.inet.tcp.pcblist_n`）里找到对应的进程。只有当排在最前的候选规则是进程规则时，内核才会去查进程；其他连接在建立之后才补查，只用于诊断显示，不增加连接延迟。
 - `global` 把所有连接交给选定出站，`direct` 强制直连。端口可填 `0`，由系统分配。
 
 ### 连接诊断
 
-每条连接都记录经过的策略组路径、实际使用的节点和服务器，以及 DNS、连接、握手、首字节各阶段的耗时。失败的连接会标出失败阶段：`dns`（解析不到服务器）、`connect`（服务器拒绝连接或超时）、`handshake`（TLS、证书或代理协议握手失败）、`upstream`（代理已连上，但没有任何响应就关闭了连接。VLESS、Trojan 等协议的认证错误通常表现为这种情况）、`route`（被规则拦截）。gRPC、QUIC 等多路复用的连接会标为 `shared`，因为它们复用已有会话，没有单独的建连耗时。把鼠标停在控制台连接表的目标或状态上，可以查看这些信息。
+每条连接都记录发起它的应用、经过的策略组路径、实际使用的节点和服务器，以及 DNS、连接、握手、首字节各阶段的耗时。失败的连接会标出失败阶段：`dns`（解析不到服务器）、`connect`（服务器拒绝连接或超时）、`handshake`（TLS、证书或代理协议握手失败）、`upstream`（代理已连上，但没有任何响应就关闭了连接。VLESS、Trojan 等协议的认证错误通常表现为这种情况）、`route`（被规则拦截）。gRPC、QUIC 等多路复用的连接会标为 `shared`，因为它们复用已有会话，没有单独的建连耗时。把鼠标停在控制台连接表的目标或状态上，可以查看这些信息。
 
 本版本处理 TCP 代理流量。UDP、TUN 和订阅自动刷新还没有做。
 

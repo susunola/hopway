@@ -66,6 +66,7 @@ rules:
   - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
   - GEOIP,CN,DIRECT
   - DOMAIN,x.test,Remote
+  - PROCESS-NAME,Telegram,DIRECT
   - MATCH,Proxy
 `
 	result, err := Import(context.Background(), strings.NewReader(profile), engine.Default(), backend.Default())
@@ -76,7 +77,8 @@ rules:
 	if len(config.Groups) != 2 || config.Selected != "Proxy" || config.Health == nil || config.Health.Interval != 600 {
 		t.Fatalf("groups %+v health %+v selected %s", config.Groups, config.Health, config.Selected)
 	}
-	if len(config.Rules) != 4 || !config.Rules[2].NoResolve || config.Rules[3].Type != engine.RuleMatch || config.Rules[3].Via != "Proxy" {
+	if len(config.Rules) != 5 || !config.Rules[2].NoResolve || config.Rules[3].Type != engine.RuleProcessName ||
+		config.Rules[4].Type != engine.RuleMatch || config.Rules[4].Via != "Proxy" {
 		t.Fatalf("rules %+v", config.Rules)
 	}
 	core, err := engine.New(config, backend.Default())

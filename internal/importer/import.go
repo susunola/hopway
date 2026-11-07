@@ -504,7 +504,8 @@ func convertRules(lines []string, target func(string) string) ([]engine.Rule, in
 			continue
 		}
 		types := map[string]string{"DOMAIN": engine.RuleDomain, "DOMAIN-SUFFIX": engine.RuleDomainSuffix,
-			"DOMAIN-KEYWORD": engine.RuleDomainKeyword, "IP-CIDR": engine.RuleIPCIDR, "IP-CIDR6": engine.RuleIPCIDR}
+			"DOMAIN-KEYWORD": engine.RuleDomainKeyword, "IP-CIDR": engine.RuleIPCIDR, "IP-CIDR6": engine.RuleIPCIDR,
+			"PROCESS-NAME": engine.RuleProcessName, "PROCESS-PATH": engine.RuleProcessPath}
 		ruleType, via := types[kind], target(parts[2])
 		if ruleType == "" || via == "" {
 			skipped++

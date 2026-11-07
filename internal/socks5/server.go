@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mac-proxy/internal/peer"
 	"net"
 	"slices"
 	"syscall"
@@ -50,7 +51,7 @@ func Handle(client *net.TCPConn, dial func(context.Context, string, string) (net
 		return err
 	}
 
-	upstream, err := dial(context.Background(), "SOCKS5", target)
+	upstream, err := dial(peer.With(context.Background(), client.RemoteAddr(), client.LocalAddr()), "SOCKS5", target)
 	if err != nil {
 		return errors.Join(
 			fmt.Errorf("dial %s: %w", target, err),

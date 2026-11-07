@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/netip"
 	"strings"
+
+	"mac-proxy/internal/process"
 )
 
 // Rule types, matching Clash semantics where they overlap.
@@ -13,6 +15,8 @@ const (
 	RuleDomainKeyword = "domain-keyword"
 	RuleIPCIDR        = "ip-cidr"
 	RuleMatch         = "match"
+	RuleProcessName   = "process-name" // executable name or .app bundle name, case-insensitive
+	RuleProcessPath   = "process-path" // exact executable path, or a prefix ending in "/"
 )
 
 type Rule struct {
@@ -41,6 +45,10 @@ type matcher struct {
 	keywords []indexed
 	ip       prefixSet // every ip-cidr rule, used for literal IP targets
 	resolved prefixSet // ip-cidr rules allowed to trigger DNS for domain targets
+	procName map[string]int
+	procPath map[string]int
+	procDirs []indexed
+	procMin  int
 	final    int
 }
 
@@ -102,6 +110,7 @@ func (set *prefixSet) lookup(addr netip.Addr) int {
 
 func newMatcher(rules []Rule, valid func(string) bool) (*matcher, error) {
 	m := &matcher{exact: make(map[string]int), suffix: make(map[string]int), final: none,
+		procName: make(map[string]int), procPath: make(map[string]int), procMin: none,
 		ip: prefixSet{first: none}, resolved: prefixSet{first: none}}
 	for index, rule := range rules {
 		if !valid(rule.Via) {
@@ -142,6 +151,26 @@ func newMatcher(rules []Rule, valid func(string) bool) (*matcher, error) {
 			if !rule.NoResolve {
 				m.resolved.add(prefix, index)
 			}
+		case RuleProcessName:
+			name := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(rule.Value), ".app"))
+			if name == "" || strings.Contains(name, "/") {
+				return nil, fmt.Errorf("rule %d needs a process or app name", index+1)
+			}
+			rule.Value = name
+			if _, exists := m.procName[name]; !exists {
+				m.procName[name] = index
+			}
+			m.procMin = min(m.procMin, index)
+		case RuleProcessPath:
+			if !strings.HasPrefix(rule.Value, "/") {
+				return nil, fmt.Errorf("rule %d needs an absolute path", index+1)
+			}
+			if strings.HasSuffix(rule.Value, "/") {
+				m.procDirs = append(m.procDirs, indexed{rule.Value, index})
+			} else if _, exists := m.procPath[rule.Value]; !exists {
+				m.procPath[rule.Value] = index
+			}
+			m.procMin = min(m.procMin, index)
 		case RuleMatch:
 			if rule.Value != "" || index != len(rules)-1 {
 				return nil, fmt.Errorf("rule %d: match must be the last rule and have no value", index+1)
@@ -156,13 +185,14 @@ func newMatcher(rules []Rule, valid func(string) bool) (*matcher, error) {
 }
 
 // match returns the index of the first matching rule, or -1. resolve is
-// called at most once, and only if an IP rule could beat every domain match.
-func (m *matcher) match(host string, resolve func(string) []netip.Addr) int {
+// called at most once, and only if an IP rule could beat every domain match;
+// owner likewise only if a process rule could.
+func (m *matcher) match(host string, resolve func(string) []netip.Addr, owner func() *process.Owner) int {
 	host = normalizeHost(host)
 	best := m.final
 	if addr, err := netip.ParseAddr(host); err == nil {
 		best = min(best, m.ip.lookup(addr))
-		return found(best)
+		return found(m.matchProcess(best, owner))
 	}
 	if index, ok := m.exact[host]; ok {
 		best = min(best, index)
@@ -185,12 +215,39 @@ func (m *matcher) match(host string, resolve func(string) []netip.Addr) int {
 			best = keyword.index
 		}
 	}
+	best = m.matchProcess(best, owner)
 	if m.resolved.first < best && resolve != nil {
 		for _, addr := range resolve(host) {
 			best = min(best, m.resolved.lookup(addr))
 		}
 	}
 	return found(best)
+}
+
+// matchProcess runs before DNS: finding the process is a local table lookup,
+// much cheaper than a resolver round trip.
+func (m *matcher) matchProcess(best int, owner func() *process.Owner) int {
+	if m.procMin >= best || owner == nil {
+		return best
+	}
+	o := owner()
+	if o == nil {
+		return best
+	}
+	for _, name := range []string{o.Name, o.App} {
+		if index, ok := m.procName[strings.ToLower(name)]; ok && name != "" {
+			best = min(best, index)
+		}
+	}
+	if index, ok := m.procPath[o.Path]; ok {
+		best = min(best, index)
+	}
+	for _, dir := range m.procDirs {
+		if dir.index < best && strings.HasPrefix(o.Path, dir.value) {
+			best = dir.index
+		}
+	}
+	return best
 }
 
 func found(index int) int {

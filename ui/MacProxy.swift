@@ -168,7 +168,7 @@ private struct Dashboard: View {
     private var rows: [ProxyStatus.Connection] {
         (core.status?.connections ?? [])
             .filter { row in
-                filter.isEmpty || [row.target, row.via, row.inbound, row.stateLabel, row.rule]
+                filter.isEmpty || [row.target, row.via, row.inbound, row.stateLabel, row.rule, row.process ?? ""]
                     .contains { $0.localizedCaseInsensitiveContains(filter) }
             }
             .sorted { lhs, rhs in
@@ -195,6 +195,7 @@ private struct Dashboard: View {
             } else {
                 Table(rows) {
                     TableColumn("目标") { Text($0.target).textSelection(.enabled).help($0.diagnosis) }.width(min: 135, ideal: 180)
+                    TableColumn("应用") { Text($0.process ?? "—").help($0.processPath ?? "") }.width(min: 80, ideal: 120)
                     TableColumn("入站", value: \.inbound).width(min: 80, ideal: 105)
                     TableColumn("出站", value: \.via).width(min: 80, ideal: 100)
                     TableColumn("规则", value: \.rule).width(min: 65, ideal: 130)
