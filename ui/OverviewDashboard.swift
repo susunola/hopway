@@ -47,7 +47,6 @@ struct OverviewDashboard: View {
                     .foregroundStyle(HopAppearance.warning)
             }
             routing
-            localAccess
             traffic(chartHeight: chartHeight)
             subscriptionsOverview
         }
@@ -151,7 +150,7 @@ struct OverviewDashboard: View {
     private var routing: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 10) {
-                Label("路由策略", systemImage: "arrow.triangle.branch").font(.headline)
+                Label("出站与联网", systemImage: "arrow.triangle.branch").font(.headline)
                 Spacer()
                 if core.configuredNodes.isEmpty {
                     Button("导入链接…", action: importLink).disabled(core.saving)
@@ -176,6 +175,8 @@ struct OverviewDashboard: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
+            Divider()
+            outletStatus
         }
         .hopPanel(verticalPadding: 12)
     }
@@ -236,7 +237,9 @@ struct OverviewDashboard: View {
         }
         return HStack(spacing: 9) {
             Divider().frame(height: 16)
-            Text(Policy.label(mode)).fontWeight(.medium).fixedSize()
+            if status == nil || mode == "global" {
+                Text(Policy.label(mode)).fontWeight(.medium).fixedSize()
+            }
             Text(detail).foregroundStyle(.secondary).lineLimit(1).help(detail)
         }
         .font(.callout)
@@ -255,25 +258,12 @@ struct OverviewDashboard: View {
         }
     }
 
-    private var localAccess: some View {
+    private var outletStatus: some View {
         let status = core.status
         let outbound = status?.currentOutbound
         let node = status?.nodes.first { $0.name == outbound && $0.name != "DIRECT" && $0.name != "REJECT" }
         let health = outletHealth(node)
-        return VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 12) {
-                Label("联网状态", systemImage: "network").font(.headline)
-                Spacer()
-                Text(health.label)
-                    .font(.caption)
-                    .foregroundStyle(health.color)
-                    .lineLimit(1)
-                    .help(core.verification?.detail ?? health.label)
-                    .accessibilityAddTraits(.updatesFrequently)
-                Button("验证联网", action: core.verifyConnection)
-                    .disabled(!running || core.verifying || core.statusReadFailed || core.status == nil)
-                    .fixedSize()
-            }
+        return HStack(spacing: 12) {
             if running, let status {
                 if let node {
                     let location = NodeLocation(name: node.name)
@@ -289,9 +279,9 @@ struct OverviewDashboard: View {
                             Text(source.map { "订阅 · " + $0 } ?? "本地节点")
                                 .font(.caption).foregroundStyle(.secondary).lineLimit(1).help(source ?? "本地节点")
                         }
-                        Spacer(minLength: 8)
                         if let latency = node.latencyMs {
                             Text("\(latency) ms").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                                .fixedSize()
                         }
                     }
                     .accessibilityElement(children: .combine)
@@ -300,9 +290,22 @@ struct OverviewDashboard: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
+            } else {
+                Label("联网验证", systemImage: "network")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
+            Spacer(minLength: 4)
+            Text(health.label)
+                .font(.caption)
+                .foregroundStyle(health.color)
+                .fixedSize()
+                .help(core.verification?.detail ?? health.label)
+                .accessibilityAddTraits(.updatesFrequently)
+            Button("验证联网", action: core.verifyConnection)
+                .disabled(!running || core.verifying || core.statusReadFailed || core.status == nil)
+                .fixedSize()
         }
-        .hopPanel(verticalPadding: 12)
     }
 
     private func outletHealth(_ node: ProxyStatus.Node?) -> (label: String, color: Color) {
