@@ -20,7 +20,7 @@ type countedRelay struct {
 	addr   string
 	opened atomic.Int32
 	mu     sync.Mutex
-	live   map[net.Conn]struct{}
+	live   map[net.Conn]int32
 }
 
 func newCountedRelay(t *testing.T, upstream string) *countedRelay {
@@ -29,7 +29,7 @@ func newCountedRelay(t *testing.T, upstream string) *countedRelay {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relay := &countedRelay{addr: listener.Addr().String(), live: make(map[net.Conn]struct{})}
+	relay := &countedRelay{addr: listener.Addr().String(), live: make(map[net.Conn]int32)}
 	stopped := make(chan struct{})
 	var workers sync.WaitGroup
 	go func() {
@@ -40,9 +40,8 @@ func newCountedRelay(t *testing.T, upstream string) *countedRelay {
 				return
 			}
 			relay.mu.Lock()
-			relay.live[client] = struct{}{}
+			relay.live[client] = relay.opened.Add(1)
 			relay.mu.Unlock()
-			relay.opened.Add(1)
 			workers.Go(func() {
 				defer func() {
 					client.Close()
@@ -74,6 +73,18 @@ func (r *countedRelay) closeSockets() {
 	}
 }
 
+func (r *countedRelay) closeSocket(id int32) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for client, socket := range r.live {
+		if socket == id {
+			client.Close()
+			return true
+		}
+	}
+	return false
+}
+
 func (r *countedRelay) active() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -95,7 +106,7 @@ func TestAnyTLSPoolsAreSeparateByNodeAndNetwork(t *testing.T) {
 	}
 	defer core.Close()
 
-	roundTrip := func(name string, want int32) {
+	dialThrough := func(name string) net.Conn {
 		t.Helper()
 		if err := core.SetPolicy(Policy{Mode: "global", Selected: name}); err != nil {
 			t.Fatal(err)
@@ -106,23 +117,21 @@ func TestAnyTLSPoolsAreSeparateByNodeAndNetwork(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		return conn
+	}
+	checkThrough := func(name string, want int32) {
+		t.Helper()
+		conn := dialThrough(name)
 		defer conn.Close()
-		conn.SetDeadline(time.Now().Add(time.Second))
-		if _, err := conn.Write([]byte("check")); err != nil {
-			t.Fatal(err)
-		}
-		data := make([]byte, 5)
-		if _, err := io.ReadFull(conn, data); err != nil || string(data) != "check" {
-			t.Fatalf("anytls stream: %q, %v", data, err)
-		}
+		roundTrip(t, conn, "check")
 		if got := relay.opened.Load(); got != want {
 			t.Fatalf("dial via %s: %d physical sessions, want %d", name, got, want)
 		}
 	}
-	roundTrip("one", 1)
-	roundTrip("one", 1)
-	roundTrip("two", 2) // same server and credentials, separate outbound
-	roundTrip("one", 2)
+	checkThrough("one", 1)
+	checkThrough("one", 1)
+	checkThrough("two", 2) // same server and credentials, separate outbound
+	checkThrough("one", 2)
 
 	core.NetworkChanged()
 	deadline := time.Now().Add(time.Second)
@@ -132,8 +141,8 @@ func TestAnyTLSPoolsAreSeparateByNodeAndNetwork(t *testing.T) {
 	if active := relay.active(); active != 0 {
 		t.Fatalf("network reset left %d old transports running", active)
 	}
-	roundTrip("one", 3)
-	roundTrip("two", 4)
+	checkThrough("one", 3)
+	checkThrough("two", 4)
 
 	// Drop the real transport on the relay side while a stream is open.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -154,12 +163,22 @@ func TestAnyTLSPoolsAreSeparateByNodeAndNetwork(t *testing.T) {
 	if count := relay.opened.Load(); count != 4 {
 		t.Fatalf("expected the stream to reuse its fourth physical session: %d", count)
 	}
-	relay.closeSockets()
+	survivor := dialThrough("one")
+	defer survivor.Close()
+	roundTrip(t, survivor, "before failure")
+	if !relay.closeSocket(4) {
+		t.Fatal("the second node's upstream session was missing")
+	}
 	if _, err := active.Read(oneByte[:]); err == nil {
 		t.Fatal("closed upstream transport left its stream usable")
 	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
 		t.Fatalf("stream did not notice that the upstream closed: %v", err)
 	}
 	active.Close()
-	roundTrip("two", 5)
+	roundTrip(t, survivor, "other node keeps its original session")
+	if sockets := relay.opened.Load(); sockets != 4 {
+		t.Fatalf("the unaffected node replaced its transport: %d sockets", sockets)
+	}
+	checkThrough("two", 5)
+	roundTrip(t, survivor, "after the failed node reconnects")
 }

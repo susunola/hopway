@@ -172,46 +172,75 @@ func NewClient(options ClientOptions) (*Client, error) {
 }
 
 func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
-	c.connAccess.Lock()
-	conn := c.conn
-	if conn != nil && conn.active() {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		c.connAccess.Lock()
+		conn := c.conn
+		if conn != nil && conn.active() {
+			c.connAccess.Unlock()
+			return conn, nil
+		}
+		pending := c.pending
+		if pending != nil && pending.discarded {
+			c.connAccess.Unlock()
+			// Let the canceled offer release its socket before a retry.
+			select {
+			case <-pending.done:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if pending == nil {
+			// The first caller's context cannot own a shared handshake.
+			// Keep it alive until the final waiter leaves or the client closes.
+			offerCtx := c.ctx
+			if offerCtx == nil {
+				offerCtx = context.Background()
+			}
+			offerCtx, cancel := context.WithCancelCause(offerCtx)
+			pending = &clientOffer{
+				done:   make(chan struct{}),
+				cancel: cancel,
+			}
+			c.pending = pending
+			go c.completeOffer(pending, offerCtx)
+		}
+		pending.waiters++
 		c.connAccess.Unlock()
-		return conn, nil
-	}
-	pending := c.pending
-	if pending != nil {
-		c.connAccess.Unlock()
+
 		select {
 		case <-pending.done:
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			return pending.conn, pending.err
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			err := ctx.Err()
+			c.leaveOffer(pending, err)
+			return nil, err
 		}
 	}
-	// A pending offer is shared by concurrent callers. Do not derive offerCtx
-	// from the foreground request ctx: a timed-out request must stop waiting for
-	// the shared result, but it must not tear down the background QUIC dial that
-	// may still be reused by later requests. The connection attempt is owned by
-	// the client lifetime context instead.
-	offerCtx := c.ctx
-	if offerCtx == nil {
-		offerCtx = context.Background()
+}
+
+func (c *Client) leaveOffer(pending *clientOffer, cause error) {
+	c.connAccess.Lock()
+	if c.pending != pending {
+		c.connAccess.Unlock()
+		return
 	}
-	offerCtx, cancel := context.WithCancelCause(offerCtx)
-	pending = &clientOffer{
-		done:   make(chan struct{}),
-		cancel: cancel,
+	pending.waiters--
+	last := pending.waiters == 0
+	if last && !pending.discarded {
+		pending.discarded = true
+		pending.cause = cause
+		pending.cancel(cause)
 	}
-	c.pending = pending
 	c.connAccess.Unlock()
-
-	go c.completeOffer(pending, offerCtx)
-
-	select {
-	case <-pending.done:
-		return pending.conn, pending.err
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	if last {
+		<-pending.done
 	}
 }
 
@@ -231,15 +260,20 @@ func (c *Client) completeOffer(pending *clientOffer, offerCtx context.Context) {
 	conn, err := c.offerNew(offerCtx)
 	pending.cancel(nil)
 
-	discardErr := err
-	shouldDiscard := false
 	c.connAccess.Lock()
 	if pending.discarded {
-		shouldDiscard = true
-		if pending.cause != nil {
-			discardErr = pending.cause
+		discardErr := pending.cause
+		if discardErr == nil {
+			discardErr = net.ErrClosed
 		}
 		pending.err = discardErr
+		if conn != nil {
+			// A successful handshake can race with abandonment. Keep
+			// the slot occupied until this unpublished transport closes.
+			c.connAccess.Unlock()
+			conn.closeWithError(discardErr)
+			c.connAccess.Lock()
+		}
 	} else {
 		pending.conn = conn
 		pending.err = err
@@ -252,10 +286,6 @@ func (c *Client) completeOffer(pending *clientOffer, offerCtx context.Context) {
 	}
 	close(pending.done)
 	c.connAccess.Unlock()
-
-	if shouldDiscard && conn != nil {
-		conn.closeWithError(discardErr)
-	}
 }
 
 func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
@@ -715,6 +745,7 @@ func (c *Client) CloseIdleConnections() {
 }
 
 type clientOffer struct {
+	waiters   int // guarded by Client.connAccess
 	done      chan struct{}
 	cancel    func(error)
 	conn      *clientQUICConnection

@@ -3,12 +3,13 @@
 package tun
 
 import (
-	"context"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
 	"os"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
+	"mac-proxy/internal/outbound"
 )
 
 // TestDevice runs real traffic through a TUN device. It needs root and
@@ -56,9 +58,16 @@ func TestDevice(t *testing.T) {
 	defer backend.Resolver.Pin("echo.test", nil)
 	defer backend.Resolver.Pin("udp.test", nil)
 
+	stalledTLS, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stalledTLS.Close()
 	config := engine.Default()
+	config.Nodes = []outbound.Node{{Name: "stall", Type: "trojan", Server: stalledTLS.Addr().String(), Password: "fixture"}}
 	config.Rules = []engine.Rule{
 		{Type: engine.RuleDomain, Value: "blocked.test", Via: "REJECT"},
+		{Type: engine.RuleDomain, Value: "stalled.test", Via: "stall"},
 		{Type: engine.RuleMatch, Via: "DIRECT"},
 	}
 	core, err := engine.New(config, backend.Default())
@@ -90,7 +99,7 @@ func TestDevice(t *testing.T) {
 		t.Fatalf("device descriptor: %d %v", fd, err)
 	}
 
-	lookup := func(name string) netip.Addr {
+	lookup := func(t *testing.T, name string) netip.Addr {
 		t.Helper()
 		query := new(dns.Msg)
 		query.SetQuestion(dns.Fqdn(name), dns.TypeA)
@@ -108,7 +117,7 @@ func TestDevice(t *testing.T) {
 
 	// TCP to a fake address reaches the target by name.
 	echoPort := tcpEcho.Addr().(*net.TCPAddr).Port
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(lookup("echo.test").String(), strconv.Itoa(echoPort)), 3*time.Second)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(lookup(t, "echo.test").String(), strconv.Itoa(echoPort)), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +134,7 @@ func TestDevice(t *testing.T) {
 	}
 
 	// A REJECT rule applies to TUN traffic by name too.
-	blocked, err := net.DialTimeout("tcp", net.JoinHostPort(lookup("blocked.test").String(), "80"), 3*time.Second)
+	blocked, err := net.DialTimeout("tcp", net.JoinHostPort(lookup(t, "blocked.test").String(), "80"), 3*time.Second)
 	if err == nil {
 		blocked.SetDeadline(time.Now().Add(2 * time.Second))
 		_, err = blocked.Read(make([]byte, 1))
@@ -136,7 +145,7 @@ func TestDevice(t *testing.T) {
 	}
 
 	// UDP to a fake address is relayed directly, replies come back from it.
-	fakeUDP := lookup("udp.test")
+	fakeUDP := lookup(t, "udp.test")
 	udpConn, err := net.Dial("udp", net.JoinHostPort(fakeUDP.String(), strconv.Itoa(udpEcho.LocalAddr().(*net.UDPAddr).Port)))
 	if err != nil {
 		t.Fatal(err)
@@ -156,5 +165,47 @@ func TestDevice(t *testing.T) {
 	if err != nil || len(answer.Answer) != 1 || answer.Answer[0].(*dns.TXT).Txt[0] != "from upstream" {
 		t.Fatalf("forwarded query: %v %v", answer, err)
 	}
-	_ = context.Background
+
+	t.Run("cancel stalled TLS with full read ahead", func(t *testing.T) {
+		target := net.JoinHostPort(lookup(t, "stalled.test").String(), "443")
+		client, err := net.DialTimeout("tcp4", target, 3*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		tcp := client.(*net.TCPConn)
+		client.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if _, err := client.Write(make([]byte, 32<<10)); err != nil {
+			t.Fatal(err)
+		}
+		stalledTLS.SetDeadline(time.Now().Add(3 * time.Second))
+		origin, err := stalledTLS.AcceptTCP()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer origin.Close()
+		origin.SetReadDeadline(time.Now().Add(2 * time.Second))
+		var hello [4096]byte
+		if n, err := origin.Read(hello[:]); err != nil || n == 0 || hello[0] != 0x16 {
+			t.Fatalf("expected a real TLS handshake, got %d bytes and %v", n, err)
+		}
+		// Give the bounded ingress reader time to fill before the reset.
+		time.Sleep(250 * time.Millisecond)
+		if err := tcp.SetLinger(0); err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		tcp.Close()
+		origin.SetReadDeadline(started.Add(2 * time.Second))
+		for {
+			_, err := origin.Read(hello[:])
+			if errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("TUN reset did not release the TLS socket: %v", err)
+			}
+		}
+		t.Logf("real TUN client reset closed stalled TLS in %s", time.Since(started))
+	})
 }
