@@ -256,6 +256,11 @@ struct ProxyStatus: Decodable, Equatable {
         }
     }
 
+    struct NetworkEvent: Decodable, Equatable {
+        let at: String
+    }
+
+    let network: [NetworkEvent]?
     let policy: Policy
     let auto: AutoRoutingStatus?
     let warnings: [String]?
@@ -388,6 +393,30 @@ final class CoreModel: ObservableObject {
         case running = "运行中"
         case stopping = "正在停止"
     }
+
+    private struct VerificationRoute: Equatable {
+        let generation: UInt64
+        let policy: Policy
+        let outbound: String?
+        let groupExits: [String]
+        let networkChangedAt: String?
+
+        init(_ status: ProxyStatus) {
+            generation = status.generation
+            policy = status.policy
+            outbound = status.currentOutbound
+            groupExits = policy.mode == "rule" ? status.groups?.map(\.now) ?? [] : []
+            networkChangedAt = status.network?.last?.at
+        }
+
+        var canVerify: Bool {
+            outbound != "REJECT" && (outbound != nil || policy.mode == "rule")
+        }
+    }
+
+    private var verificationRoute: VerificationRoute?
+    private var verificationTask: Task<Void, Never>?
+    private var nextVerificationAt: ContinuousClock.Instant?
 
     @Published private(set) var phase = Phase.stopped
     @Published private(set) var endpoint: Endpoint?
@@ -669,6 +698,7 @@ final class CoreModel: ObservableObject {
         cancelProbe()
         cancelControlRefresh()
         phase = .stopping
+        resetVerification()
         requestedTUNOperation = nil
         polling?.cancel()
         polling = nil
@@ -688,8 +718,7 @@ final class CoreModel: ObservableObject {
         input = nil
         process = nil
         endpoint = nil
-        verification = nil
-        verifying = false
+        resetVerification()
         status = nil
         connectionRecords.removeAll()
         connectionCursor = nil
@@ -746,11 +775,27 @@ final class CoreModel: ObservableObject {
         }
     }
 
-    func verifyConnection() {
-        guard let info = endpoint, let route = status, !statusReadFailed, !verifying else { return }
-        verifying = true
-        verification = nil
-        Task {
+    private func resetVerification() {
+        verificationTask?.cancel()
+        verificationTask = nil
+        verificationRoute = nil
+        nextVerificationAt = nil
+        if verifying { verifying = false }
+        if verification != nil { verification = nil }
+    }
+
+    private func scheduleVerification(_ info: Endpoint, status: ProxyStatus) {
+        let route = VerificationRoute(status)
+        if verificationRoute != route {
+            resetVerification()
+            verificationRoute = route
+        }
+        guard route.canVerify, verificationTask == nil,
+              nextVerificationAt.map({ $0 <= .now }) ?? true else { return }
+
+        if verification == nil { verifying = true }
+        verificationTask = Task { [weak self] in
+            guard let self, isRunning(info) else { return }
             let result: RouteVerification
             do {
                 _ = try await call(info, path: "verify", method: "POST")
@@ -758,12 +803,11 @@ final class CoreModel: ObservableObject {
             } catch {
                 result = .failed(error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines))
             }
-            await refresh(info)
-            guard isRunning(info) else { return }
-            verifying = false
-            guard !statusReadFailed, status?.generation == route.generation, status?.policy == route.policy,
-                  status?.currentOutbound == route.currentOutbound else { return }
+            guard isRunning(info), verificationRoute == route, !statusReadFailed else { return }
             verification = result
+            verifying = false
+            nextVerificationAt = ContinuousClock.now.advanced(by: .seconds(result.failed ? 30 : 300))
+            verificationTask = nil
         }
     }
 
@@ -779,10 +823,12 @@ final class CoreModel: ObservableObject {
     }
 
     var reachabilityLabel: String {
-        if phase != .running { return "启动后可验证" }
+        if phase != .running { return "启动后自动验证" }
         if statusReadFailed { return "状态待确认" }
         if verifying { return "正在验证…" }
-        return verification?.title ?? "尚未验证"
+        if status?.currentOutbound == "REJECT" { return "已阻断" }
+        if verificationRoute?.canVerify == false { return "等待可用出站" }
+        return verification?.title ?? "等待验证"
     }
 
     func dismissMessage() {
@@ -988,11 +1034,6 @@ final class CoreModel: ObservableObject {
             guard isRunning(info) else { return }
             let snapshot = try JSONDecoder().decode(ProxyStatus.self, from: data)
             let before = status?.subscriptions?.map { [$0.updated, $0.usage.map { Double($0.updatedAt) }] }
-            if let previous = status,
-               previous.generation != snapshot.generation || previous.policy != snapshot.policy ||
-                previous.currentOutbound != snapshot.currentOutbound {
-                verification = nil
-            }
             statusReadAt = .now
             clearStatusFailure()
             let generationChanged = status?.generation != snapshot.generation
@@ -1004,6 +1045,7 @@ final class CoreModel: ObservableObject {
                 connectionReadFailed = false
             }
             if status != snapshot { status = snapshot }
+            scheduleVerification(info, status: snapshot)
             updateTrafficRate(snapshot.sessionTraffic)
             if generationChanged || before != snapshot.subscriptions?.map({ [$0.updated, $0.usage.map { Double($0.updatedAt) }] }) {
                 reloadConfiguredNodes()
@@ -1023,7 +1065,10 @@ final class CoreModel: ObservableObject {
             requestConnectionFeed(info, generation: snapshot.generation)
         } catch {
             guard isRunning(info) else { return }
-            if !statusReadFailed { statusReadFailed = true }
+            if !statusReadFailed {
+                statusReadFailed = true
+                resetVerification()
+            }
             updateTrafficRate(nil)
             let failure = "读取内核状态失败 · " + error.localizedDescription
             if message == nil || message == statusFailureMessage { message = failure }

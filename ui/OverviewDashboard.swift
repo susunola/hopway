@@ -187,7 +187,7 @@ struct OverviewDashboard: View {
                     }
                     routingContext(mode: mode, status: nil)
                     Spacer(minLength: 6)
-                    Text("启动后可验证").font(.caption).foregroundStyle(.secondary).fixedSize()
+                    Text("启动后自动验证").font(.caption).foregroundStyle(.secondary).fixedSize()
                 }
                 .font(.callout)
             } else {
@@ -324,9 +324,6 @@ struct OverviewDashboard: View {
                 .fixedSize()
                 .help(core.verification?.detail ?? health.label)
                 .accessibilityAddTraits(.updatesFrequently)
-            Button("验证联网", action: core.verifyConnection)
-                .disabled(!running || core.verifying || core.statusReadFailed || core.status == nil)
-                .fixedSize()
         }
     }
 
