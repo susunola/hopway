@@ -37,7 +37,7 @@ struct ConnectionsDashboard: View {
             .filter { row in
                 scope.includes(row) && (keyword.isEmpty ||
                     [row.target, row.via, row.inboundLabel, row.stateLabel, row.rule, row.process ?? "",
-                     row.processPath ?? "", row.server ?? ""].contains { $0.localizedCaseInsensitiveContains(keyword) })
+                     row.processPath ?? "", row.processBundleId ?? "", row.server ?? ""].contains { $0.localizedCaseInsensitiveContains(keyword) })
             }
             .sorted { lhs, rhs in
                 if (lhs.state == "active") != (rhs.state == "active") { return lhs.state == "active" }
@@ -145,6 +145,12 @@ struct ConnectionsDashboard: View {
                            row.start.map { Date(timeIntervalSince1970: $0 / 1000).formatted(date: .omitted, time: .standard) }]
                 .compactMap { $0 }.joined(separator: " · ")
             if !context.isEmpty { Text(context).foregroundStyle(.secondary).lineLimit(1).help(context) }
+            if let bundleID = row.processBundleId {
+                Text("应用标识 · " + bundleID)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
             if !row.timingLabel.isEmpty {
                 Text(row.timingLabel).font(.caption).monospacedDigit().foregroundStyle(.secondary)
             }

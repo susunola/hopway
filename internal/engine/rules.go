@@ -20,6 +20,7 @@ const (
 	RuleMatch         = "match"
 	RuleProcessName   = "process-name" // executable name or .app bundle name, case-insensitive
 	RuleProcessPath   = "process-path" // exact executable path, or a prefix ending in "/"
+	RuleProcessBundle = "process-bundle-id"
 )
 
 type Rule struct {
@@ -49,6 +50,7 @@ type matcher struct {
 	ip       prefixSet // every ip-cidr rule, used for literal IP targets
 	resolved prefixSet // ip-cidr rules allowed to trigger DNS for domain targets
 	procName map[string]int
+	procID   map[string]int
 	procPath map[string]int
 	procDirs []indexed
 	procMin  int
@@ -123,7 +125,7 @@ func (set *prefixSet) lookup(addr netip.Addr) int {
 
 func newMatcher(rules []Rule, valid func(string) bool, sets []*ruleSetState) (*matcher, error) {
 	m := &matcher{exact: make(map[string]int), suffix: make(map[string]int), final: none,
-		procName: make(map[string]int), procPath: make(map[string]int), procMin: none,
+		procName: make(map[string]int), procID: make(map[string]int), procPath: make(map[string]int), procMin: none,
 		ip: prefixSet{first: none}, resolved: prefixSet{first: none}}
 	slots := make(map[string]int, len(sets))
 	contents := make(ruleSetContents, len(sets))
@@ -190,6 +192,16 @@ func newMatcher(rules []Rule, valid func(string) bool, sets []*ruleSetState) (*m
 				m.procDirs = append(m.procDirs, indexed{rule.Value, index})
 			} else if _, exists := m.procPath[rule.Value]; !exists {
 				m.procPath[rule.Value] = index
+			}
+			m.procMin = min(m.procMin, index)
+		case RuleProcessBundle:
+			id := strings.ToLower(strings.TrimSpace(rule.Value))
+			if !validBundleID(id) {
+				return nil, fmt.Errorf("rule %d needs a valid macOS bundle identifier", index+1)
+			}
+			rule.Value = id
+			if _, exists := m.procID[id]; !exists {
+				m.procID[id] = index
 			}
 			m.procMin = min(m.procMin, index)
 		case RuleRuleSet:
@@ -338,6 +350,9 @@ func (m *matcher) matchProcess(best int, owner func() *process.Owner) int {
 			best = min(best, index)
 		}
 	}
+	if index, ok := m.procID[strings.ToLower(o.BundleID)]; ok {
+		best = min(best, index)
+	}
 	if index, ok := m.procPath[o.Path]; ok {
 		best = min(best, index)
 	}
@@ -347,6 +362,18 @@ func (m *matcher) matchProcess(best int, owner func() *process.Owner) int {
 		}
 	}
 	return best
+}
+
+func validBundleID(id string) bool {
+	if id == "" || len(id) > 255 || strings.HasPrefix(id, ".") || strings.HasSuffix(id, ".") || strings.Contains(id, "..") {
+		return false
+	}
+	for _, c := range id {
+		if c != '.' && c != '-' && (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func found(index int) int {

@@ -1,4 +1,4 @@
-//go:build !hopway_native && (darwin || linux)
+//go:build !hopway_native && (linux || (darwin && !cgo))
 
 package process
 

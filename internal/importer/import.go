@@ -712,7 +712,8 @@ func convertRules(lines []string, target func(string) string, sets *ruleSetBuild
 		}
 		types := map[string]string{"DOMAIN": engine.RuleDomain, "DOMAIN-SUFFIX": engine.RuleDomainSuffix,
 			"DOMAIN-KEYWORD": engine.RuleDomainKeyword, "IP-CIDR": engine.RuleIPCIDR, "IP-CIDR6": engine.RuleIPCIDR,
-			"PROCESS-NAME": engine.RuleProcessName, "PROCESS-PATH": engine.RuleProcessPath}
+			"PROCESS-NAME": engine.RuleProcessName, "PROCESS-PATH": engine.RuleProcessPath,
+			"PROCESS-BUNDLE-ID": engine.RuleProcessBundle}
 		rule := engine.Rule{Type: types[kind], Value: parts[1], Via: via, NoResolve: noResolve}
 		if rule.Type == "" && sets != nil {
 			if name := sets.use(kind, parts[1]); name != "" {

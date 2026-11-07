@@ -81,6 +81,7 @@ curl --noproxy "" --proxy http://127.0.0.1:8080 https://example.com/
   "rules": [
     { "type": "domain-keyword", "value": "ads", "via": "REJECT" },
     { "type": "domain-suffix", "value": "openai.com", "via": "Auto" },
+    { "type": "process-bundle-id", "value": "com.google.Chrome", "via": "Proxy" },
     { "type": "process-name", "value": "Telegram", "via": "Proxy" },
     { "type": "process-path", "value": "/Applications/Steam.app/", "via": "DIRECT" },
     { "type": "ip-cidr", "value": "192.168.0.0/16", "via": "DIRECT", "noResolve": true },
@@ -96,6 +97,7 @@ curl --noproxy "" --proxy http://127.0.0.1:8080 https://example.com/
 - `rule` 模式按顺序取第一条匹配的规则，未匹配时走 `DIRECT`。规则在加载时建立索引，十万条规则的匹配耗时仍在一微秒以内。`SELECT` 表示当前选定出站。
 - 目标是域名时，只有当排在最前的候选规则是 IP 规则时，内核才解析这个域名（每次连接最多解析一次）；带 `noResolve` 的 IP 规则只匹配客户端直接提交的 IP。
 - `process-name` 匹配发起连接的应用：可以填可执行文件名，也可以填 `.app` 包名（不区分大小写）。例如填 `Google Chrome`，就能匹配它的所有 Helper 进程。`process-path` 匹配可执行文件的完整路径；以 `/` 结尾时匹配该目录下的所有程序。识别进程不需要 TUN：内核根据本机应用连接到 HopWay 时使用的端口，在系统连接表（macOS 上是 `net.inet.tcp.pcblist_n`）里找到对应的进程。只有当排在最前的候选规则是进程规则时，内核才会去查进程；其他连接在建立之后才补查，只用于诊断显示，不增加连接延迟。
+- `process-bundle-id` 匹配 macOS 应用最外层 `.app` 的标识符，例如 `com.google.Chrome`。嵌套 Helper 使用同一个应用标识，应用移动目录后也能继续匹配。无法确认应用身份时，按规则顺序继续匹配。连接详情会显示已识别的应用标识。
 - `global` 把所有连接交给选定出站，`direct` 强制直连。端口可填 `0`，由系统分配。
 
 ### 规则集与 GeoIP / GeoSite

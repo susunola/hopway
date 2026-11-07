@@ -236,6 +236,36 @@ func TestProcessRules(t *testing.T) {
 	}
 }
 
+func TestProcessBundleRoutingUsesFirstRuleAndFallsThroughOnUnknown(t *testing.T) {
+	config := Default()
+	config.Rules = []Rule{
+		{Type: RuleProcessPath, Value: "/Applications/First.app/", Via: "DIRECT"},
+		{Type: RuleProcessBundle, Value: "org.example.Browser", Via: "REJECT"},
+		{Type: RuleMatch, Via: "DIRECT"},
+	}
+	core, err := New(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		owner *process.Owner
+		want  int
+	}{
+		{&process.Owner{BundleID: "ORG.EXAMPLE.BROWSER", Path: "/Applications/First.app/Contents/MacOS/Browser"}, 0},
+		{&process.Owner{BundleID: "org.example.Browser", Path: "/Moved/Browser.app/Contents/MacOS/Helper"}, 1},
+		{&process.Owner{Path: "/Moved/Browser.app/Contents/MacOS/Helper"}, 2},
+		{nil, 2},
+	} {
+		if got := core.rules.match("example.test", nil, func() *process.Owner { return test.owner }); got != test.want {
+			t.Fatalf("owner %+v matched %d, want %d", test.owner, got, test.want)
+		}
+	}
+	config.Rules[1].Value = "com.example..Bad identifier"
+	if _, err := New(config, nil); err == nil {
+		t.Fatal("accepted a malformed bundle identifier")
+	}
+}
+
 func TestScopedIPv6RouteRespectsLocalInterfaceAndExplicitRejection(t *testing.T) {
 	rules := []Rule{
 		{Type: RuleIPCIDR, Value: "fe80::123/128", Via: "REJECT", NoResolve: true},

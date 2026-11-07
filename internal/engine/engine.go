@@ -125,31 +125,32 @@ type GroupStatus struct {
 
 // Record describes one connection. Timings are milliseconds.
 type Record struct {
-	ID          uint64        `json:"id"`
-	Start       int64         `json:"start"`
-	Inbound     string        `json:"inbound"`
-	Target      string        `json:"target"`
-	Via         string        `json:"via"`
-	Route       []string      `json:"route,omitempty"`
-	Rule        string        `json:"rule"`
-	State       string        `json:"state"`
-	Sent        uint64        `json:"sent"`
-	Recv        uint64        `json:"received"`
-	Error       string        `json:"error,omitempty"`
-	Stage       string        `json:"stage,omitempty"`
-	FailureCode string        `json:"failureCode,omitempty"`
-	Failures    []DialFailure `json:"failures,omitempty"`
-	Server      string        `json:"server,omitempty"`
-	Shared      bool          `json:"shared,omitempty"`      // rode a multiplexed session, no socket of its own
-	Network     string        `json:"network,omitempty"`     // "udp" for datagram sessions
-	Process     string        `json:"process,omitempty"`     // app or executable name
-	ProcessPath string        `json:"processPath,omitempty"` // executable path
-	PID         uint32        `json:"pid,omitempty"`
-	Attempts    int           `json:"attempts,omitempty"`
-	DNSMs       int64         `json:"dnsMs,omitempty"`
-	ConnectMs   int64         `json:"connectMs,omitempty"`
-	HandshakeMs int64         `json:"handshakeMs,omitempty"`
-	FirstByteMs int64         `json:"firstByteMs,omitempty"`
+	ID              uint64        `json:"id"`
+	Start           int64         `json:"start"`
+	Inbound         string        `json:"inbound"`
+	Target          string        `json:"target"`
+	Via             string        `json:"via"`
+	Route           []string      `json:"route,omitempty"`
+	Rule            string        `json:"rule"`
+	State           string        `json:"state"`
+	Sent            uint64        `json:"sent"`
+	Recv            uint64        `json:"received"`
+	Error           string        `json:"error,omitempty"`
+	Stage           string        `json:"stage,omitempty"`
+	FailureCode     string        `json:"failureCode,omitempty"`
+	Failures        []DialFailure `json:"failures,omitempty"`
+	Server          string        `json:"server,omitempty"`
+	Shared          bool          `json:"shared,omitempty"`      // rode a multiplexed session, no socket of its own
+	Network         string        `json:"network,omitempty"`     // "udp" for datagram sessions
+	Process         string        `json:"process,omitempty"`     // app or executable name
+	ProcessPath     string        `json:"processPath,omitempty"` // executable path
+	ProcessBundleID string        `json:"processBundleId,omitempty"`
+	PID             uint32        `json:"pid,omitempty"`
+	Attempts        int           `json:"attempts,omitempty"`
+	DNSMs           int64         `json:"dnsMs,omitempty"`
+	ConnectMs       int64         `json:"connectMs,omitempty"`
+	HandshakeMs     int64         `json:"handshakeMs,omitempty"`
+	FirstByteMs     int64         `json:"firstByteMs,omitempty"`
 }
 
 type Status struct {
@@ -787,7 +788,7 @@ func (engine *Engine) attribute(id uint64, addrs peer.Addrs) {
 
 func (record *Record) setOwner(owner *process.Owner) {
 	if owner != nil {
-		record.Process, record.ProcessPath, record.PID = owner.Label(), owner.Path, owner.PID
+		record.Process, record.ProcessPath, record.ProcessBundleID, record.PID = owner.Label(), owner.Path, owner.BundleID, owner.PID
 	}
 }
 

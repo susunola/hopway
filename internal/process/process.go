@@ -10,11 +10,12 @@ import (
 )
 
 type Owner struct {
-	PID  uint32 `json:"pid,omitempty"`
-	Path string `json:"path,omitempty"` // executable
-	Name string `json:"name,omitempty"` // executable file name
-	App  string `json:"app,omitempty"`  // outermost .app bundle name, if any
-	User string `json:"user,omitempty"`
+	PID      uint32 `json:"pid,omitempty"`
+	Path     string `json:"path,omitempty"`     // executable
+	Name     string `json:"name,omitempty"`     // executable file name
+	App      string `json:"app,omitempty"`      // outermost .app bundle name, if any
+	BundleID string `json:"bundleId,omitempty"` // identifier of the outermost .app
+	User     string `json:"user,omitempty"`
 }
 
 // Label is what to show a person: the app bundle name when there is one, so
@@ -42,10 +43,20 @@ func newOwner(pid uint32, path, user string) *Owner {
 
 // BundleName returns the outermost "X.app" component of path, without ".app".
 func BundleName(path string) string {
-	for _, part := range strings.Split(path, "/") {
+	if root := bundleRoot(path); root != "" {
+		return strings.TrimSuffix(filepath.Base(root), ".app")
+	}
+	return ""
+}
+
+func bundleRoot(path string) string {
+	offset := 0
+	for part := range strings.SplitSeq(path, "/") {
+		end := offset + len(part)
 		if len(part) > 4 && strings.HasSuffix(part, ".app") {
-			return strings.TrimSuffix(part, ".app")
+			return path[:end]
 		}
+		offset = end + 1
 	}
 	return ""
 }

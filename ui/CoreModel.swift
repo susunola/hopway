@@ -113,6 +113,7 @@ struct ProxyStatus: Decodable, Equatable {
         var firstByteMs: Int?
         let process: String?
         let processPath: String?
+        let processBundleId: String?
         let network: String?
 
         var inboundLabel: String { network == "udp" ? inbound + " · UDP" : inbound }
@@ -130,7 +131,7 @@ struct ProxyStatus: Decodable, Equatable {
 
         var diagnosis: String {
             let lines = [failureMessage, failureStage.map { "失败阶段 · " + $0 },
-                         processPath.map { "应用 · " + $0 }, "路径 · " + routeLabel,
+                         processPath.map { "应用 · " + $0 }, processBundleId.map { "应用标识 · " + $0 }, "路径 · " + routeLabel,
                          server.map { "服务器 · " + $0 }, timingLabel.isEmpty ? nil : timingLabel]
             return (lines.compactMap { $0 } + (failures ?? []).map(\.label)).joined(separator: "\n")
         }
