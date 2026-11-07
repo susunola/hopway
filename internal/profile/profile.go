@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"mac-proxy/internal/engine"
+	"mac-proxy/internal/importer"
 	"mac-proxy/internal/outbound"
 )
 
@@ -22,14 +23,20 @@ type Snapshot struct {
 	Usage   *engine.SubscriptionUsage `json:"usage,omitempty"`
 	Samples []engine.UsageSample      `json:"usageSamples,omitempty"`
 
-	Updated  int64            `json:"updated"` // unix ms
-	Nodes    []outbound.Node  `json:"nodes"`
-	Groups   []engine.Group   `json:"groups,omitempty"`
-	Rules    []engine.Rule    `json:"rules,omitempty"`
-	RuleSets []engine.RuleSet `json:"ruleSets,omitempty"`
-	Health   *engine.Health   `json:"health,omitempty"`
-	Skipped  int              `json:"skipped,omitempty"`
-	Notes    []string         `json:"notes,omitempty"`
+	Updated    int64                `json:"updated"` // last routing update, Unix ms
+	Checked    int64                `json:"checked,omitempty"`
+	Validators *importer.Validators `json:"validators,omitempty"`
+	Nodes      []outbound.Node      `json:"nodes"`
+	Groups     []engine.Group       `json:"groups,omitempty"`
+	Rules      []engine.Rule        `json:"rules,omitempty"`
+	RuleSets   []engine.RuleSet     `json:"ruleSets,omitempty"`
+	Health     *engine.Health       `json:"health,omitempty"`
+	Skipped    int                  `json:"skipped,omitempty"`
+	Notes      []string             `json:"notes,omitempty"`
+}
+
+func (snapshot *Snapshot) CheckedAt() int64 {
+	return max(snapshot.Checked, snapshot.Updated)
 }
 
 func SnapshotPath(dataDir string, sub engine.Subscription) string {
@@ -50,6 +57,15 @@ func LoadSnapshot(dataDir string, sub engine.Subscription) (*Snapshot, error) {
 }
 
 func SaveSnapshot(dataDir string, sub engine.Subscription, snapshot *Snapshot) error {
+	release, err := lockSnapshots(dataDir)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return saveSnapshot(dataDir, sub, snapshot)
+}
+
+func saveSnapshot(dataDir string, sub engine.Subscription, snapshot *Snapshot) error {
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
@@ -336,6 +352,9 @@ func load(path, dataDir string, validate func(engine.Config) error) (Loaded, err
 		}
 	}
 	user.DataDir = dataDir
+	if n := user.SubscriptionRefreshMin; n != 0 && (n < 10 || n > 10080) {
+		return Loaded{}, errors.New("subscriptionRefreshMin must be between 10 and 10080")
+	}
 	if err := validateSubscriptions(user.Subscriptions); err != nil {
 		return Loaded{}, err
 	}

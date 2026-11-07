@@ -13,6 +13,12 @@ struct AdvancedSettingsDraft {
         var fallbackURL = ""
         var probeInterval = ""
         var maxDialAttempts = ""
+        var dialTimeout = ""
+        var failoverTimeout = ""
+        var probeTimeout = ""
+        var probeConcurrency = ""
+        var autoRouteInterval = ""
+        var subscriptionRefresh = ""
     }
 
     let source: String
@@ -26,6 +32,7 @@ struct AdvancedSettingsDraft {
         }
         let tun = config["tun"] as? [String: Any] ?? [:]
         let health = config["health"] as? [String: Any] ?? [:]
+        let performance = config["performance"] as? [String: Any] ?? [:]
         let loaded = Values(
             socksPort: String(config["socksPort"] as? Int ?? 1080),
             httpPort: String(config["httpPort"] as? Int ?? 8080),
@@ -36,7 +43,13 @@ struct AdvancedSettingsDraft {
             probeURL: health["url"] as? String ?? "",
             fallbackURL: health["fallbackUrl"] as? String ?? "",
             probeInterval: Self.nonzeroText(health["intervalSec"]),
-            maxDialAttempts: Self.nonzeroText(config["maxDialAttempts"])
+            maxDialAttempts: Self.nonzeroText(config["maxDialAttempts"]),
+            dialTimeout: Self.nonzeroText(performance["dialTimeoutMs"]),
+            failoverTimeout: Self.nonzeroText(performance["failoverTimeoutMs"]),
+            probeTimeout: Self.nonzeroText(performance["probeTimeoutMs"]),
+            probeConcurrency: Self.nonzeroText(performance["probeConcurrency"]),
+            autoRouteInterval: Self.nonzeroText(performance["autoRouteIntervalSec"]),
+            subscriptionRefresh: Self.nonzeroText(config["subscriptionRefreshMin"])
         )
         self.source = source
         original = loaded
@@ -94,6 +107,29 @@ struct AdvancedSettingsDraft {
             config["maxDialAttempts"] = attempts == 0 ? nil : attempts
         }
 
+        if values.subscriptionRefresh != original.subscriptionRefresh {
+            let minutes = try number(values.subscriptionRefresh, in: 10...10080, label: "订阅刷新间隔", blank: 0)
+            config["subscriptionRefreshMin"] = minutes == 0 ? nil : minutes
+        }
+
+        var performance = config["performance"] as? [String: Any] ?? [:]
+        let fields: [(key: String, value: KeyPath<Values, String>, label: String, range: ClosedRange<Int>)] = [
+            ("dialTimeoutMs", \.dialTimeout, "拨号总时限", 250...30000),
+            ("failoverTimeoutMs", \.failoverTimeout, "切换前等待上限", 100...29999),
+            ("probeTimeoutMs", \.probeTimeout, "单节点测速时限", 1000...12000),
+            ("probeConcurrency", \.probeConcurrency, "每批测速并发", 1...8),
+            ("autoRouteIntervalSec", \.autoRouteInterval, "自动选路复测间隔", 15...3600)
+        ]
+        for field in fields where values[keyPath: field.value] != original[keyPath: field.value] {
+            let value = try number(values[keyPath: field.value], in: field.range, label: field.label, blank: 0)
+            performance[field.key] = value == 0 ? nil : value
+        }
+        let configuredDial = performance["dialTimeoutMs"] as? Int ?? 0
+        if let failover = performance["failoverTimeoutMs"] as? Int, failover >= (configuredDial == 0 ? 10000 : configuredDial) {
+            throw CoreError(message: "切换前等待上限须小于拨号总时限。")
+        }
+        config["performance"] = performance.isEmpty ? nil : performance
+
         var notes: [String] = []
         if values.systemProxy != original.systemProxy || values.tunEnabled != original.tunEnabled {
             notes.append("启动选项在下次启动时使用。")
@@ -142,6 +178,8 @@ struct AdvancedSettingsPanel: View {
                 Label("请先保存或还原 JSON 草稿，再编辑高级选项。", systemImage: "doc.badge.clock")
                     .foregroundStyle(.orange)
             } else if let fields = Binding($draft) {
+                Text("留空使用默认值。运行时保存拨号、测速和订阅设置，可应用到新请求。")
+                    .font(.caption).foregroundStyle(.secondary)
                 Divider()
                 controls(fields.values)
                     .disabled(core.saving)
@@ -158,6 +196,7 @@ struct AdvancedSettingsPanel: View {
                         .disabled(!fields.wrappedValue.changed || core.saving)
                     Button(core.saving ? "正在校验…" : "保存高级配置", action: save)
                         .buttonStyle(HopPrimaryButton())
+                        .keyboardShortcut("s", modifiers: .command)
                         .disabled(!fields.wrappedValue.changed || core.saving || fields.wrappedValue.source != core.saved)
                 }
             } else {
@@ -178,47 +217,67 @@ struct AdvancedSettingsPanel: View {
 
     private func controls(_ values: Binding<AdvancedSettingsDraft.Values>) -> some View {
         VStack(alignment: .leading, spacing: 13) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("监听端口").fontWeight(.semibold)
-                HStack(spacing: 14) {
+            section("连接与故障切换", icon: "arrow.triangle.branch") {
+                fieldRow {
+                    field("拨号总时限（毫秒）", text: values.dialTimeout, prompt: "10000")
+                    field("切换前等待上限（毫秒）", text: values.failoverTimeout, prompt: "5000")
+                    field("出站尝试上限", text: values.maxDialAttempts, prompt: "3")
+                }
+                hint("总时限适用于 TCP 和 UDP 建连。TCP 有备用出站时，前序尝试单独计时，留空最多用总时限的一半。尝试次数包含首次拨号。")
+            }
+            Divider()
+            section("测速与自动选路", icon: "speedometer") {
+                field("首选测速地址", text: values.probeURL, prompt: "随订阅或默认")
+                field("备用测速地址", text: values.fallbackURL, prompt: "可留空")
+                fieldRow {
+                    field("单节点测速时限（毫秒）", text: values.probeTimeout, prompt: "6000")
+                    field("每批测速并发", text: values.probeConcurrency, prompt: "8")
+                }
+                fieldRow {
+                    field("策略组测速间隔（秒）", text: values.probeInterval, prompt: "随订阅或 300")
+                    field("自动选路复测间隔（秒）", text: values.autoRouteInterval, prompt: "60")
+                }
+                hint("单节点时限涵盖首选和备用测速地址。策略组测速与按地区、服务商自动选路各自计时。")
+            }
+            Divider()
+            section("订阅刷新", icon: "arrow.clockwise") {
+                field("默认刷新间隔（分钟）", text: values.subscriptionRefresh, prompt: "360")
+                    .frame(maxWidth: 190)
+                hint("内核运行时每 10 分钟检查是否到期。订阅自己的刷新间隔优先。")
+            }
+            Divider()
+            section("本机端口与 TUN", icon: "network") {
+                fieldRow {
                     field("SOCKS5 端口", text: values.socksPort, prompt: "1080")
                     field("HTTP 端口", text: values.httpPort, prompt: "8080")
                 }
-                Text("填 0 自动分配。修改后重启代理生效。").font(.caption).foregroundStyle(.secondary)
-            }
-            Divider()
-            VStack(alignment: .leading, spacing: 8) {
-                Text("自动测速").fontWeight(.semibold)
-                field("首选测速地址", text: values.probeURL, prompt: "随订阅或默认")
-                field("备用测速地址", text: values.fallbackURL, prompt: "可留空")
-                HStack(spacing: 8) {
-                    field("自动测速间隔", text: values.probeInterval, prompt: "300")
-                    Text("秒").foregroundStyle(.secondary).padding(.top, 19)
+                hint("端口填 0 自动分配。修改后重启代理生效。")
+                fieldRow {
+                    Toggle("启动时接管系统代理", isOn: values.systemProxy)
+                    Toggle("启动时开启 TUN", isOn: values.tunEnabled)
+                    Toggle("TUN 接管 IPv6", isOn: values.ipv6)
                 }
-                .frame(maxWidth: 190)
-                Text("整组留空跟随订阅。自定义测速地址时可单独指定备用目标。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Divider()
-            VStack(alignment: .leading, spacing: 8) {
-                Text("出站恢复").fontWeight(.semibold)
-                field("出站尝试上限", text: values.maxDialAttempts, prompt: "3")
-                    .frame(maxWidth: 190)
-                Text("包含首次拨号。填 1 只尝试当前出站，留空使用默认值。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Divider()
-            VStack(alignment: .leading, spacing: 8) {
-                Text("启动与 TUN").fontWeight(.semibold)
-                Toggle("启动时接管系统代理", isOn: values.systemProxy)
-                Toggle("启动时开启 TUN", isOn: values.tunEnabled)
-                Toggle("TUN 接管 IPv6", isOn: values.ipv6)
                 field("TUN MTU", text: values.mtu, prompt: "9000")
                     .frame(maxWidth: 190)
-                Text("重新开启 TUN 后应用 MTU 和 IPv6。旧版 TUN 助手需更新后才支持自定义 MTU。")
-                    .font(.caption).foregroundStyle(.secondary)
+                hint("重新开启 TUN 后应用 MTU 和 IPv6。自定义 MTU 需要新版 TUN 助手。")
             }
         }
+    }
+
+    private func section<Content: View>(_ title: String, icon: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(title, systemImage: icon).fontWeight(.semibold)
+            content()
+        }
+    }
+
+    private func fieldRow<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        HStack(alignment: .top, spacing: 14, content: content)
+    }
+
+    private func hint(_ text: String) -> some View {
+        Text(text).font(.caption).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private func field(_ title: String, text: Binding<String>, prompt: String) -> some View {
@@ -226,6 +285,7 @@ struct AdvancedSettingsPanel: View {
             Text(title).font(.caption).foregroundStyle(.secondary)
             TextField(title, text: text, prompt: Text(prompt))
                 .labelsHidden()
+                .accessibilityLabel(title)
                 .textFieldStyle(.roundedBorder)
                 .autocorrectionDisabled()
                 .monospacedDigit()

@@ -198,6 +198,8 @@ struct ProxyStatus: Decodable {
         let id: String
         let nodes: Int
         let updated: Double?
+        let checked: Double?
+        let usage: SubscriptionSummary.Meter?
         let error: String?
     }
 
@@ -591,7 +593,7 @@ final class CoreModel: ObservableObject {
             let data = try await call(info, path: "status")
             guard endpoint?.token == info.token else { return }
             let snapshot = try JSONDecoder().decode(ProxyStatus.self, from: data)
-            let before = status?.subscriptions?.map(\.updated)
+            let before = status?.subscriptions?.map { [$0.updated, $0.usage.map { Double($0.updatedAt) }] }
             if let previous = status,
                previous.policy != snapshot.policy || previous.auto?.node != snapshot.auto?.node {
                 verification = nil
@@ -600,7 +602,9 @@ final class CoreModel: ObservableObject {
             clearStatusFailure()
             status = snapshot
             updateTrafficRate(snapshot.sessionTraffic)
-            if before != snapshot.subscriptions?.map(\.updated) { reloadConfiguredNodes() }
+            if before != snapshot.subscriptions?.map({ [$0.updated, $0.usage.map { Double($0.updatedAt) }] }) {
+                reloadConfiguredNodes()
+            }
             reloadTraffic()
             if message == nil, let warnings = status?.warnings, !warnings.isEmpty {
                 message = warnings.joined(separator: "；")

@@ -1,70 +1,151 @@
 package profile
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
 	"mac-proxy/internal/importer"
+	"mac-proxy/internal/outbound"
 )
 
-// Fetch downloads a subscription and converts it to a snapshot.
+// Fetch downloads a subscription without using an earlier response.
 func Fetch(ctx context.Context, sub engine.Subscription, impl backend.Backend, transport http.RoundTripper) (*Snapshot, importer.Result, error) {
-	result, err := importer.ImportWith(ctx, strings.NewReader(sub.URL), engine.Default(), impl, importer.Options{Transport: transport, Agent: sub.Agent})
+	return fetch(ctx, sub, impl, transport, nil)
+}
+
+func fetch(ctx context.Context, sub engine.Subscription, impl backend.Backend, transport http.RoundTripper, previous *Snapshot) (*Snapshot, importer.Result, error) {
+	options := importer.Options{Transport: transport, Agent: sub.Agent}
+	if previous != nil && previous.Validators != nil {
+		options.Validators = *previous.Validators
+	}
+	result, err := importer.ImportWith(ctx, strings.NewReader(sub.URL), engine.Default(), impl, options)
 	if err != nil {
 		return nil, importer.Result{}, err
 	}
+	now := time.Now().UnixMilli()
+	if result.NotModified {
+		snapshot := *previous
+		snapshot.Checked, snapshot.Validators = now, &result.Validators
+		return &snapshot, result, nil
+	}
 	config := result.Config
-	snapshot := &Snapshot{Updated: time.Now().UnixMilli(), Nodes: config.Nodes, Groups: config.Groups,
-		RuleSets: config.RuleSets, Health: config.Health, Usage: result.Usage, Skipped: result.Skipped, Notes: result.Notes}
+	if len(config.Nodes) == 0 {
+		return nil, importer.Result{}, errors.New("订阅没有可用节点")
+	}
+	snapshot := &Snapshot{Updated: now, Checked: now, Validators: &result.Validators,
+		Nodes: config.Nodes, Groups: config.Groups, RuleSets: config.RuleSets,
+		Health: config.Health, Usage: result.Usage, Skipped: result.Skipped, Notes: result.Notes}
 	if len(config.Groups) != 0 {
 		snapshot.Rules = config.Rules // Clash profiles bring their own routing
 	}
 	return snapshot, result, nil
 }
 
-// RefreshSnapshot validates a new snapshot alongside all other subscriptions
-// before replacing the cached version.
+type Refresh struct {
+	Snapshot    *Snapshot
+	previous    *Snapshot
+	notModified bool
+}
+
+// FetchRefresh keeps the snapshot a conditional response refers to, so a
+// concurrent import cannot have its nodes overwritten by a stale HTTP 304.
+func FetchRefresh(ctx context.Context, sub engine.Subscription, dataDir string, impl backend.Backend, transport http.RoundTripper) (*Refresh, error) {
+	if err := checkRetry(sub, dataDir); err != nil {
+		return nil, err
+	}
+	previous, _ := LoadSnapshot(dataDir, sub)
+	snapshot, result, err := fetch(ctx, sub, impl, transport, previous)
+	if err != nil {
+		saveRetry(sub, dataDir, err)
+		return nil, err
+	}
+	return &Refresh{Snapshot: snapshot, previous: previous, notModified: result.NotModified}, nil
+}
+
+// RefreshSnapshot downloads and validates before replacing a cached snapshot.
 func RefreshSnapshot(ctx context.Context, user engine.Config, sub engine.Subscription, dataDir string, impl backend.Backend, transport http.RoundTripper) (*Snapshot, error) {
-	snapshot, _, err := Fetch(ctx, sub, impl, transport)
+	refresh, err := FetchRefresh(ctx, sub, dataDir, impl, transport)
 	if err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := CommitRefresh(user, sub, snapshot, dataDir, impl); err != nil {
+	if _, err := CommitRefresh(user, sub, refresh, dataDir, impl); err != nil {
 		return nil, err
 	}
-	return snapshot, nil
+	return refresh.Snapshot, nil
 }
 
-// CommitRefresh validates a downloaded snapshot against the current profile
-// before atomically replacing the last good copy.
-func CommitRefresh(user engine.Config, sub engine.Subscription, snapshot *Snapshot, dataDir string, impl backend.Backend) error {
-	if err := prepareSnapshot(user, sub, snapshot, dataDir, impl); err != nil {
-		return err
+// CommitRefresh reports whether the engine-facing content actually changed.
+func CommitRefresh(user engine.Config, sub engine.Subscription, refresh *Refresh, dataDir string, impl backend.Backend) (bool, error) {
+	release, err := lockSnapshots(dataDir)
+	if err != nil {
+		return false, err
 	}
-	return SaveSnapshot(dataDir, sub, snapshot)
+	defer release()
+	current, _ := LoadSnapshot(dataDir, sub)
+	if !reflect.DeepEqual(current, refresh.previous) {
+		return false, errors.New("订阅缓存已由其他操作更新，请重新检查")
+	}
+	snapshot := refresh.Snapshot
+	changed := !sameRouting(current, snapshot)
+	if changed {
+		if err := prepareSnapshot(user, sub, snapshot, dataDir, impl); err != nil {
+			return false, err
+		}
+	} else {
+		snapshot.Updated = current.Updated
+		if !refresh.notModified {
+			updateUsage(sub, snapshot, current)
+		}
+	}
+	if err := saveSnapshot(dataDir, sub, snapshot); err != nil {
+		return false, err
+	}
+	return changed, nil
 }
 
-func prepareSnapshot(user engine.Config, sub engine.Subscription, snapshot *Snapshot, dataDir string, impl backend.Backend) error {
-	snapshots := map[string]*Snapshot{sub.Name: snapshot}
-	for _, other := range user.Subscriptions {
-		cached, err := LoadSnapshot(dataDir, other)
-		if err != nil {
-			continue
-		}
-		if other.Name != sub.Name {
-			snapshots[other.Name] = cached
-			continue
-		}
-		sub.Usage, sub.UsageSamples = cached.Usage, cached.Samples
+func sameRouting(a, b *Snapshot) bool {
+	return a != nil && slices.EqualFunc(a.Nodes, b.Nodes, sameNode) &&
+		equalSlice(a.Groups, b.Groups) && equalSlice(a.Rules, b.Rules) &&
+		equalSlice(a.RuleSets, b.RuleSets) && reflect.DeepEqual(a.Health, b.Health)
+}
+
+func equalSlice[T any](a, b []T) bool {
+	return slices.EqualFunc(a, b, func(a, b T) bool { return reflect.DeepEqual(a, b) })
+}
+
+func sameNode(a, b outbound.Node) bool {
+	aOptions, bOptions := a.Options, b.Options
+	a.Options, b.Options = nil, nil
+	if !reflect.DeepEqual(a, b) {
+		return false
+	}
+	if bytes.Equal(aOptions, bOptions) {
+		return true
+	}
+	var left, right bytes.Buffer
+	return json.Compact(&left, aOptions) == nil && json.Compact(&right, bOptions) == nil &&
+		bytes.Equal(left.Bytes(), right.Bytes())
+}
+
+func updateUsage(sub engine.Subscription, snapshot, previous *Snapshot) {
+	if previous != nil {
+		sub.Usage, sub.UsageSamples = previous.Usage, previous.Samples
 	}
 	if snapshot.Usage != nil {
 		importer.UpdateUsage(&sub, snapshot.Usage)
@@ -72,9 +153,58 @@ func prepareSnapshot(user engine.Config, sub engine.Subscription, snapshot *Snap
 		snapshot.Usage = sub.Usage
 	}
 	snapshot.Samples = sub.UsageSamples
+}
+
+func prepareSnapshot(user engine.Config, sub engine.Subscription, snapshot *Snapshot, dataDir string, impl backend.Backend) error {
+	snapshots := map[string]*Snapshot{sub.Name: snapshot}
+	var previous *Snapshot
+	for _, other := range user.Subscriptions {
+		cached, err := LoadSnapshot(dataDir, other)
+		if err != nil {
+			continue
+		}
+		if other.Name == sub.Name {
+			previous = cached
+		} else {
+			snapshots[other.Name] = cached
+		}
+	}
+	updateUsage(sub, snapshot, previous)
 	merged, _ := Merge(user, snapshots)
 	merged.DataDir = dataDir
 	return engine.Validate(merged, impl)
+}
+
+func checkRetry(sub engine.Subscription, dataDir string) error {
+	until := time.Unix(readRetryDeadline(SnapshotPath(dataDir, sub)+".retry"), 0)
+	if until.After(time.Now()) {
+		return fmt.Errorf("订阅暂缓刷新，可在 %s 后重试", until.Local().Format("01-02 15:04:05"))
+	}
+	return nil
+}
+
+func readRetryDeadline(path string) int64 {
+	raw, _ := os.ReadFile(path)
+	seconds, _ := strconv.ParseInt(string(raw), 10, 64)
+	return seconds
+}
+
+func saveRetry(sub engine.Subscription, dataDir string, err error) {
+	var response *importer.DownloadError
+	if !errors.As(err, &response) || !response.RetryAfter.After(time.Now()) {
+		return
+	}
+	release, err := lockSnapshots(dataDir)
+	if err != nil {
+		return
+	}
+	defer release()
+	// Round up so the next process cannot retry just before the hint.
+	until := response.RetryAfter.Add(time.Second - time.Nanosecond).Unix()
+	path := SnapshotPath(dataDir, sub) + ".retry"
+	if until > readRetryDeadline(path) {
+		_ = engine.WriteAtomic(path, strconv.AppendInt(nil, until, 10))
+	}
 }
 
 // Subscribe adds (or refreshes) a subscription in user, downloading it now.
@@ -119,8 +249,12 @@ func subscribe(ctx context.Context, user engine.Config, rawURL, dataDir string, 
 			sub.Name = fmt.Sprintf("%s-%d", base, i)
 		}
 	}
+	if err := checkRetry(sub, dataDir); err != nil {
+		return importer.Result{}, err
+	}
 	snapshot, result, err := Fetch(ctx, sub, impl, nil)
 	if err != nil {
+		saveRetry(sub, dataDir, err)
 		return importer.Result{}, err
 	}
 	if index < 0 {
@@ -129,11 +263,18 @@ func subscribe(ctx context.Context, user engine.Config, rawURL, dataDir string, 
 		user.Subscriptions = append([]engine.Subscription(nil), user.Subscriptions...)
 		user.Subscriptions[index] = sub
 	}
+	if !preview {
+		release, err := lockSnapshots(dataDir)
+		if err != nil {
+			return importer.Result{}, err
+		}
+		defer release()
+	}
 	if err := prepareSnapshot(user, sub, snapshot, dataDir, impl); err != nil {
 		return importer.Result{}, err
 	}
 	if !preview {
-		if err := SaveSnapshot(dataDir, sub, snapshot); err != nil {
+		if err := saveSnapshot(dataDir, sub, snapshot); err != nil {
 			return importer.Result{}, err
 		}
 	}
@@ -152,15 +293,16 @@ func subscribe(ctx context.Context, user engine.Config, rawURL, dataDir string, 
 	for i, note := range result.Notes {
 		result.Notes[i] = strings.Replace(note, "替换原有分组和规则", "排在你自己的规则之后生效", 1)
 	}
-	result.Notes = append([]string{fmt.Sprintf("%s「%s」，之后每 %d 小时自动更新", verb, sub.Name, interval(sub)/3600)}, result.Notes...)
+	result.Notes = append([]string{fmt.Sprintf("%s「%s」，之后每 %g 分钟自动检查", verb, sub.Name, RefreshInterval(user, sub).Minutes())}, result.Notes...)
 	return result, nil
 }
 
-const DefaultInterval = 6 * 3600
-
-func interval(sub engine.Subscription) int {
+func RefreshInterval(config engine.Config, sub engine.Subscription) time.Duration {
 	if sub.Interval > 0 {
-		return sub.Interval
+		return time.Duration(sub.Interval) * time.Second
 	}
-	return DefaultInterval
+	if config.SubscriptionRefreshMin > 0 {
+		return time.Duration(config.SubscriptionRefreshMin) * time.Minute
+	}
+	return 6 * time.Hour
 }

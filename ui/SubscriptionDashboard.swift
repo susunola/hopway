@@ -139,12 +139,12 @@ struct SubscriptionDashboard: View {
     }
 
     private func plan(_ subscription: SubscriptionSummary) -> some View {
-        let meter = subscription.usage
+        let runtime = core.status?.subscriptions?.first { $0.id == subscription.id }
+        let meter = runtime?.usage ?? subscription.usage
         let used = meter?.used
         let total = meter?.total.flatMap { $0 > 0 ? $0 : nil }
         let ratio = used.flatMap { used in total.map { Double(used) / Double($0) } }
         let warning = (ratio ?? 0) >= 0.8
-        let runtime = core.status?.subscriptions?.first { $0.id == subscription.id }
         let nodeSync = max(runtime?.updated ?? 0, core.configuredProfile?.snapshotAt?[subscription.id] ?? 0)
         return VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline, spacing: 9) {
@@ -238,8 +238,8 @@ struct SubscriptionDashboard: View {
                 .font(.caption)
             }
             ViewThatFits(in: .horizontal) {
-                HStack(spacing: 14) { syncLabels(nodeSync: nodeSync, quotaSync: meter?.updatedAt) }
-                VStack(alignment: .leading, spacing: 4) { syncLabels(nodeSync: nodeSync, quotaSync: meter?.updatedAt) }
+                HStack(spacing: 14) { syncLabels(nodeSync: nodeSync, quotaSync: meter?.updatedAt, checked: runtime?.checked) }
+                VStack(alignment: .leading, spacing: 4) { syncLabels(nodeSync: nodeSync, quotaSync: meter?.updatedAt, checked: runtime?.checked) }
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -248,11 +248,14 @@ struct SubscriptionDashboard: View {
     }
 
     @ViewBuilder
-    private func syncLabels(nodeSync: Double, quotaSync: Int64?) -> some View {
+    private func syncLabels(nodeSync: Double, quotaSync: Int64?, checked: Double?) -> some View {
         if nodeSync > 0 {
             Text("节点同步 " + Date(timeIntervalSince1970: nodeSync / 1000).formatted(date: .abbreviated, time: .shortened))
         } else {
             Text("节点暂无同步记录")
+        }
+        if let checked, checked > nodeSync {
+            Text("已检查 · 节点未变更 " + Date(timeIntervalSince1970: checked / 1000).formatted(date: .abbreviated, time: .shortened))
         }
         if let quotaSync, quotaSync > 0 {
             Text("额度更新 " + Date(timeIntervalSince1970: Double(quotaSync)).formatted(date: .abbreviated, time: .shortened))

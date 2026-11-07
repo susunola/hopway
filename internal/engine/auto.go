@@ -124,7 +124,7 @@ func (engine *Engine) MonitorAuto(ctx context.Context) {
 			engine.mu.Unlock()
 		}
 
-		timer := time.NewTimer(60 * time.Second)
+		timer := time.NewTimer(engine.performance.autoRouteInterval)
 		select {
 		case <-ctx.Done():
 			timer.Stop()

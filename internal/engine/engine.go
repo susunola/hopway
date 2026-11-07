@@ -38,13 +38,15 @@ type Config struct {
 	Health    *Health         `json:"health,omitempty"`
 	// Subscriptions are merged in by the profile package; the engine only
 	// sees their nodes, groups and rules.
-	Subscriptions     []Subscription `json:"subscriptions,omitempty"`
-	SubscriptionNodes []string       `json:"subscriptionNodes,omitempty"` // inline nodes from older versions
+	Subscriptions          []Subscription `json:"subscriptions,omitempty"`
+	SubscriptionNodes      []string       `json:"subscriptionNodes,omitempty"` // inline nodes from older versions
+	SubscriptionRefreshMin int            `json:"subscriptionRefreshMin,omitempty"`
 	// SystemProxy points macOS's proxy settings at HopWay while it runs.
 	SystemProxy bool `json:"systemProxy,omitempty"`
 	// TUN captures all traffic through a virtual network device.
-	TUN             *TUNConfig `json:"tun,omitempty"`
-	MaxDialAttempts int        `json:"maxDialAttempts,omitempty"`
+	TUN             *TUNConfig        `json:"tun,omitempty"`
+	MaxDialAttempts int               `json:"maxDialAttempts,omitempty"`
+	Performance     PerformanceConfig `json:"performance,omitzero"`
 
 	// DataDir holds caches (downloaded rule sets). Set by the caller, not saved.
 	DataDir string `json:"-"`
@@ -178,6 +180,7 @@ type Engine struct {
 	health        map[string]*nodeHealth
 	rules         *matcher
 	attempts      int
+	performance   performanceLimits
 	probeURL      string
 	probeFallback string
 	sequence      uint64
@@ -203,8 +206,6 @@ type Engine struct {
 }
 
 const (
-	dialTimeout            = 10 * time.Second
-	attemptTimeout         = 5 * time.Second
 	defaultDialAttempts    = 3
 	maxAllowedDialAttempts = 8
 	endpointDialLimit      = 64
@@ -234,10 +235,15 @@ func NewWithResourceBudget(config Config, impl backend.Backend, budget *Resource
 	if attempts == 0 {
 		attempts = defaultDialAttempts
 	}
+	performance, err := config.Performance.limits()
+	if err != nil {
+		return nil, err
+	}
 	engine := &Engine{subscriptions: config.Subscriptions, autoWake: make(chan struct{}, 1), dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL, probeFallback: defaultProbeFallback,
-		dialSlots: make(map[string]*endpointSlots), attempts: attempts, lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
+		dialSlots: make(map[string]*endpointSlots), attempts: attempts, performance: performance,
+		lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
 	}
 	for _, port := range localPorts {
 		engine.ports[uint16(port)] = true
@@ -608,7 +614,7 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		attempt := ctx
 		cancelAttempt := context.CancelFunc(func() {})
 		if i < len(candidates)-1 {
-			attempt, cancelAttempt = context.WithTimeout(ctx, attemptTimeout)
+			attempt, cancelAttempt = context.WithTimeout(ctx, engine.performance.failoverTimeout)
 		}
 		conn, err = engine.dialOnce(attempt, candidate.via, target, &record)
 		cancelAttempt()
@@ -671,7 +677,7 @@ func (engine *Engine) dialContext(ctx context.Context) (context.Context, context
 	engine.mu.Lock()
 	network := engine.networkCtx
 	engine.mu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	ctx, cancel := context.WithTimeout(ctx, engine.performance.dialTimeout)
 	stop := context.AfterFunc(network, cancel)
 	if network.Err() != nil {
 		cancel()

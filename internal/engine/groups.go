@@ -45,7 +45,6 @@ const (
 	defaultProbeFallback = "https://www.cloudflare.com/cdn-cgi/trace"
 	defaultProbeInterval = 300
 	defaultTolerance     = 50
-	probeTimeout         = 6 * time.Second
 	probeParallel        = 8
 )
 
@@ -309,7 +308,7 @@ func (engine *Engine) probeNodes(ctx context.Context, names []string, emit func(
 			names = append(names, name)
 		}
 	}
-	workers := min(probeParallel, len(names))
+	workers := min(engine.performance.probeConcurrency, len(names))
 	work := make(chan string)
 	results := make(chan ProbeResult, workers)
 	var wait sync.WaitGroup
@@ -424,12 +423,13 @@ func (engine *Engine) probe(ctx context.Context, name string) ProbeResult {
 		return result
 	}
 	defer release()
-	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	timeout := engine.performance.probeTimeout
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	primary := ctx
 	if engine.probeFallback != "" {
 		var stop context.CancelFunc
-		primary, stop = context.WithTimeout(ctx, 4*time.Second)
+		primary, stop = context.WithTimeout(ctx, timeout*2/3)
 		defer stop()
 	}
 	target := engine.probeURL
@@ -489,10 +489,10 @@ func probeTarget(ctx context.Context, dialer backend.Dialer, target string) (tim
 			}
 			return conn, err
 		},
-		DisableKeepAlives: true, TLSHandshakeTimeout: probeTimeout, ResponseHeaderTimeout: probeTimeout,
+		DisableKeepAlives: true,
 	}
 	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: probeTimeout,
+	client := &http.Client{Transport: transport,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {

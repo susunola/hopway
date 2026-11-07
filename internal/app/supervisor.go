@@ -34,6 +34,7 @@ type SubscriptionStatus struct {
 	Usage   *engine.SubscriptionUsage `json:"usage,omitempty"`
 	Nodes   int                       `json:"nodes"`
 	Updated int64                     `json:"updated,omitempty"`
+	Checked int64                     `json:"checked,omitempty"`
 	Error   string                    `json:"error,omitempty"`
 }
 
@@ -70,23 +71,24 @@ type Supervisor struct {
 	ports         []int
 	lease         *os.File
 
-	ledger        *engine.TrafficLedger
-	budget        *engine.ResourceBudget
-	refreshMu     sync.Mutex
-	current       atomic.Pointer[engine.Engine]
-	mu            sync.Mutex // serializes reloads; guards the fields below
-	loaded        profile.Loaded
-	autoPolicy    *engine.Policy
-	subErr        map[string]string
-	subMeta       map[string]SubscriptionStatus // nodes and update time of each snapshot
-	started       time.Time
-	ctx           context.Context
-	cancel        context.CancelFunc
-	networkCtx    context.Context
-	cancelNetwork context.CancelFunc
-	closing       bool
-	closeOnce     sync.Once
-	retiring      sync.WaitGroup
+	ledger           *engine.TrafficLedger
+	budget           *engine.ResourceBudget
+	refreshMu        sync.Mutex
+	current          atomic.Pointer[engine.Engine]
+	mu               sync.Mutex // serializes reloads; guards the fields below
+	loaded           profile.Loaded
+	autoPolicy       *engine.Policy
+	subErr           map[string]string
+	subMeta          map[string]SubscriptionStatus // nodes and update time of each snapshot
+	subReloadPending bool
+	started          time.Time
+	ctx              context.Context
+	cancel           context.CancelFunc
+	networkCtx       context.Context
+	cancelNetwork    context.CancelFunc
+	closing          bool
+	closeOnce        sync.Once
+	retiring         sync.WaitGroup
 
 	proxyMu     sync.Mutex
 	proxy       *sysproxy.Manager
@@ -156,7 +158,7 @@ var SystemProxySupported = runtime.GOOS == "darwin"
 func (s *Supervisor) readSnapshotMeta() {
 	for _, sub := range s.loaded.User.Subscriptions {
 		if snapshot, err := profile.LoadSnapshot(s.dataDir, sub); err == nil {
-			s.subMeta[sub.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated, Usage: snapshot.Usage}
+			s.subMeta[sub.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated, Checked: snapshot.CheckedAt(), Usage: snapshot.Usage}
 		}
 	}
 }
@@ -188,17 +190,17 @@ func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
 		core.Restore(engine.Runtime{Policy: *s.autoPolicy})
 	}
 	s.current.Store(core)
-	go s.subscriptionLoop()
 	if s.ledger != nil {
 		go s.flushTraffic()
 	}
-	go netmon.Watch(s.ctx, 3*time.Second, nil, s.networkChanged)
 	if s.loaded.Merged.SystemProxy {
 		s.SetSystemProxy(true)
 	}
 	if t := s.loaded.Merged.TUN; t != nil && t.Enabled {
 		_ = s.StartTUNChange(true) // may wait for the user to enter a password
 	}
+	go s.subscriptionLoop()
+	go netmon.Watch(s.ctx, 3*time.Second, nil, s.networkChanged)
 	return nil
 }
 
@@ -506,6 +508,7 @@ func (s *Supervisor) reloadLocked() error {
 	}
 	s.loaded = loaded
 	s.readSnapshotMeta()
+	s.subReloadPending = false
 	s.started = time.Now()
 	s.current.Store(core)
 	if err := profile.SaveLastGood(s.path, s.dataDir, loaded.User); err != nil {
@@ -599,39 +602,46 @@ func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id st
 		return
 	}
 	network := s.networkCtx
-	subs := s.loaded.User.Subscriptions
+	user := s.loaded.User
 	s.mu.Unlock()
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stop := context.AfterFunc(network, cancel)
 	defer stop()
-	changed := false
-	for _, sub := range subs {
+	var transport *http.Transport
+	var transportCore *engine.Engine
+	defer func() {
+		if transport != nil {
+			transport.CloseIdleConnections()
+		}
+	}()
+	for _, sub := range user.Subscriptions {
 		if ctx.Err() != nil || network.Err() != nil {
 			break
 		}
 		if sub.Paused || (id != "" && sub.Key() != id) {
 			continue
 		}
-		interval := time.Duration(sub.Interval) * time.Second
-		if sub.Interval == 0 {
-			interval = profile.DefaultInterval * time.Second
-		}
 		s.mu.Lock()
 		meta, known := s.subMeta[sub.URL]
 		s.mu.Unlock()
-		if known && !force && time.Since(time.UnixMilli(meta.Updated)) < interval {
+		if known && !force && time.Since(time.UnixMilli(meta.Checked)) < profile.RefreshInterval(user, sub) {
 			continue
 		}
-		transport := &http.Transport{
-			DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
-				return s.Dial(ctx, "subscription", address)
-			},
-			ForceAttemptHTTP2: true,
+		if core := s.current.Load(); core != transportCore {
+			if transport != nil {
+				transport.CloseIdleConnections()
+			}
+			transport = &http.Transport{
+				DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
+					return core.Dial(ctx, "subscription", address)
+				},
+				ForceAttemptHTTP2: true, IdleConnTimeout: 30 * time.Second, MaxIdleConns: 16,
+			}
+			transportCore = core
 		}
-		snapshot, _, err := profile.Fetch(ctx, sub, s.impl, transport)
-		transport.CloseIdleConnections()
+		refresh, err := profile.FetchRefresh(ctx, sub, s.dataDir, s.impl, transport)
 		s.mu.Lock()
 		// Check the generation and the subscription again under the same
 		// lock that serializes network events and profile changes.
@@ -645,25 +655,28 @@ func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id st
 			continue
 		}
 		if err == nil {
-			err = profile.CommitRefresh(s.loaded.User, current, snapshot, s.dataDir, s.impl)
+			var changed bool
+			changed, err = profile.CommitRefresh(s.loaded.User, current, refresh, s.dataDir, s.impl)
+			s.subReloadPending = s.subReloadPending || changed
 		}
 		if err != nil {
 			s.subErr[current.Name] = err.Error()
 		} else {
+			snapshot := refresh.Snapshot
 			delete(s.subErr, current.Name)
-			s.subMeta[current.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated, Usage: snapshot.Usage}
-			changed = true
+			s.subMeta[current.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated, Checked: snapshot.CheckedAt(), Usage: snapshot.Usage}
 		}
 		s.mu.Unlock()
 	}
-	if changed {
-		s.mu.Lock()
-		if !s.closing {
-			if err := s.reloadLocked(); err != nil {
-				s.loaded.Warnings = append(s.loaded.Warnings, "订阅已更新，但新配置无法应用："+err.Error())
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.subReloadPending && !s.closing {
+		if err := s.reloadLocked(); err != nil {
+			warning := "订阅已更新，但新配置无法应用：" + err.Error()
+			if len(s.loaded.Warnings) == 0 || s.loaded.Warnings[len(s.loaded.Warnings)-1] != warning {
+				s.loaded.Warnings = append(s.loaded.Warnings, warning)
 			}
 		}
-		s.mu.Unlock()
 	}
 }
 

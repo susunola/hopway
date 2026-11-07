@@ -13,8 +13,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"go.yaml.in/yaml/v3"
 
@@ -34,6 +34,8 @@ type Result struct {
 	incompatible  int
 	Notes         []string                  `json:"notes"`
 	Source        string                    `json:"-"`
+	Validators    Validators                `json:"-"`
+	NotModified   bool                      `json:"-"`
 	Usage         *engine.SubscriptionUsage `json:"usage,omitempty"`
 	names         map[string]bool
 	seen          map[string]string
@@ -319,51 +321,32 @@ func pluginOptions(options map[string]any) string {
 	return strings.Join(parts, ";")
 }
 
+var errImportTooLarge = errors.New("导入内容超过 1 MB")
+
 func readBounded(reader io.Reader) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(reader, MaxSize+1))
 	if err != nil {
 		return nil, errors.New("读取导入内容失败")
 	}
 	if len(data) > MaxSize {
-		return nil, errors.New("导入内容超过 1 MB")
+		return nil, errImportTooLarge
 	}
 	return data, nil
 }
 
-// Options adjust how Import fetches subscriptions.
-type Options struct {
-	// Transport carries subscription downloads; nil means a direct connection.
-	// Background refreshes pass one that goes through HopWay's own routing.
-	Transport http.RoundTripper
-	Agent     string
+func importText(data []byte) (string, error) {
+	if !utf8.Valid(data) {
+		return "", errors.New("订阅或配置不是有效的 UTF-8 文本")
+	}
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(data)), "\ufeff")), nil
 }
 
-func fetch(ctx context.Context, source *url.URL, options Options) ([]byte, string, error) {
-	if source.User != nil || source.Hostname() == "" {
-		return nil, "", errors.New("订阅地址无效")
-	}
-	client := &http.Client{Transport: options.Transport, Timeout: 30 * time.Second, CheckRedirect: func(next *http.Request, via []*http.Request) error {
-		if len(via) >= 5 || next.URL.User != nil ||
-			(next.URL.Scheme != "https" && (next.URL.Scheme != "http" || via[len(via)-1].URL.Scheme == "https")) {
-			return errors.New("invalid subscription redirect")
-		}
-		return nil
-	}}
-	request, err := http.NewRequestWithContext(ctx, "GET", source.String(), nil)
-	if err != nil {
-		return nil, "", errors.New("订阅地址无效")
-	}
-	request.Header.Set("User-Agent", options.Agent)
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, "", errors.New("无法下载订阅，请检查网络和链接")
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("订阅服务器返回 HTTP %d", response.StatusCode)
-	}
-	data, err := readBounded(response.Body)
-	return data, response.Header.Get("Subscription-Userinfo"), err
+// Options adjust how Import fetches subscriptions.
+type Options struct {
+	// Transport carries subscription downloads; nil uses the default transport.
+	Transport  http.RoundTripper
+	Agent      string
+	Validators Validators
 }
 
 func Import(ctx context.Context, input io.Reader, base engine.Config, impl backend.Backend) (Result, error) {
@@ -375,7 +358,10 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 	if err != nil {
 		return Result{}, err
 	}
-	raw := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(data)), "\ufeff"))
+	raw, err := importText(data)
+	if err != nil {
+		return Result{}, err
+	}
 	if raw == "" {
 		return Result{}, errors.New("没有可导入的内容")
 	}
@@ -384,25 +370,36 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 		return Result{}, err
 	}
 	var meter *engine.SubscriptionUsage
+	var validators Validators
 	if source != nil {
 		if options.Agent == "" || options.Agent == "clash/HopWay" {
 			options.Agent = agent
 		}
-		data, header, err := fetch(ctx, source, options)
+		response, err := fetch(ctx, source, options)
 		if err != nil {
 			return Result{}, err
 		}
-		raw = strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
-		meter = readUsage(header, raw)
+		validators = response.validators
+		if response.notModified {
+			return Result{Source: source.String(), Validators: validators, NotModified: true}, nil
+		}
+		raw, err = importText(response.body)
+		if err != nil {
+			return Result{}, err
+		}
+		meter = readUsage(response.usage, raw)
+	}
+	if isHTMLDocument(raw) {
+		return Result{}, errors.New("收到网页，无法作为订阅或节点配置导入")
 	}
 	if config, err := engine.Decode(strings.NewReader(raw)); strings.HasPrefix(raw, "{") && err == nil {
 		if err := engine.Validate(config, impl); err != nil {
 			return Result{}, fmt.Errorf("HopWay 配置无效：%w", err)
 		}
-		return Result{Config: config, Usage: meter, Added: len(config.Nodes), Notes: []string{"已导入完整 JSON 配置"}}, nil
+		return Result{Config: config, Usage: meter, Added: len(config.Nodes), Notes: []string{"已导入完整 JSON 配置"}, Validators: validators}, nil
 	}
 
-	result := Result{Config: base, Usage: meter, Notes: []string{}, names: map[string]bool{"DIRECT": true, "REJECT": true, "SELECT": true},
+	result := Result{Config: base, Usage: meter, Validators: validators, Notes: []string{}, names: map[string]bool{"DIRECT": true, "REJECT": true, "SELECT": true},
 		seen: make(map[string]string), check: impl.Check, renamed: map[string]string{}}
 	for _, node := range base.Nodes {
 		result.names[node.Name] = true
@@ -413,7 +410,11 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 	}
 	raw = stripSubscriptionHeader(raw)
 	if decoded, err := decodeBase64(strings.Join(strings.Fields(raw), "")); err == nil && isLinks(stripSubscriptionHeader(string(decoded))) {
-		raw = stripSubscriptionHeader(string(decoded))
+		raw, err = importText(decoded)
+		if err != nil {
+			return Result{}, err
+		}
+		raw = stripSubscriptionHeader(raw)
 	}
 	if isLinks(raw) {
 		for _, line := range strings.Fields(raw) {
