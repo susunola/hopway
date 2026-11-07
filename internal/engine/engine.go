@@ -46,8 +46,10 @@ type Config struct {
 	SystemProxy bool `json:"systemProxy,omitempty"`
 	// TUN captures all traffic through a virtual network device.
 	TUN               *TUNConfig              `json:"tun,omitempty"`
+	Inbound           InboundConfig           `json:"inbound,omitzero"`
 	MaxDialAttempts   int                     `json:"maxDialAttempts,omitempty"`
 	Performance       PerformanceConfig       `json:"performance,omitzero"`
+	AutoSwitch        AutoSwitchConfig        `json:"autoSwitch,omitzero"`
 	Resources         ResourceLimits          `json:"resources,omitzero"`
 	ConnectionHistory ConnectionHistoryConfig `json:"connectionHistory,omitzero"`
 
@@ -59,6 +61,36 @@ type TUNConfig struct {
 	Enabled bool   `json:"enabled"`
 	MTU     uint32 `json:"mtu,omitempty"`
 	IPv6    bool   `json:"ipv6,omitempty"` // capture IPv6 too (fake IPv6 answers, ::/0 route)
+}
+
+// InboundConfig controls the local listeners. Zero uses the listener default.
+type InboundConfig struct {
+	HandshakeTimeoutMS int `json:"handshakeTimeoutMs,omitempty"`
+	HTTPIdleTimeoutSec int `json:"httpIdleTimeoutSec,omitempty"`
+}
+
+func (config InboundConfig) HandshakeTimeout() time.Duration {
+	if config.HandshakeTimeoutMS == 0 {
+		return 10 * time.Second
+	}
+	return time.Duration(config.HandshakeTimeoutMS) * time.Millisecond
+}
+
+func (config InboundConfig) HTTPIdleTimeout() time.Duration {
+	if config.HTTPIdleTimeoutSec == 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(config.HTTPIdleTimeoutSec) * time.Second
+}
+
+func (config InboundConfig) validate() error {
+	if n := config.HandshakeTimeoutMS; n != 0 && (n < 250 || n > 60000) {
+		return errors.New("inbound.handshakeTimeoutMs must be between 250 and 60000")
+	}
+	if n := config.HTTPIdleTimeoutSec; n != 0 && (n < 1 || n > 300) {
+		return errors.New("inbound.httpIdleTimeoutSec must be between 1 and 300")
+	}
+	return nil
 }
 
 // Subscription is a remote node list refreshed in the background.
@@ -193,6 +225,7 @@ type Engine struct {
 	rules         *matcher
 	attempts      int
 	performance   performanceLimits
+	autoSwitch    AutoSwitchConfig
 	probeURL      string
 	probeFallback string
 	sequence      uint64
@@ -258,6 +291,9 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 			return nil, err
 		}
 	}
+	if err := config.Inbound.validate(); err != nil {
+		return nil, err
+	}
 	if config.MaxDialAttempts < 0 || config.MaxDialAttempts > maxAllowedDialAttempts {
 		return nil, fmt.Errorf("maxDialAttempts must be between 0 and %d", maxAllowedDialAttempts)
 	}
@@ -266,6 +302,10 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 		attempts = defaultDialAttempts
 	}
 	performance, err := config.Performance.limits()
+	if err != nil {
+		return nil, err
+	}
+	autoSwitch, err := config.AutoSwitch.effective()
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +320,7 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 	engine := &Engine{subscriptions: config.Subscriptions, autoWake: make(chan struct{}, 1), dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL, probeFallback: defaultProbeFallback,
-		dialSlots: make(map[string]*endpointSlots), attempts: attempts, performance: performance,
+		dialSlots: make(map[string]*endpointSlots), attempts: attempts, performance: performance, autoSwitch: autoSwitch,
 		recentLimit: recentLimit, recentTTL: recentTTL,
 		lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
 	}
@@ -516,7 +556,8 @@ func (engine *Engine) SetPolicy(policy Policy) error {
 	}
 	engine.auto = nil
 	if policy.Mode == "auto" {
-		engine.auto = &autoState{config: policy.Auto, unavailable: engine.unavailableProviders(policy.Auto), health: make(map[string]autoNode), activeGroup: -1}
+		engine.auto = &autoState{config: policy.Auto, switching: engine.autoSwitch,
+			unavailable: engine.unavailableProviders(policy.Auto), health: make(map[string]autoNode), activeGroup: -1}
 		engine.auto.orderedCandidates = engine.auto.candidates()
 	}
 	engine.policy = policy

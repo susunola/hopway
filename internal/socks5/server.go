@@ -50,7 +50,12 @@ func HandleWithUDP(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc
 
 // HandleWithUDPTimeout serves one client with a custom UDP session idle timeout.
 func HandleWithUDPTimeout(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc, idle time.Duration) error {
-	if err := client.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	return HandleWithTimeouts(client, dial, dialPacket, 10*time.Second, idle)
+}
+
+// HandleWithTimeouts applies the negotiation deadline before a tunnel is opened.
+func HandleWithTimeouts(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc, handshake, idle time.Duration) error {
+	if err := client.SetReadDeadline(time.Now().Add(handshake)); err != nil {
 		return err
 	}
 	if err := negotiate(client); err != nil {

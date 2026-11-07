@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 )
@@ -18,6 +19,37 @@ type AutoConfig struct {
 	Groups []AutoGroup `json:"groups"`
 }
 
+// AutoSwitchConfig tunes provider and node selection in automatic routing mode.
+type AutoSwitchConfig struct {
+	GainMS            int `json:"gainMs,omitempty"`
+	GainPercent       int `json:"gainPercent,omitempty"`
+	Confirmations     int `json:"confirmations,omitempty"`
+	FailoverFailures  int `json:"failoverFailures,omitempty"`
+	RecoverySuccesses int `json:"recoverySuccesses,omitempty"`
+}
+
+func (config AutoSwitchConfig) effective() (AutoSwitchConfig, error) {
+	for _, field := range []struct {
+		name          string
+		value         *int
+		fallback, max int
+	}{
+		{"gainMs", &config.GainMS, 50, 2000},
+		{"gainPercent", &config.GainPercent, 20, 95},
+		{"confirmations", &config.Confirmations, 2, 10},
+		{"failoverFailures", &config.FailoverFailures, 2, 10},
+		{"recoverySuccesses", &config.RecoverySuccesses, 2, 10},
+	} {
+		if *field.value == 0 {
+			*field.value = field.fallback
+		}
+		if *field.value < 1 || *field.value > field.max {
+			return AutoSwitchConfig{}, fmt.Errorf("autoSwitch.%s must be between 1 and %d", field.name, field.max)
+		}
+	}
+	return config, nil
+}
+
 type AutoStatus struct {
 	Provider string `json:"provider,omitempty"`
 	Node     string `json:"node,omitempty"`
@@ -30,12 +62,13 @@ type autoNode struct {
 	fails   int
 }
 
-func (node autoNode) viable() bool {
-	return node.fails < 2 && (node.passes > 0 || node.latency > 0)
+func (node autoNode) viable(failures int) bool {
+	return node.fails < failures && (node.passes > 0 || node.latency > 0)
 }
 
 type autoState struct {
 	config            *AutoConfig
+	switching         AutoSwitchConfig
 	health            map[string]autoNode
 	unavailable       map[int]bool
 	activeGroup       int
@@ -143,7 +176,7 @@ func (state *autoState) bestNode(group int, recovering bool) string {
 	}
 	for _, name := range state.config.Groups[group].Nodes {
 		node := state.health[name]
-		if !node.viable() || (recovering && node.passes < 2) {
+		if !node.viable(state.switching.FailoverFailures) || (recovering && node.passes < state.switching.RecoverySuccesses) {
 			continue
 		}
 		if best == "" || node.latency < state.health[best].latency {
@@ -154,12 +187,12 @@ func (state *autoState) bestNode(group int, recovering bool) string {
 }
 
 func (state *autoState) apply(results []ProbeResult) {
-	measured := false
+	measured := make(map[string]bool, len(results))
 	for _, result := range results {
 		if result.Inconclusive {
 			continue
 		}
-		measured = true
+		measured[result.Name] = result.Failure == ""
 		node := state.health[result.Name]
 		if result.Failure == "" {
 			if node.latency == 0 {
@@ -167,17 +200,18 @@ func (state *autoState) apply(results []ProbeResult) {
 			} else {
 				node.latency = (node.latency*2 + result.Milliseconds) / 3
 			}
-			node.fails, node.passes = 0, min(node.passes+1, 2)
+			node.fails, node.passes = 0, min(node.passes+1, state.switching.RecoverySuccesses)
 		} else {
-			node.passes, node.fails = 0, min(node.fails+1, 2)
+			node.passes, node.fails = 0, min(node.fails+1, state.switching.FailoverFailures)
 		}
 		state.health[result.Name] = node
 	}
-	if !measured {
+	if len(measured) == 0 {
 		return
 	}
 	defer func() { state.orderedCandidates = state.candidates() }()
-	activeHealthy := state.activeNode != "" && !state.unavailable[state.activeGroup] && state.health[state.activeNode].viable()
+	activeHealthy := state.activeNode != "" && !state.unavailable[state.activeGroup] &&
+		state.health[state.activeNode].viable(state.switching.FailoverFailures)
 	for group := range state.config.Groups {
 		if activeHealthy && group > state.activeGroup {
 			break
@@ -193,15 +227,25 @@ func (state *autoState) apply(results []ProbeResult) {
 		}
 
 		active := state.health[state.activeNode]
-		if best == state.activeNode || active.latency-state.health[best].latency < max(50, active.latency/5) {
+		gain := max(int64(state.switching.GainMS), active.latency*int64(state.switching.GainPercent)/100)
+		if best == state.activeNode || active.latency-state.health[best].latency < gain {
 			state.challenger, state.challengerWins = "", 0
+			return
+		}
+		activeOK, activeMeasured := measured[state.activeNode]
+		bestOK, bestMeasured := measured[best]
+		if (activeMeasured && !activeOK) || (bestMeasured && !bestOK) {
+			state.challenger, state.challengerWins = "", 0
+			return
+		}
+		if !activeOK || !bestOK {
 			return
 		}
 		if state.challenger != best {
 			state.challenger, state.challengerWins = best, 0
 		}
 		state.challengerWins++
-		if state.challengerWins >= 2 {
+		if state.challengerWins >= state.switching.Confirmations {
 			state.activeNode = best
 			state.challenger, state.challengerWins = "", 0
 		}
@@ -231,9 +275,9 @@ func (state *autoState) candidates() []string {
 			rank := func(name string) int64 {
 				node, measured := state.health[name]
 				switch {
-				case node.viable():
+				case node.viable(state.switching.FailoverFailures):
 					return node.latency
-				case !measured || node.fails < 2:
+				case !measured || node.fails < state.switching.FailoverFailures:
 					return 1 << 30
 				default:
 					return 1 << 31

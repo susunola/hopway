@@ -524,6 +524,7 @@ func (s *Supervisor) Close() {
 }
 
 var ErrPortsChanged = errors.New("监听端口已修改")
+var ErrInboundChanged = errors.New("本机入口超时已修改")
 var ErrResourcesChanged = errors.New("连接资源上限已修改")
 
 // Reload re-reads the profile and swaps in a new engine. New connections use
@@ -573,6 +574,10 @@ func (s *Supervisor) reloadLocked(ctx context.Context, expected string) error {
 	running := s.loaded.Merged
 	if loaded.Merged.SOCKSPort != running.SOCKSPort || loaded.Merged.HTTPPort != running.HTTPPort {
 		return ErrPortsChanged
+	}
+	if loaded.Merged.Inbound.HandshakeTimeout() != running.Inbound.HandshakeTimeout() ||
+		loaded.Merged.Inbound.HTTPIdleTimeout() != running.Inbound.HTTPIdleTimeout() {
+		return ErrInboundChanged
 	}
 	if s.budget != nil && !s.budget.Matches(loaded.Merged.Resources) {
 		return ErrResourcesChanged

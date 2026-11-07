@@ -13,12 +13,16 @@ import (
 )
 
 func TestAutoRoutingStaysStableAndFailsOver(t *testing.T) {
+	switching, err := (AutoSwitchConfig{}).effective()
+	if err != nil {
+		t.Fatal(err)
+	}
 	state := autoState{
 		config: &AutoConfig{Region: "HK", Groups: []AutoGroup{
 			{Name: "Primary", Nodes: []string{"first", "second"}},
 			{Name: "Backup", Nodes: []string{"backup"}},
 		}},
-		health: make(map[string]autoNode), activeGroup: -1,
+		switching: switching, health: make(map[string]autoNode), activeGroup: -1,
 	}
 	apply := func(first, second, backup int64) {
 		var results []ProbeResult
@@ -58,6 +62,88 @@ func TestAutoRoutingStaysStableAndFailsOver(t *testing.T) {
 	expect("backup")
 	apply(120, 130, 40)
 	expect("second") // The historical latency average favors the second node.
+}
+
+func TestAutoSwitchSettings(t *testing.T) {
+	config := Default()
+	config.AutoSwitch = AutoSwitchConfig{GainMS: 120, GainPercent: 40, Confirmations: 3, FailoverFailures: 3, RecoverySuccesses: 4}
+	for _, name := range []string{"first", "second", "backup"} {
+		config.Nodes = append(config.Nodes, outbound.Node{Name: name, Type: "socks5", Server: "127.0.0.1:1"})
+	}
+	// The validation engine does not start a probe monitor. This test supplies each round.
+	core, err := New(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	policy := Policy{Mode: "auto", Selected: "DIRECT", Auto: &AutoConfig{
+		Region: "HK", Groups: []AutoGroup{
+			{Name: "Primary", Nodes: []string{"first", "second"}},
+			{Name: "Backup", Nodes: []string{"backup"}},
+		},
+	}}
+	if err := core.SetPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	state := core.auto
+	probe := func(name string, ms int64) ProbeResult {
+		result := ProbeResult{Name: name, Milliseconds: ms}
+		if ms == 0 {
+			result.Failure = "timeout"
+		}
+		return result
+	}
+	round := func(first, second int64) {
+		state.apply([]ProbeResult{probe("first", first), probe("second", second), probe("backup", 35)})
+	}
+	expect := func(node string, wins int) {
+		t.Helper()
+		if state.activeNode != node || state.challengerWins != wins {
+			t.Fatalf("active=%q wins=%d, want %q and %d", state.activeNode, state.challengerWins, node, wins)
+		}
+	}
+	state.apply([]ProbeResult{probe("first", 200)})
+	expect("first", 0)
+	// 110 ms faster clears 40% but falls short of the absolute gate.
+	for range 4 {
+		round(200, 90)
+	}
+	expect("first", 0)
+	if err := core.SetPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	state = core.auto
+	state.apply([]ProbeResult{probe("first", 400)})
+	// 150 ms faster clears the absolute gate but falls short of 40%.
+	for range 4 {
+		round(400, 250)
+	}
+	expect("first", 0)
+	// The better node needs three usable rounds. A missing result is not a win.
+	round(400, 10)
+	expect("first", 1)
+	state.apply([]ProbeResult{probe("first", 400), {Name: "second", Inconclusive: true}, probe("backup", 35)})
+	expect("first", 1)
+	round(400, 0)
+	expect("first", 0)
+	round(400, 10)
+	expect("first", 1)
+	round(400, 10)
+	expect("first", 2)
+	round(400, 10)
+	expect("second", 0)
+	for range 2 {
+		round(0, 0)
+		expect("second", 0)
+	}
+	round(0, 0)
+	expect("backup", 0)
+	for range 3 {
+		round(400, 10)
+		expect("backup", 0)
+	}
+	round(400, 10)
+	expect("second", 0)
 }
 
 func TestAutoDialTriesBackup(t *testing.T) {

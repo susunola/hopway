@@ -329,12 +329,13 @@ func run(path string, port int, check, managed bool) error {
 		return nil
 	}
 	serverErrors := make(chan error, 4)
+	handshake := config.Inbound.HandshakeTimeout()
 	go func() {
-		serverErrors <- serveSOCKS(lifetime, socks, supervisor.Dial, supervisor.DialPacket, config.Resources.UDPIdleTimeout())
+		serverErrors <- serveSOCKS(lifetime, socks, supervisor.Dial, supervisor.DialPacket, handshake, config.Resources.UDPIdleTimeout())
 	}()
 	httpServer := &http.Server{
-		Handler: httpproxy.Handler(supervisor.Dial), ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout: 30 * time.Second, MaxHeaderBytes: 64 << 10,
+		Handler: httpproxy.Handler(supervisor.Dial), ReadHeaderTimeout: handshake,
+		IdleTimeout: config.Inbound.HTTPIdleTimeout(), MaxHeaderBytes: 64 << 10,
 	}
 	go func() { serverErrors <- httpServer.Serve(httpProxy) }()
 	log.Printf("SOCKS5 listening on %s", info.SOCKS)
@@ -362,7 +363,7 @@ func run(path string, port int, check, managed bool) error {
 	}
 }
 
-func serveSOCKS(ctx context.Context, listener *net.TCPListener, dial socks5.DialFunc, dialPacket socks5.DialPacketFunc, idle time.Duration) error {
+func serveSOCKS(ctx context.Context, listener *net.TCPListener, dial socks5.DialFunc, dialPacket socks5.DialPacketFunc, handshake, idle time.Duration) error {
 	var delay time.Duration
 	for {
 		client, err := listener.AcceptTCP()
@@ -385,7 +386,7 @@ func serveSOCKS(ctx context.Context, listener *net.TCPListener, dial socks5.Dial
 		delay = 0
 		go func() {
 			defer client.Close()
-			socks5.HandleWithUDPTimeout(client, dial, dialPacket, idle)
+			socks5.HandleWithTimeouts(client, dial, dialPacket, handshake, idle)
 		}()
 	}
 }
@@ -559,7 +560,7 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	router.HandleFunc("POST /reload", func(writer http.ResponseWriter, request *http.Request) {
 		if err := supervisor.ReloadRevisionContext(request.Context(), request.Header.Get("X-HopWay-Revision")); err != nil {
 			status := http.StatusBadRequest
-			if errors.Is(err, app.ErrPortsChanged) || errors.Is(err, app.ErrResourcesChanged) {
+			if errors.Is(err, app.ErrPortsChanged) || errors.Is(err, app.ErrInboundChanged) || errors.Is(err, app.ErrResourcesChanged) {
 				writer.Header().Set("X-HopWay-Restart-Required", "1")
 				status = http.StatusConflict
 			} else if errors.Is(err, profile.ErrConfigurationChanged) {

@@ -448,8 +448,8 @@ private struct Dashboard: View {
             VStack(alignment: .leading, spacing: 14) {
                 HopPageHeading(title: "设置", detail: "接入方式、监听端口和内核配置。")
                 accessSettings
-                coreSettings
                 AdvancedSettingsPanel(core: core, draft: $advancedDraft) { showsConfigurationEditor = true }
+                coreSettings
             }
             .padding(.bottom, 12)
         }

@@ -5,6 +5,8 @@ struct AdvancedSettingsDraft {
     struct Values: Equatable {
         var socksPort = "1080"
         var httpPort = "8080"
+        var handshakeTimeout = ""
+        var httpIdleTimeout = ""
         var systemProxy = false
         var tunEnabled = false
         var ipv6 = false
@@ -18,6 +20,11 @@ struct AdvancedSettingsDraft {
         var probeTimeout = ""
         var probeConcurrency = ""
         var autoRouteInterval = ""
+        var autoGainMS = ""
+        var autoGainPercent = ""
+        var autoConfirmations = ""
+        var autoFailoverFailures = ""
+        var autoRecoverySuccesses = ""
         var subscriptionRefresh = ""
         var ruleSetRefresh = ""
         var connectionLimit = ""
@@ -41,13 +48,17 @@ struct AdvancedSettingsDraft {
             return nil
         }
         let tun = config["tun"] as? [String: Any] ?? [:]
+        let inbound = config["inbound"] as? [String: Any] ?? [:]
         let health = config["health"] as? [String: Any] ?? [:]
         let performance = config["performance"] as? [String: Any] ?? [:]
+        let autoSwitch = config["autoSwitch"] as? [String: Any] ?? [:]
         let resources = config["resources"] as? [String: Any] ?? [:]
         let history = config["connectionHistory"] as? [String: Any] ?? [:]
         let loaded = Values(
             socksPort: String(config["socksPort"] as? Int ?? 1080),
             httpPort: String(config["httpPort"] as? Int ?? 8080),
+            handshakeTimeout: Self.nonzeroText(inbound["handshakeTimeoutMs"]),
+            httpIdleTimeout: Self.nonzeroText(inbound["httpIdleTimeoutSec"]),
             systemProxy: config["systemProxy"] as? Bool ?? false,
             tunEnabled: tun["enabled"] as? Bool ?? false,
             ipv6: tun["ipv6"] as? Bool ?? false,
@@ -61,6 +72,11 @@ struct AdvancedSettingsDraft {
             probeTimeout: Self.nonzeroText(performance["probeTimeoutMs"]),
             probeConcurrency: Self.nonzeroText(performance["probeConcurrency"]),
             autoRouteInterval: Self.nonzeroText(performance["autoRouteIntervalSec"]),
+            autoGainMS: Self.nonzeroText(autoSwitch["gainMs"]),
+            autoGainPercent: Self.nonzeroText(autoSwitch["gainPercent"]),
+            autoConfirmations: Self.nonzeroText(autoSwitch["confirmations"]),
+            autoFailoverFailures: Self.nonzeroText(autoSwitch["failoverFailures"]),
+            autoRecoverySuccesses: Self.nonzeroText(autoSwitch["recoverySuccesses"]),
             subscriptionRefresh: Self.nonzeroText(config["subscriptionRefreshMin"]),
             ruleSetRefresh: Self.nonzeroText(config["ruleSetRefreshMin"]),
             connectionLimit: Self.nonzeroText(resources["connectionLimit"]),
@@ -95,6 +111,10 @@ struct AdvancedSettingsDraft {
         if values.socksPort != original.socksPort { config["socksPort"] = socks }
         if values.httpPort != original.httpPort { config["httpPort"] = http }
         if values.systemProxy != original.systemProxy { config["systemProxy"] = values.systemProxy ? true : nil }
+        try updateNumbers(in: &config, section: "inbound", fields: [
+            ("handshakeTimeoutMs", \.handshakeTimeout, "本机入口握手时限", 250...60000),
+            ("httpIdleTimeoutSec", \.httpIdleTimeout, "HTTP 请求间空闲时间", 1...300)
+        ])
 
         let tunChanged = values.tunEnabled != original.tunEnabled || values.ipv6 != original.ipv6 || values.mtu != original.mtu
         if tunChanged {
@@ -137,19 +157,13 @@ struct AdvancedSettingsDraft {
             config["ruleSetRefreshMin"] = minutes == 0 ? nil : minutes
         }
 
-        var resources = config["resources"] as? [String: Any] ?? [:]
-        let resourceFields: [(key: String, value: KeyPath<Values, String>, label: String, range: ClosedRange<Int>)] = [
+        try updateNumbers(in: &config, section: "resources", fields: [
             ("connectionLimit", \.connectionLimit, "代理连接总上限", 16...4096),
             ("udpSessionLimit", \.udpSessionLimit, "UDP 会话上限", 32...1024),
             ("udpOpenLimit", \.udpOpenLimit, "UDP 并发建连上限", 1...64),
             ("endpointDialLimit", \.endpointDialLimit, "每端点拨号并发", 4...64),
             ("udpIdleTimeoutSec", \.udpIdleTimeout, "UDP 空闲回收时间", 15...1800)
-        ]
-        for field in resourceFields where values[keyPath: field.value] != original[keyPath: field.value] {
-            let limit = try number(values[keyPath: field.value], in: field.range, label: field.label, blank: 0)
-            resources[field.key] = limit == 0 ? nil : limit
-        }
-        config["resources"] = resources.isEmpty ? nil : resources
+        ])
 
         var history = config["connectionHistory"] as? [String: Any] ?? [:]
         if values.connectionHistory != original.connectionHistory {
@@ -165,24 +179,26 @@ struct AdvancedSettingsDraft {
         }
         config["connectionHistory"] = history.isEmpty ? nil : history
 
-        var performance = config["performance"] as? [String: Any] ?? [:]
-        let fields: [(key: String, value: KeyPath<Values, String>, label: String, range: ClosedRange<Int>)] = [
+        try updateNumbers(in: &config, section: "performance", fields: [
             ("dialTimeoutMs", \.dialTimeout, "拨号总时限", 250...30000),
             ("failoverTimeoutMs", \.failoverTimeout, "切换前等待上限", 100...29999),
             ("probeTimeoutMs", \.probeTimeout, "单节点测速时限", 1000...12000),
             ("probeConcurrency", \.probeConcurrency, "每批测速并发", 1...8),
             ("autoRouteIntervalSec", \.autoRouteInterval, "自动选路复测间隔", 15...3600),
             ("tcpIdleTimeoutSec", \.tcpIdleTimeout, "TCP 隧道空闲回收时间", 15...86400)
-        ]
-        for field in fields where values[keyPath: field.value] != original[keyPath: field.value] {
-            let value = try number(values[keyPath: field.value], in: field.range, label: field.label, blank: 0)
-            performance[field.key] = value == 0 ? nil : value
-        }
+        ])
+        let performance = config["performance"] as? [String: Any] ?? [:]
         let configuredDial = performance["dialTimeoutMs"] as? Int ?? 0
         if let failover = performance["failoverTimeoutMs"] as? Int, failover >= (configuredDial == 0 ? 10000 : configuredDial) {
             throw CoreError(message: "切换前等待上限须小于拨号总时限。")
         }
-        config["performance"] = performance.isEmpty ? nil : performance
+        try updateNumbers(in: &config, section: "autoSwitch", fields: [
+            ("gainMs", \.autoGainMS, "最少快多少毫秒", 1...2000),
+            ("gainPercent", \.autoGainPercent, "最少快百分之多少", 1...95),
+            ("confirmations", \.autoConfirmations, "优势确认轮数", 1...10),
+            ("failoverFailures", \.autoFailoverFailures, "故障确认轮数", 1...10),
+            ("recoverySuccesses", \.autoRecoverySuccesses, "恢复确认轮数", 1...10)
+        ])
 
         var notes: [String] = []
         if values.systemProxy != original.systemProxy || values.tunEnabled != original.tunEnabled {
@@ -193,6 +209,18 @@ struct AdvancedSettingsDraft {
         }
         let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         return (String(decoding: data, as: UTF8.self), notes.isEmpty ? nil : notes.joined())
+    }
+
+    private func updateNumbers(in config: inout [String: Any], section: String,
+                               fields: [(key: String, value: KeyPath<Values, String>, label: String, range: ClosedRange<Int>)]) throws {
+        let edits = fields.filter { values[keyPath: $0.value] != original[keyPath: $0.value] }
+        guard !edits.isEmpty else { return }
+        var object = config[section] as? [String: Any] ?? [:]
+        for field in edits {
+            let value = try number(values[keyPath: field.value], in: field.range, label: field.label, blank: 0)
+            object[field.key] = value == 0 ? nil : value
+        }
+        config[section] = object.isEmpty ? nil : object
     }
 
     private func number(_ text: String, in range: ClosedRange<Int>, label: String, blank: Int) throws -> Int {
@@ -220,6 +248,7 @@ struct AdvancedSettingsPanel: View {
         case access = "接入与端口"
         case performance = "连接性能"
         case probes = "测速与选路"
+        case switching = "自动切换"
         case data = "刷新与记录"
     }
 
@@ -290,6 +319,7 @@ struct AdvancedSettingsPanel: View {
         case .access: accessControls(values)
         case .performance: performanceControls(values)
         case .probes: probeControls(values)
+        case .switching: switchingControls(values)
         case .data: dataControls(values)
         }
     }
@@ -372,21 +402,53 @@ struct AdvancedSettingsPanel: View {
         }
     }
 
+    private func switchingControls(_ values: Binding<AdvancedSettingsDraft.Values>) -> some View {
+        VStack(alignment: .leading, spacing: 13) {
+            section("同服务商优选", icon: "point.3.connected.trianglepath.dotted") {
+                fieldRow {
+                    field("最少快多少毫秒（1–2000）", text: values.autoGainMS, prompt: "50")
+                    field("最少快百分之多少（1–95）", text: values.autoGainPercent, prompt: "20")
+                    field("优势确认轮数（1–10）", text: values.autoConfirmations, prompt: "2")
+                }
+                hint("备用节点的平滑延迟须同时达到两个改善门槛，并连续通过指定轮数，才切换新连接。")
+            }
+            Divider()
+            section("故障切换与回切", icon: "arrow.triangle.branch") {
+                fieldRow {
+                    field("故障确认轮数（1–10）", text: values.autoFailoverFailures, prompt: "2")
+                    field("恢复确认轮数（1–10）", text: values.autoRecoverySuccesses, prompt: "2")
+                }
+                hint("连续测速失败达到门槛后换线。高优先级服务商恢复时，须连续测速成功才从仍健康的备用服务商切回。")
+                hint("适用于地区自动选路。保存后可热加载，已建立的连接继续使用原出站。")
+            }
+        }
+    }
+
     private func accessControls(_ values: Binding<AdvancedSettingsDraft.Values>) -> some View {
-        section("本机端口与 TUN", icon: "network") {
-            fieldRow {
-                field("SOCKS5 端口", text: values.socksPort, prompt: "1080")
-                field("HTTP 端口", text: values.httpPort, prompt: "8080")
+        VStack(alignment: .leading, spacing: 13) {
+            section("本机监听", icon: "network") {
+                fieldRow {
+                    field("SOCKS5 端口", text: values.socksPort, prompt: "1080")
+                    field("HTTP 端口", text: values.httpPort, prompt: "8080")
+                }
+                hint("端口填 0 自动分配。")
+                fieldRow {
+                    field("入口握手时限（毫秒，250–60000）", text: values.handshakeTimeout, prompt: "10000")
+                    field("HTTP 请求间空闲（秒，1–300）", text: values.httpIdleTimeout, prompt: "30")
+                }
+                hint("握手时限适用于 SOCKS5 协商和 HTTP 请求头。空闲时限用于 HTTP 复用连接等待下一次请求。端口和超时在重启代理后生效。")
             }
-            hint("端口填 0 自动分配。修改后重启代理生效。")
-            fieldRow {
-                Toggle("启动时接管系统代理", isOn: values.systemProxy)
-                Toggle("启动时开启 TUN", isOn: values.tunEnabled)
-                Toggle("TUN 接管 IPv6", isOn: values.ipv6)
+            Divider()
+            section("启动与 TUN", icon: "bolt.shield") {
+                fieldRow {
+                    Toggle("启动时接管系统代理", isOn: values.systemProxy)
+                    Toggle("启动时开启 TUN", isOn: values.tunEnabled)
+                    Toggle("TUN 接管 IPv6", isOn: values.ipv6)
+                }
+                field("TUN MTU", text: values.mtu, prompt: "9000")
+                    .frame(maxWidth: 190)
+                hint("重新开启 TUN 后应用 MTU 和 IPv6。自定义 MTU 需要新版 TUN 助手。")
             }
-            field("TUN MTU", text: values.mtu, prompt: "9000")
-                .frame(maxWidth: 190)
-            hint("重新开启 TUN 后应用 MTU 和 IPv6。自定义 MTU 需要新版 TUN 助手。")
         }
     }
 
