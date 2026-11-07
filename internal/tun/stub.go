@@ -15,6 +15,7 @@ type Service struct{}
 func Start(Options, Dial, DialPacket) (*Service, error) { return nil, errUnsupported }
 func (*Service) Close() error                           { return nil }
 func (*Service) ResetNetwork()                          {}
+func (*Service) FakeIPStats() FakeIPStats               { return FakeIPStats{} }
 func RunHelper(string, Options) error                   { return errUnsupported }
 func OpenWithHelper(context.Context, string, Options) (int, string, error) {
 	return 0, "", errUnsupported

@@ -3,9 +3,12 @@ package tun
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
+	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,33 +31,94 @@ func answerDNS(ctx context.Context, payload []byte, fake *FakeIP, forward func(c
 		return forward(ctx, payload)
 	}
 	question := query.Question[0]
+	if question.Qclass != dns.ClassINET {
+		return forward(ctx, payload)
+	}
+	reply := new(dns.Msg).SetReply(&query)
+	reply.RecursionAvailable = true
 	switch question.Qtype {
+	case dns.TypePTR:
+		address := reverseDNSAddress(question.Name)
+		if !fake.Contains(address) {
+			return forward(ctx, payload)
+		}
+		name, found := fake.Lookup(address)
+		if !found {
+			reply.Rcode = dns.RcodeNameError
+		} else {
+			reply.Answer = []dns.RR{&dns.PTR{
+				Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 1},
+				Ptr: dns.Fqdn(name),
+			}}
+		}
 	case dns.TypeA, dns.TypeAAAA:
+		if isLocalName(question.Name) {
+			return forward(ctx, payload)
+		}
+		name := strings.TrimSuffix(question.Name, ".")
+		if _, err := netip.ParseAddr(name); err == nil || name == "" || strings.ContainsAny(name, "/\\: *") {
+			reply.Rcode = dns.RcodeNameError
+			return reply.Pack()
+		}
+		if question.Qtype == dns.TypeA {
+			if addr := fake.Allocate(name); addr.IsValid() {
+				reply.Answer = []dns.RR{&dns.A{
+					Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 1},
+					A:   net.IP(addr.AsSlice()),
+				}}
+			} else {
+				reply.Rcode = dns.RcodeServerFailure
+			}
+		} else if fake.hasIPv6() {
+			if addr := fake.Allocate6(name); addr.IsValid() {
+				reply.Answer = []dns.RR{&dns.AAAA{
+					Hdr:  dns.RR_Header{Name: question.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 1},
+					AAAA: net.IP(addr.AsSlice()),
+				}}
+			} else {
+				reply.Rcode = dns.RcodeServerFailure
+			}
+		}
 	default:
 		return forward(ctx, payload)
 	}
-	if question.Qclass != dns.ClassINET || dns.IsFqdn(question.Name) && isLocalName(question.Name) {
-		return forward(ctx, payload)
-	}
-	reply := new(dns.Msg)
-	reply.SetReply(&query)
-	reply.RecursionAvailable = true
-	switch question.Qtype {
-	case dns.TypeA:
-		addr := fake.Allocate(question.Name)
-		reply.Answer = []dns.RR{&dns.A{
-			Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 1},
-			A:   net.IP(addr.AsSlice()),
-		}}
-	case dns.TypeAAAA:
-		if addr := fake.Allocate6(question.Name); addr.IsValid() {
-			reply.Answer = []dns.RR{&dns.AAAA{
-				Hdr:  dns.RR_Header{Name: question.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 1},
-				AAAA: net.IP(addr.AsSlice()),
-			}}
+	return reply.Pack()
+}
+
+func reverseDNSAddress(name string) netip.Addr {
+	name = strings.ToLower(name)
+	if suffix, ok := strings.CutSuffix(name, ".in-addr.arpa."); ok {
+		parts := strings.Split(suffix, ".")
+		if len(parts) == 4 {
+			slices.Reverse(parts)
+			address, _ := netip.ParseAddr(strings.Join(parts, "."))
+			return address
 		}
 	}
-	return reply.Pack()
+	if suffix, ok := strings.CutSuffix(name, ".ip6.arpa."); ok && len(suffix) == 63 {
+		var encoded [32]byte
+		for i := range encoded {
+			encoded[31-i] = suffix[2*i]
+			if i < 31 && suffix[2*i+1] != '.' {
+				return netip.Addr{}
+			}
+		}
+		var raw [16]byte
+		if _, err := hex.Decode(raw[:], encoded[:]); err == nil {
+			return netip.AddrFrom16(raw).Unmap()
+		}
+	}
+	return netip.Addr{}
+}
+
+func isLocalReverseDNS(payload []byte) bool {
+	var query dns.Msg
+	if err := query.Unpack(payload); err != nil || query.Opcode != dns.OpcodeQuery ||
+		len(query.Question) != 1 || query.Question[0].Qtype != dns.TypePTR || query.Question[0].Qclass != dns.ClassINET {
+		return false
+	}
+	addr := reverseDNSAddress(query.Question[0].Name)
+	return addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsUnspecified()
 }
 
 // isLocalName keeps mDNS and private names on the real resolver.

@@ -43,7 +43,7 @@ func TestSniffTLSAndHTTP(t *testing.T) {
 }
 
 func TestFakeIPAndDNS(t *testing.T) {
-	fake := NewFakeIP(netip.MustParsePrefix("198.18.0.0/29")) // 8 addresses: wraps quickly
+	fake := NewFakeIP(netip.MustParsePrefix("198.18.0.0/29")) // five usable addresses
 	a := fake.Allocate("a.test.")
 	if a != fake.Allocate("A.test") {
 		t.Fatal("same name must keep its address")
@@ -83,20 +83,6 @@ func TestFakeIPAndDNS(t *testing.T) {
 	answerDNS(context.Background(), payload, fake, func(context.Context, []byte) ([]byte, error) { forwarded = true; return nil, nil })
 	if !forwarded {
 		t.Fatal(".local names must go to the real resolver")
-	}
-}
-
-func TestFakeIPWraps(t *testing.T) {
-	fake := NewFakeIP(netip.MustParsePrefix("198.18.0.0/29"))
-	first := fake.Allocate("first.test")
-	for i := 0; i < 5; i++ {
-		fake.Allocate(string(rune('a'+i)) + ".test")
-	}
-	if name, _ := fake.Lookup(first); name == "first.test" {
-		t.Fatal("oldest mapping must be replaced after wrapping")
-	}
-	if name, ok := fake.Lookup(fake.Allocate("first.test")); !ok || name != "first.test" {
-		t.Fatal("re-allocation after wrap")
 	}
 }
 

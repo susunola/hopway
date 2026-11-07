@@ -45,12 +45,13 @@ type SystemProxyStatus struct {
 }
 
 type TUNStatus struct {
-	Supported bool   `json:"supported"`
-	Enabled   bool   `json:"enabled"`
-	Service   bool   `json:"service"` // the password-free service is installed and answering
-	Device    string `json:"device,omitempty"`
-	Error     string `json:"error,omitempty"`
-	Operation string `json:"operation,omitempty"`
+	Supported bool             `json:"supported"`
+	Enabled   bool             `json:"enabled"`
+	Service   bool             `json:"service"` // the password-free service is installed and answering
+	Device    string           `json:"device,omitempty"`
+	Error     string           `json:"error,omitempty"`
+	Operation string           `json:"operation,omitempty"`
+	FakeIP    *tun.FakeIPStats `json:"fakeIP,omitempty"`
 }
 
 type Status struct {
@@ -286,8 +287,12 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 	if t != nil {
 		options.MTU, options.IPv6 = t.MTU, t.IPv6
 	}
+	if err := options.CheckFakeIPNetworks(); err != nil {
+		return err
+	}
 	// Read the real DNS servers before the system DNS is pointed at the device.
-	options.UpstreamDNS = tun.SystemDNS(options.DNSAddress())
+	options.LocalDNS = tun.SystemDNS(options.DNSAddress())
+	options.UpstreamDNS = options.LocalDNS
 	if len(options.UpstreamDNS) == 0 {
 		options.UpstreamDNS = []string{"223.5.5.5:53", "1.1.1.1:53"}
 	}
@@ -543,6 +548,10 @@ func (s *Supervisor) Status() Status {
 	status.Network = append([]netmon.Event(nil), s.events...)
 	status.TUN = TUNStatus{Supported: TUNSupported, Enabled: s.tunDevice != nil, Device: s.tunName, Error: s.tunErr,
 		Service: runtime.GOOS == "darwin" && serviceInstalled(), Operation: s.tunOperation}
+	if s.tunDevice != nil {
+		fakeIP := s.tunDevice.FakeIPStats()
+		status.TUN.FakeIP = &fakeIP
+	}
 	status.Reloaded = s.started.UnixMilli()
 	for _, sub := range s.loaded.User.Subscriptions {
 		entry := s.subMeta[sub.URL]

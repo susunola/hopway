@@ -114,6 +114,19 @@ struct ProxyStatus: Decodable {
         let recovered: Bool?
     }
 
+    struct FakeIPPool: Decodable {
+        let capacity: Int
+        let mapped: Int
+        let pinned: Int
+        let reclaimed: UInt64
+        let refused: UInt64
+    }
+
+    struct FakeIP: Decodable {
+        let ipv4: FakeIPPool
+        let ipv6: FakeIPPool?
+    }
+
     struct TUN: Decodable {
         let supported: Bool
         let enabled: Bool
@@ -121,6 +134,7 @@ struct ProxyStatus: Decodable {
         let device: String?
         let error: String?
         let operation: String?
+        let fakeIP: FakeIP?
     }
 
     struct PolicyGroup: Decodable, Identifiable {

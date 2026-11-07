@@ -17,6 +17,7 @@ type Options struct {
 	RouteAddress []netip.Prefix // limits auto-route to these ranges (default: everything)
 	FakeRange    netip.Prefix
 	UpstreamDNS  []string // host:port servers for HopWay's own lookups and forwarded queries
+	LocalDNS     []string // system resolvers, before adding public fallback servers
 	IPv6         bool     // give the device an IPv6 address, route ::/0 and answer AAAA with fake IPv6
 }
 

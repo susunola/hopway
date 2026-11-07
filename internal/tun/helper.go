@@ -46,6 +46,9 @@ func CreateDevice(options Options) (int, string, error) {
 		return 0, "", err
 	}
 	options.defaults()
+	if err := options.CheckFakeIPNetworks(); err != nil {
+		return 0, "", err
+	}
 	finder := control.NewDefaultInterfaceFinder()
 	network, err := stun.NewNetworkUpdateMonitor(logger.NOP())
 	if err != nil {

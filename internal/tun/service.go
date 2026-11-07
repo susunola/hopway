@@ -64,10 +64,15 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 	if err := wire.ValidateTUNMTU(options.MTU, options.IPv6); err != nil {
 		return nil, err
 	}
+	var existingInterface string
 	if fd > 0 {
 		if err := verifyDevice(fd, options.Name); err != nil {
 			return nil, fmt.Errorf("invalid device from TUN helper: %w", err)
 		}
+		existingInterface = options.Name
+	}
+	if err := options.checkFakeIPNetworks(existingInterface); err != nil {
+		return nil, err
 	}
 	s := &Service{options: options, fake: NewFakeIP(options.FakeRange), dial: dial, dialPacket: dialPacket}
 	if options.IPv6 {
@@ -202,10 +207,17 @@ func (s *Service) replyDNS(ctx context.Context, payload []byte, destination M.So
 		}
 	}
 	reply, err := answerDNS(ctx, payload, s.fake, func(ctx context.Context, query []byte) ([]byte, error) {
-		if server == "" {
+		upstream := server
+		if isLocalReverseDNS(query) {
+			if len(s.options.LocalDNS) == 0 {
+				return nil, errors.New("no local DNS server for reverse lookup")
+			}
+			upstream = s.options.LocalDNS[0]
+		}
+		if upstream == "" {
 			return nil, errors.New("no upstream DNS server")
 		}
-		return forwardDNS(ctx, query, server, backend.BoundDial)
+		return forwardDNS(ctx, query, upstream, backend.BoundDial)
 	})
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -279,15 +291,22 @@ func (s *Service) serveDNSTCP(ctx context.Context, conn net.Conn, destination M.
 	}
 }
 
-// target turns a destination into what the engine routes on: the name
-// behind a fake IP, or the address itself.
-func (s *Service) target(destination M.Socksaddr) string {
+var errUnknownFakeIP = errors.New("unknown or expired fake address")
+
+// routeTarget holds the mapping for the lifetime of a captured flow.
+func (s *Service) routeTarget(destination M.Socksaddr) (string, func(), error) {
 	if destination.IsIP() && s.fake.Contains(destination.Addr) {
-		if name, ok := s.fake.Lookup(destination.Addr); ok {
-			return net.JoinHostPort(name, strconv.Itoa(int(destination.Port)))
+		name, release := s.fake.acquire(destination.Addr)
+		if release == nil {
+			return "", nil, errUnknownFakeIP
 		}
+		return net.JoinHostPort(name, strconv.Itoa(int(destination.Port))), release, nil
 	}
-	return destination.String()
+	return destination.String(), nil, nil
+}
+
+func (s *Service) FakeIPStats() FakeIPStats {
+	return s.fake.Stats()
 }
 
 // done calls onClose, which the stack may leave nil.
@@ -304,15 +323,17 @@ func (s *Service) NewConnectionEx(ctx context.Context, conn net.Conn, source, de
 		done(onClose, err)
 		return
 	}
-	target := s.target(destination)
-	if destination.IsIP() && s.fake.Contains(destination.Addr) && target == destination.String() {
-		// A fake address we no longer know: the mapping wrapped around.
+	target, release, err := s.routeTarget(destination)
+	if err != nil {
 		conn.Close()
-		done(onClose, errors.New("unknown fake address"))
+		done(onClose, err)
 		return
 	}
+	if release != nil {
+		defer release()
+	}
 	var reader *bufio.Reader
-	if destination.IsIP() && !s.fake.Contains(destination.Addr) {
+	if destination.IsIP() && release == nil {
 		// An application that connects to an IP directly may still say
 		// which site it wants in its TLS ClientHello or HTTP Host header.
 		name, replay := sniff(conn)
@@ -344,12 +365,15 @@ func (s *Service) NewConnectionEx(ctx context.Context, conn net.Conn, source, de
 // DIRECT, or a node that carries UDP. If the route cannot carry UDP the
 // flow is dropped, and QUIC applications fall back to TCP.
 func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	target := s.target(destination)
-	if destination.IsIP() && s.fake.Contains(destination.Addr) && target == destination.String() {
+	target, release, err := s.routeTarget(destination)
+	if err != nil {
 		wire.TUNUDPDrops.Add(wire.UDPInvalid, 1)
 		conn.Close()
-		done(onClose, errors.New("unknown fake address"))
+		done(onClose, err)
 		return
+	}
+	if release != nil {
+		defer release()
 	}
 	ctx = peer.WithAddrs(ctx, peer.Addrs{Client: source.AddrPort(), Server: destination.AddrPort(), Local: true})
 	remote, err := s.dialPacket(ctx, "TUN", target)

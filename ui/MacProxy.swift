@@ -484,6 +484,15 @@ private struct Dashboard: View {
                             Text("设备 " + device).font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                    if let pools = status.tun?.fakeIP {
+                        HStack(spacing: 12) {
+                            Text("虚拟地址池")
+                            fakePoolSummary(pools.ipv4, family: "IPv4")
+                            if let ipv6 = pools.ipv6 { fakePoolSummary(ipv6, family: "IPv6") }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
                     if let error = status.systemProxy?.error {
                         Label("系统代理 · " + error, systemImage: "exclamationmark.circle")
                             .font(.callout).foregroundStyle(.orange)
@@ -501,6 +510,12 @@ private struct Dashboard: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .hopPanel()
+    }
+
+    private func fakePoolSummary(_ pool: ProxyStatus.FakeIPPool, family: String) -> some View {
+        Text("\(family) \(pool.mapped.formatted()) / \(pool.capacity.formatted())")
+            .monospacedDigit()
+            .help("使用中 \(pool.pinned.formatted()) · 已回收 \(pool.reclaimed.formatted()) · 累计暂缓分配 \(pool.refused.formatted())")
     }
 
     private var coreSettings: some View {
