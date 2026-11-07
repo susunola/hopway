@@ -99,3 +99,34 @@ func TestFakeIPWraps(t *testing.T) {
 		t.Fatal("re-allocation after wrap")
 	}
 }
+
+func TestFakeIPv6(t *testing.T) {
+	fake := NewFakeIP(DefaultFakeRange)
+	if fake.Allocate6("a.test").IsValid() {
+		t.Fatal("no IPv6 pool configured")
+	}
+	fake.EnableIPv6(DefaultFakeRange6)
+	a := fake.Allocate6("a.test")
+	if !DefaultFakeRange6.Contains(a) || !fake.Contains(a) || a != fake.Allocate6("A.test.") {
+		t.Fatalf("allocation %v", a)
+	}
+	if name, ok := fake.Lookup(a); !ok || name != "a.test" {
+		t.Fatal("lookup")
+	}
+	if v4 := fake.Allocate("a.test"); !v4.Is4() || v4 == a {
+		t.Fatal("v4 and v6 pools are separate")
+	}
+	query := new(dns.Msg)
+	query.SetQuestion("six.test.", dns.TypeAAAA)
+	payload, _ := query.Pack()
+	reply, _ := answerDNS(context.Background(), payload, fake, nil)
+	var msg dns.Msg
+	msg.Unpack(reply)
+	if len(msg.Answer) != 1 {
+		t.Fatalf("AAAA answer %v", msg.Answer)
+	}
+	addr, _ := netip.AddrFromSlice(msg.Answer[0].(*dns.AAAA).AAAA)
+	if name, _ := fake.Lookup(addr); name != "six.test" {
+		t.Fatalf("AAAA maps to %q", name)
+	}
+}

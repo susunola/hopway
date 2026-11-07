@@ -47,6 +47,7 @@ type Config struct {
 type TUNConfig struct {
 	Enabled bool   `json:"enabled"`
 	MTU     uint32 `json:"mtu,omitempty"`
+	IPv6    bool   `json:"ipv6,omitempty"` // capture IPv6 too (fake IPv6 answers, ::/0 route)
 }
 
 // Subscription is a remote node list refreshed in the background.

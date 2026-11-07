@@ -45,9 +45,10 @@ func main() {
 	managed := flag.Bool("managed", false, "start the local control API and exit when stdin closes")
 	importInput := flag.Bool("import", false, "read a subscription URL or profile from stdin and print converted JSON")
 	tunHelper := flag.String("tun-helper", "", "internal: create the TUN device as root and hand it to the core over this socket")
+	tunIPv6 := flag.Bool("tun-ipv6", false, "internal: give the helper's TUN device an IPv6 address and route")
 	flag.Parse()
 	if *tunHelper != "" {
-		if err := tun.RunHelper(*tunHelper, tun.Options{}); err != nil {
+		if err := tun.RunHelper(*tunHelper, tun.Options{IPv6: *tunIPv6}); err != nil {
 			log.SetFlags(0)
 			log.Fatal(err)
 		}

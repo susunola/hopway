@@ -45,6 +45,9 @@ type Service struct {
 func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) {
 	options.defaults()
 	s := &Service{options: options, fake: NewFakeIP(options.FakeRange), dial: dial, dialPacket: dialPacket}
+	if options.IPv6 {
+		s.fake.EnableIPv6(DefaultFakeRange6)
+	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	finder := control.NewDefaultInterfaceFinder()
 	var err error
@@ -73,6 +76,9 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 		Name: options.Name, Inet4Address: []netip.Prefix{options.Address}, MTU: options.MTU,
 		AutoRoute: options.AutoRoute, Inet4RouteAddress: options.RouteAddress, FileDescriptor: options.FD,
 		InterfaceMonitor: s.monitor, InterfaceFinder: finder,
+	}
+	if options.IPv6 {
+		tunOptions.Inet6Address = []netip.Prefix{defaultAddress6}
 	}
 	if tunOptions.Name == "" && options.FD == 0 {
 		tunOptions.Name = stun.CalculateInterfaceName("")
@@ -145,7 +151,7 @@ func (s *Service) NewDNSPacket(payload []byte, source, destination M.Socksaddr, 
 		server := destination.String()
 		// Queries addressed to the tunnel itself (the system DNS points
 		// here in TUN mode) are forwarded to the real upstream.
-		if destination.IsIP() && (s.options.Address.Contains(destination.Addr) || s.fake.Contains(destination.Addr)) {
+		if destination.IsIP() && (s.options.Address.Contains(destination.Addr) || defaultAddress6.Contains(destination.Addr) || s.fake.Contains(destination.Addr)) {
 			server = ""
 			if upstreams := backend.UpstreamDNS(); len(upstreams) != 0 {
 				server = upstreams[0]
