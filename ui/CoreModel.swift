@@ -34,7 +34,7 @@ enum DialDiagnostic {
                       "handshake": "TLS / 协议握手", "upstream": "目标服务",
                       "client-read": "读取客户端", "client-write": "写入客户端",
                       "upstream-read": "读取出站", "upstream-write": "写入出站",
-                      "client-transfer": "上传转发", "upstream-transfer": "下载转发"]
+                      "client-transfer": "上传转发", "upstream-transfer": "下载转发", "idle": "空闲回收"]
         return labels[key] ?? key
     }
 
@@ -48,6 +48,7 @@ enum DialDiagnostic {
             "proxy-auth": "上游代理认证失败", "endpoint-cooldown": "出站端点冷却中",
             "endpoint-busy": "出站拨号槽已满", "connection-refused": "服务器拒绝连接",
             "fd-exhausted": "本机文件描述符额度用尽",
+            "tcp-idle-timeout": "隧道达到空闲回收时限",
             "target-refused": "目标服务拒绝连接", "timeout": "连接超时",
             "connection-reset": "连接被对端重置", "broken-pipe": "连接已断开",
             "unreachable": "网络或主机不可达", "canceled": "已取消"

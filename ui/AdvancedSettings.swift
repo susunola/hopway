@@ -25,6 +25,7 @@ struct AdvancedSettingsDraft {
         var udpOpenLimit = ""
         var endpointDialLimit = ""
         var udpIdleTimeout = ""
+        var tcpIdleTimeout = ""
         var connectionHistory = true
         var historyLimit = ""
         var historyRetention = ""
@@ -67,6 +68,7 @@ struct AdvancedSettingsDraft {
             udpOpenLimit: Self.nonzeroText(resources["udpOpenLimit"]),
             endpointDialLimit: Self.nonzeroText(resources["endpointDialLimit"]),
             udpIdleTimeout: Self.nonzeroText(resources["udpIdleTimeoutSec"]),
+            tcpIdleTimeout: Self.nonzeroText(performance["tcpIdleTimeoutSec"]),
             connectionHistory: history["disabled"] as? Bool != true,
             historyLimit: Self.nonzeroText(history["limit"]),
             historyRetention: Self.nonzeroText(history["retentionMin"])
@@ -169,7 +171,8 @@ struct AdvancedSettingsDraft {
             ("failoverTimeoutMs", \.failoverTimeout, "切换前等待上限", 100...29999),
             ("probeTimeoutMs", \.probeTimeout, "单节点测速时限", 1000...12000),
             ("probeConcurrency", \.probeConcurrency, "每批测速并发", 1...8),
-            ("autoRouteIntervalSec", \.autoRouteInterval, "自动选路复测间隔", 15...3600)
+            ("autoRouteIntervalSec", \.autoRouteInterval, "自动选路复测间隔", 15...3600),
+            ("tcpIdleTimeoutSec", \.tcpIdleTimeout, "TCP 隧道空闲回收时间", 15...86400)
         ]
         for field in fields where values[keyPath: field.value] != original[keyPath: field.value] {
             let value = try number(values[keyPath: field.value], in: field.range, label: field.label, blank: 0)
@@ -300,6 +303,8 @@ struct AdvancedSettingsPanel: View {
                     field("出站尝试上限", text: values.maxDialAttempts, prompt: "3")
                 }
                 hint("总时限适用于 TCP 和 UDP 建连。TCP 有备用出站时，前序尝试单独计时，留空最多用总时限的一半。尝试次数包含首次拨号。")
+                field("TCP 隧道空闲回收（秒，15–86400）", text: values.tcpIdleTimeout, prompt: "留空关闭")
+                hint("适用于 SOCKS5、HTTP CONNECT 和 TUN。任一方向传输数据都会重新计时，保存后对新建隧道生效。")
             }
             Divider()
             section("连接资源上限", icon: "gauge.with.dots.needle.33percent") {

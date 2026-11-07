@@ -6,13 +6,14 @@ import (
 	"time"
 )
 
-// PerformanceConfig tunes opening and health checks. Zero uses HopWay's defaults.
+// PerformanceConfig tunes dialing, tunnels and health checks. Zero uses defaults.
 type PerformanceConfig struct {
 	DialTimeoutMS        int `json:"dialTimeoutMs,omitempty"`
 	FailoverTimeoutMS    int `json:"failoverTimeoutMs,omitempty"`
 	ProbeTimeoutMS       int `json:"probeTimeoutMs,omitempty"`
 	ProbeConcurrency     int `json:"probeConcurrency,omitempty"`
 	AutoRouteIntervalSec int `json:"autoRouteIntervalSec,omitempty"`
+	TCPIdleTimeoutSec    int `json:"tcpIdleTimeoutSec,omitempty"`
 }
 
 type performanceLimits struct {
@@ -21,6 +22,7 @@ type performanceLimits struct {
 	probeTimeout      time.Duration
 	probeConcurrency  int
 	autoRouteInterval time.Duration
+	tcpIdleTimeout    time.Duration
 }
 
 func (config PerformanceConfig) limits() (performanceLimits, error) {
@@ -33,6 +35,7 @@ func (config PerformanceConfig) limits() (performanceLimits, error) {
 		{"probeTimeoutMs", config.ProbeTimeoutMS, 1000, 12000},
 		{"probeConcurrency", config.ProbeConcurrency, 1, probeParallel},
 		{"autoRouteIntervalSec", config.AutoRouteIntervalSec, 15, 3600},
+		{"tcpIdleTimeoutSec", config.TCPIdleTimeoutSec, 15, 86400},
 	} {
 		if field.value != 0 && (field.value < field.low || field.value > field.high) {
 			return performanceLimits{}, fmt.Errorf("performance.%s must be between %d and %d", field.name, field.low, field.high)
@@ -60,5 +63,5 @@ func (config PerformanceConfig) limits() (performanceLimits, error) {
 	if interval == 0 {
 		interval = time.Minute
 	}
-	return performanceLimits{dial, failover, probe, parallel, interval}, nil
+	return performanceLimits{dial, failover, probe, parallel, interval, time.Duration(config.TCPIdleTimeoutSec) * time.Second}, nil
 }

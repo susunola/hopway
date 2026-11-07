@@ -1256,6 +1256,10 @@ func (conn *tracked) CloseWrite() error {
 	return wire.CloseWrite(conn.Conn)
 }
 
+func (conn *tracked) RelayIdleTimeout() time.Duration {
+	return conn.engine.performance.tcpIdleTimeout
+}
+
 func (conn *tracked) RecordRelayError(failure *wire.RelayError) {
 	if !errors.Is(failure.Err, net.ErrClosed) {
 		conn.relayErr.CompareAndSwap(nil, failure)
@@ -1274,9 +1278,13 @@ func (conn *tracked) Close() error {
 		// Protocols such as VLESS and Trojan finish their handshake lazily: a
 		// bad credential shows up as the server hanging up before any reply.
 		if failure := conn.relayErr.Load(); failure != nil {
-			record.State = "failed"
-			record.Stage = failure.Endpoint + "-" + failure.Operation
-			record.setFailure(diagnoseDial(failure.Err, record.Stage))
+			if errors.Is(failure.Err, wire.ErrRelayIdle) {
+				record.Stage, record.FailureCode, record.Error = "idle", "tcp-idle-timeout", wire.ErrRelayIdle.Error()
+			} else {
+				record.State = "failed"
+				record.Stage = failure.Endpoint + "-" + failure.Operation
+				record.setFailure(diagnoseDial(failure.Err, record.Stage))
+			}
 		} else if record.Sent > 0 && record.Recv == 0 && record.Via != "DIRECT" {
 			record.State, record.Stage = "failed", trace.StageUpstream
 			record.Error = "the proxy closed the connection without a response"

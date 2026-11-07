@@ -5,7 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type BufferedConn struct {
@@ -28,7 +29,12 @@ func CloseWrite(conn net.Conn) error {
 	return conn.Close()
 }
 
-var relayBuffers = sync.Pool{New: func() any { return new([32 * 1024]byte) }}
+const (
+	relayBufferSize     = 32 * 1024
+	relayBufferCacheCap = 128 // at most 4 MiB of idle relay buffers
+)
+
+var relayBuffers = make(chan *[relayBufferSize]byte, relayBufferCacheCap)
 
 func copyRelay(destination io.Writer, source io.Reader) (int64, error) {
 	// Preserve the connection's optimized copy methods when present.
@@ -39,8 +45,18 @@ func copyRelay(destination io.Writer, source io.Reader) (int64, error) {
 		return io.Copy(destination, source)
 	}
 	// Stream wrappers used by the proxy fall back to a regular buffer.
-	buffer := relayBuffers.Get().(*[32 * 1024]byte)
-	defer relayBuffers.Put(buffer)
+	var buffer *[relayBufferSize]byte
+	select {
+	case buffer = <-relayBuffers:
+	default:
+		buffer = new([relayBufferSize]byte)
+	}
+	defer func() {
+		select {
+		case relayBuffers <- buffer:
+		default: // Let surplus buffers become collectible after a burst.
+		}
+	}()
 	return io.CopyBuffer(destination, source, buffer[:])
 }
 
@@ -48,6 +64,37 @@ type RelayError struct {
 	Endpoint  string
 	Operation string
 	Err       error
+}
+
+var ErrRelayIdle = errors.New("tunnel closed after its configured idle interval")
+
+// Relay activity is timestamped only after payload makes forward progress.
+// The relay's coordinator owns the timer, including every reset and stop.
+type relayActivity struct {
+	start time.Time
+	last  atomic.Int64
+}
+
+func (a *relayActivity) touch() {
+	now := time.Since(a.start).Nanoseconds()
+	for previous := a.last.Load(); previous >= 0 && now > previous; previous = a.last.Load() {
+		if a.last.CompareAndSwap(previous, now) {
+			return
+		}
+	}
+}
+
+func (a *relayActivity) remaining(idle time.Duration) time.Duration {
+	for {
+		previous := a.last.Load()
+		remaining := idle - (time.Since(a.start) - time.Duration(previous))
+		if remaining > 0 {
+			return remaining
+		}
+		if a.last.CompareAndSwap(previous, -1) {
+			return 0
+		}
+	}
 }
 
 type relayReader struct {
@@ -70,11 +117,15 @@ func (r *relayReader) Read(data []byte) (int, error) {
 
 type relayWriter struct {
 	io.Writer
-	err error
+	err      error
+	activity *relayActivity
 }
 
 func (w *relayWriter) Write(data []byte) (int, error) {
 	n, err := w.Writer.Write(data)
+	if w.activity != nil && n > 0 {
+		w.activity.touch()
+	}
 	if err == nil && n < len(data) {
 		err = io.ErrShortWrite
 	}
@@ -82,10 +133,10 @@ func (w *relayWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 
-func transfer(destination, source net.Conn, to, from string) *RelayError {
+func transfer(destination, source net.Conn, to, from string, activity *relayActivity) *RelayError {
 	_, directSource := source.(*net.TCPConn)
 	_, directDestination := destination.(*net.TCPConn)
-	if directSource && directDestination {
+	if directSource && directDestination && activity == nil {
 		// Preserve native TCP copy optimizations when neither side is
 		// wrapped. Socket errors identify the operation themselves.
 		if _, err := copyRelay(destination, source); err != nil {
@@ -101,7 +152,7 @@ func transfer(destination, source net.Conn, to, from string) *RelayError {
 			return &RelayError{from, "transfer", err}
 		}
 	} else {
-		reader, writer := relayReader{Reader: source}, relayWriter{Writer: destination}
+		reader, writer := relayReader{Reader: source}, relayWriter{Writer: destination, activity: activity}
 		if _, err := copyRelay(&writer, &reader); err != nil {
 			if writer.err != nil {
 				return &RelayError{to, "write", err}
@@ -116,19 +167,42 @@ func transfer(destination, source net.Conn, to, from string) *RelayError {
 }
 
 func Relay(client, upstream net.Conn) {
-	results := make(chan *RelayError, 2)
-	go func() { results <- transfer(upstream, client, "upstream", "client") }()
-	go func() { results <- transfer(client, upstream, "client", "upstream") }()
-	first := <-results
-	if first != nil {
-		reportRelayFailure(upstream, first)
-		client.Close()
-		upstream.Close()
+	var activity *relayActivity
+	var timer *time.Timer
+	var expiry <-chan time.Time
+	var idle time.Duration
+	if config, ok := upstream.(interface{ RelayIdleTimeout() time.Duration }); ok {
+		idle = config.RelayIdleTimeout()
+		if idle > 0 {
+			activity = &relayActivity{start: time.Now()}
+			timer = time.NewTimer(idle)
+			defer timer.Stop()
+			expiry = timer.C
+		}
 	}
-	if second := <-results; first == nil && second != nil {
-		reportRelayFailure(upstream, second)
-		client.Close()
-		upstream.Close()
+	results := make(chan *RelayError, 2)
+	go func() { results <- transfer(upstream, client, "upstream", "client", activity) }()
+	go func() { results <- transfer(client, upstream, "client", "upstream", activity) }()
+	var stopped bool
+	for finished := 0; finished < 2; {
+		var failure *RelayError
+		select {
+		case failure = <-results:
+			finished++
+		case <-expiry:
+			if remaining := activity.remaining(idle); remaining > 0 {
+				timer.Reset(remaining)
+				continue
+			}
+			failure = &RelayError{Operation: "idle", Err: ErrRelayIdle}
+		}
+		if failure != nil && !stopped {
+			stopped = true
+			expiry = nil
+			reportRelayFailure(upstream, failure)
+			client.Close()
+			upstream.Close()
+		}
 	}
 }
 
