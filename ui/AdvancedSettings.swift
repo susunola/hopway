@@ -142,7 +142,7 @@ struct AdvancedSettingsDraft {
 
 struct AdvancedSettingsPanel: View {
     private enum Category: String, CaseIterable {
-        case access = "接入与端口"
+        case access = "本机端口"
         case dns = "DNS 与嗅探"
         case probes = "测速与选路"
         case data = "刷新与记录"
@@ -290,28 +290,6 @@ struct AdvancedSettingsPanel: View {
                     }
                 }
             }
-            Divider()
-            section("启动与 TUN", icon: "bolt.shield") {
-                fieldRow {
-                    Toggle("启动时接管系统代理", isOn: values.systemProxy)
-                        .fixedSize()
-                    Toggle("启动时开启 TUN", isOn: values.tunEnabled)
-                        .fixedSize()
-                    Toggle("TUN 接管 IPv6", isOn: values.ipv6)
-                        .fixedSize()
-                    Spacer(minLength: 0)
-                    let tun = core.status?.tun
-                    Menu("TUN 助手") {
-                        Button(tun?.service == true ? "移除助手" : "安装助手") {
-                            core.setTUNService(tun?.service != true)
-                        }
-                    }
-                    .fixedSize()
-                    .disabled(core.phase != .running || tun?.supported != true || core.statusReadFailed || core.changingTUN)
-                    .help(core.phase == .stopped ? "启动代理后可管理 TUN 助手。" : "管理 TUN 助手")
-                }
-                hint("IPv6 设置在下次开启 TUN 时生效。")
-            }
         }
     }
 
@@ -369,6 +347,79 @@ struct AdvancedSettingsPanel: View {
             core.saveAdvanced(candidate.text, basedOn: current.source, activation: candidate.activation)
         } catch {
             draft?.error = error.localizedDescription
+        }
+    }
+}
+
+struct StartupAccessSettings: View {
+    @ObservedObject var core: CoreModel
+    let hasAdvancedEdits: Bool
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: AdvancedSettingsDraft?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("启动与 TUN", systemImage: "bolt.shield").font(.headline)
+            if let fields = Binding($draft) {
+                VStack(alignment: .leading, spacing: 9) {
+                    Toggle("启动时接管系统代理", isOn: fields.values.systemProxy)
+                    Toggle("启动时开启 TUN", isOn: fields.values.tunEnabled)
+                    Toggle("TUN 接管 IPv6", isOn: fields.values.ipv6)
+                }
+                .disabled(core.saving || core.changed || hasAdvancedEdits)
+                Text("IPv6 设置在下次开启 TUN 时生效。").foregroundStyle(.secondary)
+                if core.changed || hasAdvancedEdits {
+                    Text("请先保存或还原设置页的草稿。").foregroundStyle(HopAppearance.warning)
+                } else if fields.wrappedValue.source != core.saved {
+                    HStack {
+                        Text("配置已更新，请重新载入。").foregroundStyle(HopAppearance.warning)
+                        Button("重新载入") { draft = AdvancedSettingsDraft(source: core.saved) }
+                    }
+                }
+                if let error = fields.wrappedValue.error {
+                    Text(error).foregroundStyle(HopAppearance.warning)
+                }
+            } else {
+                Text("无法读取已保存的配置。").foregroundStyle(.secondary)
+            }
+
+            Divider()
+            let tun = core.status?.tun
+            HStack {
+                Menu("TUN 助手") {
+                    Button(tun?.service == true ? "移除助手" : "安装助手") {
+                        core.setTUNService(tun?.service != true)
+                    }
+                }
+                .fixedSize()
+                .disabled(core.phase != .running || tun?.supported != true || core.statusReadFailed || core.changingTUN)
+                .help(core.phase == .stopped ? "启动代理后可管理 TUN 助手。" : "管理 TUN 助手")
+                Spacer()
+                Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(core.saving ? "正在保存…" : "保存偏好", action: save)
+                    .buttonStyle(HopPrimaryButton())
+                    .disabled(draft?.changed != true || draft?.source != core.saved ||
+                              core.changed || hasAdvancedEdits || core.saving || core.configurationConflict)
+            }
+        }
+        .font(.callout)
+        .padding(22)
+        .frame(width: 410)
+        .onChange(of: core.saved, initial: true) { _, source in
+            if draft?.changed != true || (try? draft?.configuration().text) == source {
+                draft = AdvancedSettingsDraft(source: source)
+            }
+        }
+    }
+
+    private func save() {
+        guard let draft else { return }
+        do {
+            let candidate = try draft.configuration()
+            self.draft?.error = nil
+            core.saveAdvanced(candidate.text, basedOn: draft.source, activation: candidate.activation)
+        } catch {
+            self.draft?.error = error.localizedDescription
         }
     }
 }

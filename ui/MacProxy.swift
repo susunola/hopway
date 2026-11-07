@@ -107,6 +107,7 @@ private struct Dashboard: View {
                     case .overview:
                         OverviewDashboard(
                             core: core,
+                            hasAdvancedEdits: advancedDraft?.changed == true,
                             showNodes: { page = .nodes },
                             showPolicies: { page = .policies },
                             showUsage: { page = .usage },
@@ -590,7 +591,7 @@ private struct Dashboard: View {
         ScrollView {
             VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
                 HStack {
-                    HopPageHeading(title: "设置", detail: "启动偏好、接入端口和高级配置")
+                    HopPageHeading(title: "设置", detail: "本机端口和高级配置")
                     Spacer()
                     Button(action: core.exportDiagnostics) {
                         Label(core.exportingDiagnostics ? "正在生成…" : "导出诊断…", systemImage: "doc.text.magnifyingglass")

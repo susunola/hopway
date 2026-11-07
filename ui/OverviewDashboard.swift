@@ -2,6 +2,8 @@ import SwiftUI
 
 struct OverviewDashboard: View {
     @ObservedObject var core: CoreModel
+    let hasAdvancedEdits: Bool
+    @State private var showsStartupSettings = false
     let showNodes: () -> Void
     let showPolicies: () -> Void
     let showUsage: () -> Void
@@ -35,12 +37,21 @@ struct OverviewDashboard: View {
                 .fixedSize(horizontal: false, vertical: true)
             ScrollView { content(chartHeight: 46) }
         }
+        .sheet(isPresented: $showsStartupSettings) {
+            StartupAccessSettings(core: core, hasAdvancedEdits: hasAdvancedEdits)
+        }
     }
 
     private func content(chartHeight: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
             HopPageHeading(title: "概览").padding(.bottom, 2)
-            proxyControl
+            VStack(spacing: 0) {
+                proxyControl
+                proxyAccessControls
+            }
+            .background(Color(nsColor: .windowBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary))
             accessIssues
             if core.statusReadFailed {
                 Label(core.statusReadAt.map { "状态读取失败，显示 " + $0.formatted(date: .omitted, time: .standard) + " 的记录" }
@@ -78,7 +89,6 @@ struct OverviewDashboard: View {
             }
             .accessibilityElement(children: .combine)
             Spacer(minLength: 10)
-            proxyAccessControls
             controlMetric("活动连接", value: core.status.map { $0.active.formatted() } ?? (core.phase == .stopped ? "0" : "—"))
             Button(action: core.toggle) {
                 Label(running || core.phase == .stopping ? "停止代理" : "启动代理", systemImage: "power")
@@ -88,38 +98,44 @@ struct OverviewDashboard: View {
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 16)
-        .padding(.vertical, 20)
+        .padding(.vertical, 14)
         .frame(maxWidth: .infinity)
-        .background {
-            RoundedRectangle(cornerRadius: 12)
-                .fill(LinearGradient(
-                    colors: [HopAppearance.navy, Color(red: 0.08, green: 0.20, blue: 0.25)],
-                    startPoint: .leading, endPoint: .trailing
-                ))
-        }
+        .background(LinearGradient(
+            colors: [HopAppearance.navy, Color(red: 0.08, green: 0.20, blue: 0.25)],
+            startPoint: .leading, endPoint: .trailing
+        ))
     }
 
     private var proxyAccessControls: some View {
         let status = core.status
-        let ready = running && !core.statusReadFailed
-        return VStack(alignment: .leading, spacing: 5) {
-            Text("macOS 接入 · " + (core.phase == .stopped ? "启动后可切换" : core.accessLabel))
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.72))
-                .lineLimit(1)
-            HStack(spacing: 12) {
+        return HStack(spacing: 12) {
+            Text("macOS 接入").fontWeight(.medium).fixedSize()
+            if running {
+                Text(core.accessLabel).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Divider().frame(height: 16)
                 Toggle("系统代理", isOn: Binding(
                     get: { status?.systemProxy?.enabled == true }, set: core.setSystemProxy))
-                    .disabled(!ready || status?.systemProxy?.supported != true)
-                Toggle("TUN 增强模式", isOn: Binding(
+                    .disabled(core.statusReadFailed || status?.systemProxy?.supported != true)
+                    .fixedSize()
+                Toggle("TUN", isOn: Binding(
                     get: { status?.tun?.enabled == true }, set: core.setTUN))
-                    .disabled(!ready || status?.tun?.supported != true || core.changingTUN)
+                    .accessibilityLabel("TUN 增强模式")
+                    .disabled(core.statusReadFailed || status?.tun?.supported != true || core.changingTUN)
+                    .fixedSize()
+            } else {
+                Text("启动后可切换系统代理与 TUN")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-            .font(.callout)
-            .toggleStyle(.checkbox)
-            .tint(HopAppearance.mint)
+            Spacer(minLength: 6)
+            Button("启动与 TUN…") { showsStartupSettings = true }
+                .fixedSize()
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .font(.callout)
+        .controlSize(.small)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
     }
 
     @ViewBuilder
