@@ -1,0 +1,58 @@
+package wire
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"io"
+	"net"
+	"time"
+)
+
+// DialWithClient watches the ingress while opening a tunnel. It peeks into
+// a bounded buffer so any early payload can still be relayed, and it stops
+// reading before the established relay takes over.
+func DialWithClient(ctx context.Context, client net.Conn, reader *bufio.Reader, dial func(context.Context) (net.Conn, error)) (net.Conn, error) {
+	if err := client.SetReadDeadline(time.Time{}); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for reader.Buffered() < reader.Size() {
+			_, err := reader.Peek(reader.Buffered() + 1)
+			if err == nil {
+				continue
+			}
+			var timeout net.Error
+			switch {
+			case errors.As(err, &timeout) && timeout.Timeout():
+				// The dial completed and interrupted the pending read.
+			case errors.Is(err, io.EOF) && reader.Buffered() > 0:
+				// The client sent a request and half-closed early.
+			default:
+				cancel()
+			}
+			return
+		}
+	}()
+	conn, err := dial(ctx)
+	interruptErr := client.SetReadDeadline(time.Now())
+	if interruptErr != nil {
+		_ = client.Close()
+	}
+	<-done
+	resetErr := client.SetReadDeadline(time.Time{})
+	if err == nil {
+		err = errors.Join(ctx.Err(), interruptErr, resetErr)
+	}
+	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, err
+	}
+	return conn, nil
+}

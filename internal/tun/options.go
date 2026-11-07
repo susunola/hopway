@@ -6,6 +6,8 @@ import (
 	"net/netip"
 )
 
+const DefaultMTU = 9000
+
 type Options struct {
 	FD           int // a device opened by the privileged helper; 0 creates one (needs root)
 	Name         string
@@ -22,7 +24,7 @@ var defaultAddress6 = netip.MustParsePrefix("fdfe:dcba:9876::1/126")
 
 func (o *Options) defaults() {
 	if o.MTU == 0 {
-		o.MTU = 9000
+		o.MTU = DefaultMTU
 	}
 	if !o.Address.IsValid() {
 		o.Address = netip.MustParsePrefix("172.19.0.1/30")

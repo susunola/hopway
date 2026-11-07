@@ -30,7 +30,7 @@ func TestServiceHandsOverOnlyToTheInstallingUser(t *testing.T) {
 	go func() { done <- RunService(socket, uint32(os.Geteuid()), create) }()
 	for !ServiceAvailable(socket) {
 	}
-	fd, name, err := OpenWithService(context.Background(), socket, false)
+	fd, name, err := OpenWithService(context.Background(), socket, Options{})
 	if err != nil || name != "utun9" || created != 1 {
 		t.Fatalf("open: %d %q %v", fd, name, err)
 	}
@@ -90,7 +90,7 @@ func TestServiceClientHelper(t *testing.T) {
 	if socket == "" {
 		t.Skip("helper process only")
 	}
-	_, _, err := OpenWithService(context.Background(), socket, false)
+	_, _, err := OpenWithService(context.Background(), socket, Options{})
 	fmt.Println("client result:", err)
 }
 

@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
-	"mac-proxy/internal/peer"
 	"net"
 	"net/http"
 	"strings"
 	"time"
 
 	"mac-proxy/internal/outbound"
+	"mac-proxy/internal/peer"
 	"mac-proxy/internal/wire"
 )
 
@@ -27,11 +27,15 @@ func Handler(dial Dial) http.Handler {
 }
 
 func fail(writer http.ResponseWriter, err error) {
+	code, message := failure(err)
+	http.Error(writer, message, code)
+}
+
+func failure(err error) (int, string) {
 	if errors.Is(err, outbound.ErrRejected) {
-		http.Error(writer, "Blocked by routing policy", http.StatusForbidden)
-	} else {
-		http.Error(writer, "Proxy connection failed", http.StatusBadGateway)
+		return http.StatusForbidden, "Blocked by routing policy"
 	}
+	return http.StatusBadGateway, "Proxy connection failed"
 }
 
 func connect(writer http.ResponseWriter, request *http.Request, dial Dial) {
@@ -40,25 +44,40 @@ func connect(writer http.ResponseWriter, request *http.Request, dial Dial) {
 		http.Error(writer, "CONNECT requires host:port", http.StatusBadRequest)
 		return
 	}
-	upstream, err := dial(withPeer(request), "HTTP CONNECT", target)
-	if err != nil {
-		fail(writer, err)
-		return
-	}
-	defer upstream.Close()
 	client, buffer, err := http.NewResponseController(writer).Hijack()
 	if err != nil {
 		http.Error(writer, "Cannot establish tunnel", http.StatusInternalServerError)
 		return
 	}
 	defer client.Close()
+	// The hijacked socket now owns the tunnel lifetime. The HTTP reader
+	// can cancel its old request context even on a legitimate half-close.
+	upstream, err := wire.DialWithClient(context.WithoutCancel(withPeer(request)), client, buffer.Reader, func(ctx context.Context) (net.Conn, error) {
+		return dial(ctx, "HTTP CONNECT", target)
+	})
+	if err != nil {
+		code, message := failure(err)
+		body := message + "\n"
+		response := http.Response{
+			ProtoMajor: 1, ProtoMinor: 1, StatusCode: code, Close: true, ContentLength: int64(len(body)),
+			Header: http.Header{"Content-Type": {"text/plain; charset=utf-8"}, "X-Content-Type-Options": {"nosniff"}},
+			Body:   io.NopCloser(strings.NewReader(body)),
+		}
+		_ = response.Write(buffer)
+		_ = buffer.Flush()
+		return
+	}
+	defer upstream.Close()
 	if _, err := buffer.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
 	}
 	if err := buffer.Flush(); err != nil {
 		return
 	}
-	wire.Relay(&wire.BufferedConn{Conn: client, Reader: buffer.Reader}, upstream)
+	if buffer.Reader.Buffered() != 0 {
+		client = &wire.BufferedConn{Conn: client, Reader: buffer.Reader}
+	}
+	wire.Relay(client, upstream)
 }
 
 func forward(writer http.ResponseWriter, request *http.Request, dial Dial) {
@@ -72,13 +91,16 @@ func forward(writer http.ResponseWriter, request *http.Request, dial Dial) {
 	outgoing.Close = false
 	removeHopHeaders(outgoing.Header)
 	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, target string) (net.Conn, error) {
-			return dial(ctx, "HTTP", target)
+		// The transport is per request. Do not keep its dial running
+		// after this client's request has been canceled.
+		DialContext: func(_ context.Context, _, target string) (net.Conn, error) {
+			return dial(outgoing.Context(), "HTTP", target)
 		},
 		DisableKeepAlives:     true,
 		DisableCompression:    true,
 		ResponseHeaderTimeout: 30 * time.Second,
 	}
+	defer transport.CloseIdleConnections()
 	response, err := transport.RoundTrip(outgoing)
 	if err != nil {
 		fail(writer, err)

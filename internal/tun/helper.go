@@ -12,8 +12,11 @@ import (
 	"os/exec"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
+
+	"mac-proxy/internal/wire"
 
 	stun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/control"
@@ -38,6 +41,9 @@ func RunHelper(socketPath string, options Options) error {
 func CreateDevice(options Options) (int, string, error) {
 	if os.Geteuid() != 0 {
 		return 0, "", errors.New("creating the TUN device needs root")
+	}
+	if err := wire.ValidateTUNMTU(options.MTU, options.IPv6); err != nil {
+		return 0, "", err
 	}
 	options.defaults()
 	finder := control.NewDefaultInterfaceFinder()
@@ -97,7 +103,7 @@ func deviceFD(device stun.Tun) (int, error) {
 
 // OpenWithHelper asks for administrator rights (macOS's standard password
 // dialog) to run executable as the helper, and returns the device it sends.
-func OpenWithHelper(ctx context.Context, executable string, ipv6 bool) (int, string, error) {
+func OpenWithHelper(ctx context.Context, executable string, options Options) (int, string, error) {
 	if runtime.GOOS != "darwin" {
 		return 0, "", errors.New("the TUN helper is only used on macOS")
 	}
@@ -106,10 +112,14 @@ func OpenWithHelper(ctx context.Context, executable string, ipv6 bool) (int, str
 		return 0, "", err
 	}
 	defer cleanup()
-	flags := " -tun-helper "
-	if ipv6 {
-		flags = " -tun-ipv6 -tun-helper "
+	flags := ""
+	if options.IPv6 {
+		flags += " -tun-ipv6"
 	}
+	if options.MTU != 0 && options.MTU != DefaultMTU {
+		flags += " -tun-mtu " + strconv.FormatUint(uint64(options.MTU), 10)
+	}
+	flags += " -tun-helper "
 	script := fmt.Sprintf(`do shell script quoted form of %s & "`+flags+`" & quoted form of %s with administrator privileges with prompt "HopWay 需要管理员权限来开启增强模式（TUN），用于创建虚拟网卡并接管路由。"`,
 		appleString(executable), appleString(path))
 	ctx, stop := context.WithTimeout(ctx, 2*time.Minute)

@@ -19,7 +19,7 @@ struct ConnectionsDashboard: View {
             case .active: row.state == "active"
             case .closed: row.state == "closed"
             case .blocked: row.state == "blocked"
-            case .failed: row.state != "active" && row.state != "closed" && row.state != "blocked"
+            case .failed: row.state != "active" && row.state != "closed" && row.state != "blocked" && row.state != "canceled"
             }
         }
     }

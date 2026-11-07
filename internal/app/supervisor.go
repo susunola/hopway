@@ -294,7 +294,7 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 	if os.Geteuid() == 0 {
 		options.AutoRoute = true
 	} else if tun.ServiceAvailable(tun.ServiceSocket) {
-		fd, name, err := tun.OpenWithService(s.ctx, tun.ServiceSocket, options.IPv6)
+		fd, name, err := tun.OpenWithService(s.ctx, tun.ServiceSocket, options)
 		if err != nil {
 			return fmt.Errorf("TUN service: %w", err)
 		}
@@ -304,7 +304,7 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 		if err != nil {
 			return err
 		}
-		fd, name, err := tun.OpenWithHelper(s.ctx, executable, options.IPv6)
+		fd, name, err := tun.OpenWithHelper(s.ctx, executable, options)
 		if err != nil {
 			return err
 		}
@@ -464,7 +464,7 @@ func (s *Supervisor) Close() {
 	})
 }
 
-var ErrPortsChanged = errors.New("listening ports changed; restart HopWay to apply")
+var ErrPortsChanged = errors.New("监听端口已修改")
 
 // Reload re-reads the profile and swaps in a new engine. New connections use
 // it at once; open ones finish on the old engine.
@@ -484,8 +484,7 @@ func (s *Supervisor) reloadLocked() error {
 	}
 	old := s.current.Load()
 	running := s.loaded.Merged
-	if (loaded.Merged.SOCKSPort != running.SOCKSPort && loaded.Merged.SOCKSPort != 0) ||
-		(loaded.Merged.HTTPPort != running.HTTPPort && loaded.Merged.HTTPPort != 0) {
+	if loaded.Merged.SOCKSPort != running.SOCKSPort || loaded.Merged.HTTPPort != running.HTTPPort {
 		return ErrPortsChanged
 	}
 	core, err := engine.NewWithPacketBudget(loaded.Merged, s.impl, s.packetBudget, s.ports...)

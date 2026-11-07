@@ -17,7 +17,7 @@ const sniffWait = 300 * time.Millisecond
 // server name from a TLS ClientHello or an HTTP Host header. The returned
 // connection replays the peeked bytes. Protocols where the server speaks
 // first simply time out after sniffWait and keep going unsniffed.
-func sniff(conn net.Conn) (string, net.Conn) {
+func sniff(conn net.Conn) (string, *wire.BufferedConn) {
 	reader := bufio.NewReaderSize(conn, 16<<10)
 	replay := &wire.BufferedConn{Conn: conn, Reader: reader}
 	conn.SetReadDeadline(time.Now().Add(sniffWait))

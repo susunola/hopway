@@ -85,6 +85,7 @@ private struct Dashboard: View {
     @State private var importError: String?
     @State private var previewing = false
     @State private var showsConfigurationEditor = false
+    @State private var advancedDraft: AdvancedSettingsDraft?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -438,18 +439,7 @@ private struct Dashboard: View {
                 HopPageHeading(title: "设置", detail: "接入方式、监听端口和内核配置。")
                 accessSettings
                 coreSettings
-                HStack {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Label("高级配置", systemImage: "chevron.left.forwardslash.chevron.right")
-                            .font(.headline)
-                        Text(core.changed ? "有未保存的草稿" : "编辑内核的节点、规则和监听端口。")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("编辑 JSON…") { showsConfigurationEditor = true }
-                }
-                .hopPanel()
+                AdvancedSettingsPanel(core: core, draft: $advancedDraft) { showsConfigurationEditor = true }
             }
             .padding(.bottom, 12)
         }
@@ -520,14 +510,17 @@ private struct Dashboard: View {
             Label("监听与内核", systemImage: "cpu").font(.headline)
             if let profile {
                 HStack(spacing: 18) {
-                    LabeledContent("SOCKS5", value: portLabel(profile.socksPort, running: core.endpoint?.socks))
-                    LabeledContent("HTTP", value: portLabel(profile.httpPort, running: core.endpoint?.http))
+                    LabeledContent("SOCKS5", value: portLabel(profile.socksPort, running: core.endpoint?.socks, applied: core.appliedPorts?.socks))
+                    LabeledContent("HTTP", value: portLabel(profile.httpPort, running: core.endpoint?.http, applied: core.appliedPorts?.http))
                 }
                 .monospacedDigit()
                 if !backend.isEmpty { LabeledContent("内核后端", value: backend) }
                 if let applied = core.status?.reloaded {
                     LabeledContent("配置应用时间", value: Date(timeIntervalSince1970: applied / 1000)
                         .formatted(date: .abbreviated, time: .shortened))
+                }
+                if let notice = core.configurationNotice, core.phase == .running {
+                    Label(notice, systemImage: "clock").foregroundStyle(.orange)
                 }
             } else if !core.profileReadFailed {
                 Text("正在读取已保存的配置。").foregroundStyle(.secondary)
@@ -542,8 +535,14 @@ private struct Dashboard: View {
         .hopPanel()
     }
 
-    private func portLabel(_ configured: Int?, running: String?) -> String {
-        if let running { return running }
+    private func portLabel(_ configured: Int?, running: String?, applied: Int?) -> String {
+        if let running {
+            if let configured, let applied, configured != applied {
+                let saved = configured == 0 ? "自动分配" : "\(configured)"
+                return "\(running) · 已保存 \(saved)"
+            }
+            return running
+        }
         guard let configured else { return "未读取" }
         return configured == 0 ? "启动时分配" : "\(configured)（已配置）"
     }
@@ -564,6 +563,7 @@ private struct Dashboard: View {
                     }
                 }.disabled(core.saving)
                 Spacer()
+                Button("还原草稿") { core.draft = core.saved }.disabled(core.saving || !core.changed)
                 Button(core.saving ? "正在校验…" : "校验并保存", action: core.save)
                     .buttonStyle(HopPrimaryButton())
                     .disabled(core.saving || !core.changed)

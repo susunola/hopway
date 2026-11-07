@@ -76,7 +76,10 @@ struct ProxyStatus: Decodable {
         var failureStage: String? {
             guard let stage else { return nil }
             let labels = ["route": "路由策略", "dns": "DNS 解析", "connect": "连接服务器",
-                          "handshake": "TLS / 协议握手", "upstream": "代理无响应"]
+                          "handshake": "TLS / 协议握手", "upstream": "代理无响应",
+                          "client-read": "读取客户端", "client-write": "写入客户端",
+                          "upstream-read": "读取出站", "upstream-write": "写入出站",
+                          "client-transfer": "上传转发", "upstream-transfer": "下载转发"]
             return labels[stage] ?? stage
         }
 
@@ -98,6 +101,7 @@ struct ProxyStatus: Decodable {
             case "active": "传输中"
             case "closed": "已结束"
             case "blocked": "已拦截"
+            case "canceled": "已取消"
             default: "失败"
             }
         }
@@ -229,6 +233,8 @@ final class CoreModel: ObservableObject {
     @Published private(set) var profileReadFailed = false
     private(set) var statusReadAt: Date?
     @Published private(set) var message: String?
+    @Published private(set) var configurationNotice: String?
+    @Published private(set) var appliedPorts: (socks: Int?, http: Int?)?
     @Published private(set) var verifying = false
     @Published private(set) var verification: String?
     @Published private(set) var saving = false
@@ -347,6 +353,7 @@ final class CoreModel: ObservableObject {
         }
         message = nil
         phase = .starting
+        let launchedConfiguration = saved
         let child = Process()
         child.executableURL = executable
         child.arguments = ["-managed", "-config", configURL.path]
@@ -381,7 +388,9 @@ final class CoreModel: ObservableObject {
                     guard process === child, phase == .starting else { return }
                 }
                 endpoint = info
+                appliedPorts = configuredPorts(in: launchedConfiguration)
                 phase = .running
+                configurationNotice = nil
                 polling = Task {
                     while !Task.isCancelled {
                         await refresh(info)
@@ -424,6 +433,7 @@ final class CoreModel: ObservableObject {
         input = nil
         process = nil
         endpoint = nil
+        appliedPorts = nil
         verification = nil
         verifying = false
         status = nil
@@ -452,13 +462,25 @@ final class CoreModel: ObservableObject {
     /// Applies the saved configuration to the running core without a restart.
     private func applyRunning() async -> String {
         guard let info = endpoint else { return "重启内核后生效。" }
+        let reloadedConfiguration = saved
         do {
             _ = try await call(info, path: "reload", method: "POST")
+            if endpoint?.token == info.token {
+                appliedPorts = configuredPorts(in: reloadedConfiguration)
+            }
+            configurationNotice = nil
             await refresh(info)
             return "已生效，无需重启。"
         } catch {
-            return "未能热加载（" + error.localizedDescription + "），重启内核后生效。"
+            configurationNotice = "当前内核仍在使用上次成功应用的配置。"
+            let reason = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            return "未能热加载（" + reason + "），重启内核后生效。"
         }
+    }
+
+    private func configuredPorts(in source: String) -> (socks: Int?, http: Int?)? {
+        guard let config = AdvancedSettingsDraft(source: source) else { return nil }
+        return (Int(config.original.socksPort), Int(config.original.httpPort))
     }
 
     func verifyConnection() {
@@ -1108,20 +1130,40 @@ final class CoreModel: ObservableObject {
     }
 
     func save() {
+        saveConfiguration(draft)
+    }
+
+    func saveAdvanced(_ candidate: String, basedOn source: String, needsRestart: Bool, activation: String?) {
+        guard !changed, saved == source else {
+            message = "配置已有更新，请重新打开高级配置后再保存。"
+            return
+        }
+        saveConfiguration(candidate, needsRestart: needsRestart, activation: activation)
+    }
+
+    private func saveConfiguration(_ candidate: String, needsRestart: Bool = false, activation: String? = nil) {
         guard !saving, let executable else { return }
         saving = true
         message = nil
-        let candidate = draft
         let destination = configURL
         Task {
             defer { saving = false }
             do {
                 try await Task.detached { try Self.validateAndSave(candidate, to: destination, with: executable) }.value
                 saved = candidate
+                draft = candidate
                 reloadConfiguredNodes()
                 if phase == .running {
-                    let applied = await applyRunning()
-                    message = "配置已保存，" + applied
+                    if needsRestart {
+                        message = "配置已保存。重启代理后应用新的监听端口和本次改动。"
+                        configurationNotice = "已保存的端口将在重启后使用。"
+                    } else if let activation {
+                        let applied = await applyRunning()
+                        message = applied == "已生效，无需重启。" ? "配置已保存。\(activation)" : "配置已保存，\(applied)"
+                        if configurationNotice == nil { configurationNotice = activation }
+                    } else {
+                        message = "配置已保存，" + (await applyRunning())
+                    }
                 } else {
                     message = "配置已保存。"
                 }

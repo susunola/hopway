@@ -3,6 +3,7 @@
 package socks5
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -66,7 +67,11 @@ func handleWithUDP(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc
 		return err
 	}
 
-	upstream, err := dial(peer.With(context.Background(), client.RemoteAddr(), client.LocalAddr()), "SOCKS5", target)
+	reader := bufio.NewReader(client)
+	ctx := peer.With(context.Background(), client.RemoteAddr(), client.LocalAddr())
+	upstream, err := wire.DialWithClient(ctx, client, reader, func(ctx context.Context) (net.Conn, error) {
+		return dial(ctx, "SOCKS5", target)
+	})
 	if err != nil {
 		return errors.Join(
 			fmt.Errorf("dial %s: %w", target, err),
@@ -82,7 +87,11 @@ func handleWithUDP(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc
 	if err := client.SetDeadline(time.Time{}); err != nil {
 		return err
 	}
-	wire.Relay(client, upstream)
+	var downstream net.Conn = client
+	if reader.Buffered() > 0 {
+		downstream = &wire.BufferedConn{Conn: client, Reader: reader}
+	}
+	wire.Relay(downstream, upstream)
 	return nil
 }
 

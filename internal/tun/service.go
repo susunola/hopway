@@ -7,6 +7,7 @@
 package tun
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -54,6 +55,9 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 			closeFD(fd)
 		}
 	}()
+	if err := wire.ValidateTUNMTU(options.MTU, options.IPv6); err != nil {
+		return nil, err
+	}
 	if fd > 0 {
 		if err := verifyDevice(fd, options.Name); err != nil {
 			return nil, fmt.Errorf("invalid device from TUN helper: %w", err)
@@ -217,25 +221,32 @@ func (s *Service) NewConnectionEx(ctx context.Context, conn net.Conn, source, de
 		done(onClose, errors.New("unknown fake address"))
 		return
 	}
-	reader := conn
+	var reader *bufio.Reader
 	if destination.IsIP() && !s.fake.Contains(destination.Addr) {
 		// An application that connects to an IP directly may still say
 		// which site it wants in its TLS ClientHello or HTTP Host header.
-		if name, replay := sniff(conn); name != "" {
+		name, replay := sniff(conn)
+		reader = replay.Reader
+		if name != "" {
 			target = net.JoinHostPort(name, strconv.Itoa(int(destination.Port)))
-			reader = replay
-		} else {
-			reader = replay
 		}
 	}
+	if reader == nil {
+		reader = bufio.NewReader(conn)
+	}
 	ctx = peer.WithAddrs(ctx, peer.Addrs{Client: source.AddrPort(), Server: destination.AddrPort(), Local: true})
-	upstream, err := s.dial(ctx, "TUN", target)
+	upstream, err := wire.DialWithClient(ctx, conn, reader, func(ctx context.Context) (net.Conn, error) {
+		return s.dial(ctx, "TUN", target)
+	})
 	if err != nil {
 		conn.Close()
 		done(onClose, err)
 		return
 	}
-	wire.Relay(reader, upstream)
+	if reader.Buffered() > 0 {
+		conn = &wire.BufferedConn{Conn: conn, Reader: reader}
+	}
+	wire.Relay(conn, upstream)
 	done(onClose, nil)
 }
 

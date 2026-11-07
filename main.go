@@ -54,6 +54,7 @@ func main() {
 	importInput := flag.Bool("import", false, "read a subscription URL or profile from stdin and print converted JSON")
 	tunHelper := flag.String("tun-helper", "", "internal: create the TUN device as root and hand it to the core over this socket")
 	tunIPv6 := flag.Bool("tun-ipv6", false, "internal: give the helper's TUN device an IPv6 address and route")
+	tunMTU := flag.Uint("tun-mtu", 0, "internal: MTU for the helper's TUN device")
 	tunService := flag.Int("tun-service", -1, "internal: run the installed TUN service for this uid")
 	tunInstall := flag.Int("tun-install", -1, "internal: install the TUN service for this uid (root)")
 	tunUninstall := flag.Bool("tun-uninstall", false, "internal: remove the TUN service (root)")
@@ -76,7 +77,10 @@ func main() {
 		return
 	}
 	if *tunHelper != "" {
-		if err := tun.RunHelper(*tunHelper, tun.Options{IPv6: *tunIPv6}); err != nil {
+		if *tunMTU > 65535 {
+			log.Fatal("invalid TUN MTU")
+		}
+		if err := tun.RunHelper(*tunHelper, tun.Options{IPv6: *tunIPv6, MTU: uint32(*tunMTU)}); err != nil {
 			log.SetFlags(0)
 			log.Fatal(err)
 		}
@@ -292,7 +296,7 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 		json.NewEncoder(writer).Encode(supervisor.Status())
 	})
 	router.HandleFunc("GET /route", func(writer http.ResponseWriter, request *http.Request) {
-		decision, err := core().Explain(request.URL.Query().Get("target"))
+		decision, err := core().ExplainContext(request.Context(), request.URL.Query().Get("target"))
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
@@ -302,8 +306,8 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	})
 	router.HandleFunc("POST /verify", func(writer http.ResponseWriter, request *http.Request) {
 		transport := &http.Transport{
-			DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
-				return supervisor.Dial(ctx, "verification", address)
+			DialContext: func(_ context.Context, _, address string) (net.Conn, error) {
+				return supervisor.Dial(request.Context(), "verification", address)
 			},
 			DisableKeepAlives: true,
 		}

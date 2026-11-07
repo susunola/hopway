@@ -14,6 +14,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"mac-proxy/internal/wire"
 )
 
 // The TUN service is an optional, permanently installed root daemon that
@@ -26,12 +28,13 @@ const (
 	ServiceSocket  = "/var/run/com.hopway.tun-service.sock"
 	ServiceBinary  = "/Library/PrivilegedHelperTools/com.hopway.tun-service"
 	ServicePlist   = "/Library/LaunchDaemons/com.hopway.tun-service.plist"
-	ServiceVersion = 1 // bump when the request or reply changes
+	ServiceVersion = 1 // bump for incompatible request or reply changes
 )
 
 type serviceRequest struct {
-	Version int  `json:"version"`
-	IPv6    bool `json:"ipv6"`
+	Version int    `json:"version"`
+	IPv6    bool   `json:"ipv6"`
+	MTU     uint32 `json:"mtu,omitempty"`
 }
 
 type serviceReply struct {
@@ -88,13 +91,15 @@ func serveRequest(conn *net.UnixConn, allowedUID uint32, create func(Options) (i
 			reply.Error = "bad request"
 		} else if request.Version != ServiceVersion {
 			reply.Error = fmt.Sprintf("version mismatch (service %d, app %d): reinstall the service", ServiceVersion, request.Version)
+		} else if err := wire.ValidateTUNMTU(request.MTU, request.IPv6); err != nil {
+			reply.Error = err.Error()
 		}
 	}
 	if reply.Error != "" {
 		json.NewEncoder(conn).Encode(reply)
 		return false
 	}
-	fd, name, err := create(Options{IPv6: request.IPv6})
+	fd, name, err := create(Options{IPv6: request.IPv6, MTU: request.MTU})
 	if err != nil {
 		reply.Error = err.Error()
 		json.NewEncoder(conn).Encode(reply)
@@ -108,7 +113,7 @@ func serveRequest(conn *net.UnixConn, allowedUID uint32, create func(Options) (i
 }
 
 // OpenWithService asks the installed service for a device.
-func OpenWithService(ctx context.Context, socketPath string, ipv6 bool) (int, string, error) {
+func OpenWithService(ctx context.Context, socketPath string, options Options) (int, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
@@ -119,7 +124,11 @@ func OpenWithService(ctx context.Context, socketPath string, ipv6 bool) (int, st
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 	unixConn := conn.(*net.UnixConn)
-	writeErr := json.NewEncoder(conn).Encode(serviceRequest{Version: ServiceVersion, IPv6: ipv6})
+	mtu := options.MTU
+	if mtu == DefaultMTU {
+		mtu = 0 // Keep default requests compatible with the existing helper.
+	}
+	writeErr := json.NewEncoder(conn).Encode(serviceRequest{Version: ServiceVersion, IPv6: options.IPv6, MTU: mtu})
 	fd, data, err := receiveRights(unixConn) // read the answer even if the write failed
 	defer func() {
 		if fd > 0 {
@@ -147,6 +156,9 @@ func OpenWithService(ctx context.Context, socketPath string, ipv6 bool) (int, st
 		return 0, "", errors.New("TUN service version mismatch: reinstall the service")
 	}
 	if reply.Error != "" {
+		if mtu != 0 && reply.Error == "bad request" {
+			return 0, "", errors.New("已安装的 TUN 助手不支持自定义 MTU，请重新安装助手或恢复默认值")
+		}
 		return 0, "", errors.New(reply.Error)
 	}
 	if fd <= 0 || reply.Name == "" {

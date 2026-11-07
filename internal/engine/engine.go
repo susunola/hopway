@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/netip"
 	"sort"
@@ -213,6 +214,11 @@ func NewWithPacketBudget(config Config, impl backend.Backend, budget *PacketBudg
 		(config.SOCKSPort != 0 && config.SOCKSPort == config.HTTPPort) {
 		return nil, errors.New("proxy ports must be distinct or 0 for automatic assignment")
 	}
+	if config.TUN != nil {
+		if err := wire.ValidateTUNMTU(config.TUN.MTU, config.TUN.IPv6); err != nil {
+			return nil, err
+		}
+	}
 	engine := &Engine{subscriptions: config.Subscriptions, autoWake: make(chan struct{}, 1), dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL, probeFallback: defaultProbeFallback,
@@ -272,6 +278,9 @@ func NewWithPacketBudget(config Config, impl backend.Backend, budget *PacketBudg
 		if config.Health.Interval != 0 {
 			if config.Health.Interval < 30 {
 				return nil, errors.New("health interval must be at least 30 seconds")
+			}
+			if int64(config.Health.Interval) > math.MaxInt64/int64(time.Second) {
+				return nil, errors.New("health interval exceeds the supported duration")
 			}
 			interval = config.Health.Interval
 		}
@@ -442,15 +451,15 @@ func (engine *Engine) guard(peer netip.AddrPort) error {
 	return nil
 }
 
-func resolveForRules(host string) []netip.Addr {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func resolveForRules(ctx context.Context, host string) []netip.Addr {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	addrs, _ := backend.Resolver.Lookup(ctx, host)
 	return addrs
 }
 
 // route picks the outbound name for host. Rules are immutable after New.
-func (engine *Engine) route(host string, policy Policy, owner func() *process.Owner) (string, string) {
+func (engine *Engine) route(ctx context.Context, host string, policy Policy, owner func() *process.Owner) (string, string) {
 	switch policy.Mode {
 	case "direct":
 		return "DIRECT", "direct mode"
@@ -459,7 +468,7 @@ func (engine *Engine) route(host string, policy Policy, owner func() *process.Ow
 	case "global":
 		return policy.Selected, "global mode"
 	}
-	index := engine.rules.match(host, resolveForRules, owner)
+	index := engine.rules.match(host, func(name string) []netip.Addr { return resolveForRules(ctx, name) }, owner)
 	if index < 0 {
 		return "DIRECT", "default"
 	}
@@ -480,6 +489,10 @@ type RouteDecision struct {
 }
 
 func (engine *Engine) Explain(target string) (RouteDecision, error) {
+	return engine.ExplainContext(context.Background(), target)
+}
+
+func (engine *Engine) ExplainContext(ctx context.Context, target string) (RouteDecision, error) {
 	host, _, err := wire.Split(target)
 	if err != nil {
 		return RouteDecision{}, errors.New("expected a host and port")
@@ -487,7 +500,10 @@ func (engine *Engine) Explain(target string) (RouteDecision, error) {
 	engine.mu.Lock()
 	policy := engine.policy
 	engine.mu.Unlock()
-	via, rule := engine.route(host, policy, nil)
+	via, rule := engine.route(ctx, host, policy, nil)
+	if err := ctx.Err(); err != nil {
+		return RouteDecision{}, err
+	}
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if list := engine.choices(via); len(list) != 0 {
@@ -518,6 +534,11 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	record := Record{ID: engine.sequence, Start: time.Now().UnixMilli(), Target: target, Inbound: inbound, State: "active"}
 	policy := engine.policy
 	engine.mu.Unlock()
+	ctx, cancel := engine.dialContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Rule evaluation may resolve DNS or look up the process, so it runs
 	// outside the lock. The process is looked up here only if a process rule
@@ -533,7 +554,10 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		}
 		return owner
 	}
-	via, rule := engine.route(host, policy, lookup)
+	via, rule := engine.route(ctx, host, policy, lookup)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	record.Rule = rule
 	engine.mu.Lock()
 	candidates := engine.choices(via)
@@ -542,8 +566,6 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		candidates = candidates[:maxAttempts]
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
 	var conn net.Conn
 	for i, candidate := range candidates {
 		record.Via, record.Route, record.Attempts = candidate.via, candidate.route, i+1
@@ -566,7 +588,7 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 			break
 		}
 	}
-	if err != nil && local {
+	if err != nil && local && ctx.Err() == nil {
 		lookup() // the client is still waiting on its socket, so it can be found
 	}
 	record.setOwner(owner)
@@ -578,22 +600,43 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		}
 		return nil, net.ErrClosed
 	}
-	defer engine.mu.Unlock()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	}
 	if err != nil {
 		record.State, record.Error = "failed", describe(err)
 		if errors.Is(err, outbound.ErrRejected) {
 			record.State, record.Stage = "blocked", trace.StageRoute
+		} else if errors.Is(err, context.Canceled) {
+			record.State = "canceled"
 		}
 		engine.remember(record)
+		engine.mu.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
 		return nil, err
 	}
 	record.Stage, record.Error = "", ""
 	tracked := &tracked{Conn: conn, engine: engine, record: record, opened: time.Now()}
 	engine.live[record.ID] = tracked
+	engine.mu.Unlock()
 	if local && !looked {
 		go engine.attribute(record.ID, addrs)
 	}
 	return tracked, nil
+}
+
+func (engine *Engine) dialContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	stop := context.AfterFunc(engine.ctx, cancel)
+	if engine.ctx.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 // attribute fills in the process of a connection after it was established.
@@ -645,6 +688,11 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 	record := Record{ID: engine.sequence, Start: time.Now().UnixMilli(), Target: target, Inbound: inbound, State: "active", Network: "udp"}
 	policy := engine.policy
 	engine.mu.Unlock()
+	ctx, cancel := engine.dialContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	addrs, local := peer.From(ctx)
 	local = local && addrs.Local
 	var owner *process.Owner
@@ -656,7 +704,10 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 		}
 		return owner
 	}
-	via, rule := engine.route(host, policy, lookup)
+	via, rule := engine.route(ctx, host, policy, lookup)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	record.Rule = rule
 	engine.mu.Lock()
 	candidates := engine.choices(via)
@@ -664,10 +715,6 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 	if len(candidates) > maxAttempts {
 		candidates = candidates[:maxAttempts]
 	}
-	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
-	stop := context.AfterFunc(engine.ctx, cancel)
-	defer stop()
 	var conn net.PacketConn
 	var exit *packetOutbound
 	for i, candidate := range candidates {
@@ -677,7 +724,7 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 			break
 		}
 	}
-	if local {
+	if local && ctx.Err() == nil {
 		lookup()
 	}
 	record.setOwner(owner)
@@ -909,7 +956,7 @@ func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *
 			record.Stage = trace.StageHandshake
 		}
 	}
-	if via != "DIRECT" && via != "REJECT" {
+	if via != "DIRECT" && via != "REJECT" && !errors.Is(ctx.Err(), context.Canceled) {
 		engine.mu.Lock()
 		if engine.networkEpoch.Load() != epoch {
 			engine.mu.Unlock()
@@ -1021,6 +1068,7 @@ type tracked struct {
 	sent, recv atomic.Uint64
 	firstByte  atomic.Int64
 	readErr    atomic.Value
+	relayErr   atomic.Pointer[wire.RelayError]
 	once       sync.Once
 }
 
@@ -1058,6 +1106,12 @@ func (conn *tracked) CloseWrite() error {
 	return wire.CloseWrite(conn.Conn)
 }
 
+func (conn *tracked) RecordRelayError(failure *wire.RelayError) {
+	if !errors.Is(failure.Err, net.ErrClosed) {
+		conn.relayErr.CompareAndSwap(nil, failure)
+	}
+}
+
 func (conn *tracked) Close() error {
 	var err error
 	conn.once.Do(func() {
@@ -1068,7 +1122,11 @@ func (conn *tracked) Close() error {
 		record.State = "closed"
 		// Protocols such as VLESS and Trojan finish their handshake lazily: a
 		// bad credential shows up as the server hanging up before any reply.
-		if record.Sent > 0 && record.Recv == 0 && record.Via != "DIRECT" {
+		if failure := conn.relayErr.Load(); failure != nil {
+			record.State = "failed"
+			record.Stage = failure.Endpoint + "-" + failure.Operation
+			record.Error = describe(failure.Err)
+		} else if record.Sent > 0 && record.Recv == 0 && record.Via != "DIRECT" {
 			record.State, record.Stage = "failed", trace.StageUpstream
 			record.Error = "the proxy closed the connection without a response"
 			if text, ok := conn.readErr.Load().(string); ok && text != "EOF" {

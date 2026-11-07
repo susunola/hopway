@@ -2,6 +2,7 @@ package wire
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -43,20 +44,96 @@ func copyRelay(destination io.Writer, source io.Reader) (int64, error) {
 	return io.CopyBuffer(destination, source, buffer[:])
 }
 
-func Relay(client, upstream net.Conn) {
-	results := make(chan error, 2)
-	copyStream := func(destination, source net.Conn) {
-		_, err := copyRelay(destination, source)
-		if err == nil {
-			err = CloseWrite(destination)
+type RelayError struct {
+	Endpoint  string
+	Operation string
+	Err       error
+}
+
+type relayReader struct {
+	io.Reader
+	emptyReads int
+}
+
+func (r *relayReader) Read(data []byte) (int, error) {
+	n, err := r.Reader.Read(data)
+	if n == 0 && err == nil {
+		r.emptyReads++
+		if r.emptyReads >= 100 {
+			err = io.ErrNoProgress
 		}
-		results <- err
+	} else {
+		r.emptyReads = 0
 	}
-	go copyStream(upstream, client)
-	go copyStream(client, upstream)
-	if <-results != nil {
+	return n, err
+}
+
+type relayWriter struct {
+	io.Writer
+	err error
+}
+
+func (w *relayWriter) Write(data []byte) (int, error) {
+	n, err := w.Writer.Write(data)
+	if err == nil && n < len(data) {
+		err = io.ErrShortWrite
+	}
+	w.err = err
+	return n, err
+}
+
+func transfer(destination, source net.Conn, to, from string) *RelayError {
+	_, directSource := source.(*net.TCPConn)
+	_, directDestination := destination.(*net.TCPConn)
+	if directSource && directDestination {
+		// Preserve native TCP copy optimizations when neither side is
+		// wrapped. Socket errors identify the operation themselves.
+		if _, err := copyRelay(destination, source); err != nil {
+			var op *net.OpError
+			if errors.As(err, &op) {
+				switch op.Op {
+				case "read":
+					return &RelayError{from, "read", err}
+				case "write":
+					return &RelayError{to, "write", err}
+				}
+			}
+			return &RelayError{from, "transfer", err}
+		}
+	} else {
+		reader, writer := relayReader{Reader: source}, relayWriter{Writer: destination}
+		if _, err := copyRelay(&writer, &reader); err != nil {
+			if writer.err != nil {
+				return &RelayError{to, "write", err}
+			}
+			return &RelayError{from, "read", err}
+		}
+	}
+	if err := CloseWrite(destination); err != nil {
+		return &RelayError{to, "write", err}
+	}
+	return nil
+}
+
+func Relay(client, upstream net.Conn) {
+	results := make(chan *RelayError, 2)
+	go func() { results <- transfer(upstream, client, "upstream", "client") }()
+	go func() { results <- transfer(client, upstream, "client", "upstream") }()
+	first := <-results
+	if first != nil {
+		reportRelayFailure(upstream, first)
 		client.Close()
 		upstream.Close()
 	}
-	<-results
+	if second := <-results; first == nil && second != nil {
+		reportRelayFailure(upstream, second)
+		client.Close()
+		upstream.Close()
+	}
+}
+
+func reportRelayFailure(upstream net.Conn, failure *RelayError) {
+	if reporter, ok := upstream.(interface{ RecordRelayError(*RelayError) }); ok {
+		reporter.RecordRelayError(failure)
+	}
 }
