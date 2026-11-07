@@ -14,6 +14,7 @@ import (
 
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
+	"mac-proxy/internal/sysproxy"
 )
 
 func echo(t *testing.T) string {
@@ -52,7 +53,7 @@ func TestSubscriptionRefreshAndHotReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Start(); err != nil {
+	if err := s.Start(sysproxy.Target{}); err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
@@ -125,7 +126,7 @@ func TestReloadRejectsBrokenConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Start(); err != nil {
+	if err := s.Start(sysproxy.Target{}); err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()

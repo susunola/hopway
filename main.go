@@ -14,8 +14,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"mac-proxy/internal/app"
@@ -25,6 +27,7 @@ import (
 	"mac-proxy/internal/importer"
 	"mac-proxy/internal/profile"
 	"mac-proxy/internal/socks5"
+	"mac-proxy/internal/sysproxy"
 )
 
 type ready struct {
@@ -164,7 +167,7 @@ func run(path string, port int, check, managed bool) error {
 		info.Control = "http://" + control.Addr().String()
 		info.Token = hex.EncodeToString(token[:])
 	}
-	if err := supervisor.Start(ports...); err != nil {
+	if err := supervisor.Start(sysproxy.Target{HTTP: info.HTTP, SOCKS: info.SOCKS}, ports...); err != nil {
 		return err
 	}
 	defer supervisor.Close()
@@ -191,6 +194,14 @@ func run(path string, port int, check, managed bool) error {
 			serverErrors <- nil
 		}()
 	}
+	// SIGINT/SIGTERM return normally so deferred cleanup restores the system
+	// proxy. A SIGKILL cannot be caught; the next start restores it instead.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		<-signals
+		serverErrors <- nil
+	}()
 	return <-serverErrors
 }
 
@@ -270,6 +281,22 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 				status = http.StatusConflict
 			}
 			http.Error(writer, err.Error(), status)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	})
+	router.HandleFunc("PUT /system-proxy", func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			Enabled bool `json:"enabled"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 1024))
+		decoder.DisallowUnknownFields()
+		err := decoder.Decode(&body)
+		if err == nil {
+			err = supervisor.SetSystemProxy(body.Enabled)
+		}
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
 		writer.WriteHeader(http.StatusNoContent)

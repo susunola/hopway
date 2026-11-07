@@ -8,13 +8,16 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
+	"mac-proxy/internal/netmon"
 	"mac-proxy/internal/profile"
+	"mac-proxy/internal/sysproxy"
 )
 
 type SubscriptionStatus struct {
@@ -25,8 +28,17 @@ type SubscriptionStatus struct {
 	Error   string `json:"error,omitempty"`
 }
 
+type SystemProxyStatus struct {
+	Supported bool   `json:"supported"`
+	Enabled   bool   `json:"enabled"`
+	Error     string `json:"error,omitempty"`
+	Recovered bool   `json:"recovered,omitempty"` // settings left by a crashed run were restored at start
+}
+
 type Status struct {
 	engine.Status
+	SystemProxy   SystemProxyStatus    `json:"systemProxy"`
+	Network       []netmon.Event       `json:"network,omitempty"` // recent changes, newest last
 	Warnings      []string             `json:"warnings,omitempty"`
 	Subscriptions []SubscriptionStatus `json:"subscriptions,omitempty"`
 	Reloaded      int64                `json:"reloaded,omitempty"` // unix ms of the running configuration
@@ -45,6 +57,12 @@ type Supervisor struct {
 	started time.Time
 	ctx     context.Context
 	cancel  context.CancelFunc
+
+	proxy       *sysproxy.Manager
+	proxyTarget sysproxy.Target
+	proxyErr    string
+	recovered   bool
+	events      []netmon.Event
 }
 
 // Retirement: an engine replaced by a reload keeps serving its open
@@ -61,8 +79,21 @@ func Open(path, dataDir string, impl backend.Backend) (*Supervisor, error) {
 	}
 	s.loaded = loaded
 	s.readSnapshotMeta()
+	s.proxy = sysproxy.New(dataDir, nil)
+	if SystemProxySupported {
+		// A previous run that crashed with the system proxy on would leave
+		// every app pointing at a dead port: undo that first.
+		recovered, err := s.proxy.Recover()
+		s.recovered = recovered
+		if err != nil {
+			s.proxyErr = "无法还原上次的系统代理设置：" + err.Error()
+		}
+	}
 	return s, nil
 }
+
+// SystemProxySupported is true where networksetup exists.
+var SystemProxySupported = runtime.GOOS == "darwin"
 
 // readSnapshotMeta caches snapshot sizes so Status never touches the disk.
 func (s *Supervisor) readSnapshotMeta() {
@@ -77,18 +108,64 @@ func (s *Supervisor) validate(config engine.Config) error { return engine.Valida
 
 func (s *Supervisor) Config() engine.Config { return s.loaded.Merged }
 
-// Start builds the engine; ports are HopWay's own listeners.
-func (s *Supervisor) Start(ports ...int) error {
+// Start builds the engine; ports are HopWay's own listeners. target is
+// where the system proxy points when it is enabled.
+func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
 	core, err := engine.New(s.loaded.Merged, s.impl, ports...)
 	if err != nil {
 		return err
 	}
 	s.ports = ports
+	s.proxyTarget = target
 	s.started = time.Now()
 	s.current.Store(core)
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	go s.subscriptionLoop()
+	go netmon.Watch(s.ctx, 3*time.Second, nil, s.networkChanged)
+	if s.loaded.Merged.SystemProxy {
+		s.SetSystemProxy(true)
+	}
 	return nil
+}
+
+// SetSystemProxy turns the macOS system proxy on or off.
+func (s *Supervisor) SetSystemProxy(enabled bool) error {
+	if !SystemProxySupported {
+		return errors.New("system proxy settings are only supported on macOS")
+	}
+	var err error
+	if enabled {
+		err = s.proxy.Enable(s.proxyTarget)
+		if err != nil {
+			s.proxy.Disable() // never leave a half-applied change behind
+		}
+	} else {
+		err = s.proxy.Disable()
+	}
+	s.mu.Lock()
+	s.proxyErr = ""
+	if err != nil {
+		s.proxyErr = err.Error()
+	}
+	s.mu.Unlock()
+	return err
+}
+
+func (s *Supervisor) networkChanged(event netmon.Event) {
+	s.current.Load().NetworkChanged()
+	if SystemProxySupported {
+		if _, err := s.proxy.Refresh(); err != nil {
+			s.mu.Lock()
+			s.proxyErr = err.Error()
+			s.mu.Unlock()
+		}
+	}
+	s.mu.Lock()
+	s.events = append(s.events, event)
+	if len(s.events) > 10 {
+		s.events = s.events[len(s.events)-10:]
+	}
+	s.mu.Unlock()
 }
 
 func (s *Supervisor) Engine() *engine.Engine { return s.current.Load() }
@@ -100,6 +177,9 @@ func (s *Supervisor) Dial(ctx context.Context, inbound, target string) (net.Conn
 func (s *Supervisor) Close() {
 	if s.cancel != nil {
 		s.cancel()
+	}
+	if SystemProxySupported && s.proxy.Enabled() {
+		s.proxy.Disable()
 	}
 	if core := s.current.Load(); core != nil {
 		core.Close()
@@ -157,6 +237,9 @@ func (s *Supervisor) Status() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	status.Warnings = s.loaded.Warnings
+	status.SystemProxy = SystemProxyStatus{Supported: SystemProxySupported, Enabled: s.proxy.Enabled(),
+		Error: s.proxyErr, Recovered: s.recovered}
+	status.Network = append([]netmon.Event(nil), s.events...)
 	status.Reloaded = s.started.UnixMilli()
 	for _, sub := range s.loaded.User.Subscriptions {
 		entry := s.subMeta[sub.URL]
