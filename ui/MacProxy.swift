@@ -98,6 +98,7 @@ private struct Dashboard: View {
                             core: core,
                             showNodes: { page = .nodes },
                             showUsage: { page = .usage },
+                            showSubscriptions: { page = .subscriptions },
                             importLink: { showsLinkImport = true }
                         )
                     case .nodes:

@@ -5,6 +5,7 @@ struct OverviewDashboard: View {
     @ObservedObject var core: CoreModel
     let showNodes: () -> Void
     let showUsage: () -> Void
+    let showSubscriptions: () -> Void
     let importLink: () -> Void
     @State private var showsAuto = false
     @State private var configuration: ConfigurationSummary?
@@ -45,6 +46,7 @@ struct OverviewDashboard: View {
                 routing
                 localAccess
                 traffic
+                subscriptionsOverview
             }
             .padding(.bottom, 12)
         }
@@ -331,6 +333,72 @@ struct OverviewDashboard: View {
         }
         .frame(width: 116, alignment: .leading)
         .accessibilityElement(children: .combine)
+    }
+
+    private var subscriptionsOverview: some View {
+        let subscriptions = core.subscriptions
+        let active = subscriptions.filter { !$0.isPaused }
+        let visible = (active + subscriptions.filter(\.isPaused)).prefix(3)
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label("订阅速览", systemImage: "tray.full").font(.headline)
+                if !subscriptions.isEmpty {
+                    Text("\(subscriptions.count) 份 · \(active.count) 份启用")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Spacer()
+                overviewLink("管理订阅", action: showSubscriptions)
+            }
+            if visible.isEmpty {
+                Text(core.profileReadFailed ? "暂时无法读取订阅" :
+                        core.configuredProfile == nil ? "正在读取订阅…" : "暂无订阅")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 14) {
+                    ForEach(visible) { subscription in
+                        if subscription.id != visible.first?.id { Divider().frame(height: 30) }
+                        subscriptionSummary(subscription)
+                    }
+                }
+            }
+        }
+        .hopPanel(verticalPadding: 12)
+    }
+
+    private func subscriptionSummary(_ subscription: SubscriptionSummary) -> some View {
+        let meter = subscription.usage
+        let remaining: String
+        if let used = meter?.used, let total = meter?.total, total > 0 {
+            remaining = "剩余 " + trafficBytes(total > used ? total - used : 0)
+        } else {
+            remaining = "额度未提供"
+        }
+        let expiration = meter?.expiration
+        let expired = expiration.map { $0 < Calendar.current.startOfDay(for: .now) } ?? false
+        let expiry = expiration.map { $0.formatted(.dateTime.month(.defaultDigits).day(.defaultDigits)) + " 到期" }
+            ?? "到期日未知"
+        let detail = remaining + " · " + (expired ? "已到期" : expiry)
+
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(subscription.name).font(.callout.weight(.semibold)).lineLimit(1)
+                if subscription.isPaused {
+                    Text("已暂停").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Text(detail)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(expired ? Color.orange : .secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .help(subscription.name + " · " + remaining + " · " + expiry)
     }
 
     private func overviewLink(_ title: String, action: @escaping () -> Void) -> some View {

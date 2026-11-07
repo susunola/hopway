@@ -51,8 +51,9 @@ struct HopSearchField: View {
 }
 
 extension View {
-    func hopPanel() -> some View {
-        padding(16)
+    func hopPanel(verticalPadding: CGFloat = 16) -> some View {
+        padding(.horizontal, 16)
+            .padding(.vertical, verticalPadding)
             .background(Color(nsColor: .windowBackgroundColor).opacity(0.52), in: RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary))
     }
