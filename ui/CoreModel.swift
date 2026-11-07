@@ -19,7 +19,19 @@ struct ProxyStatus: Decodable {
     struct Node: Decodable, Identifiable {
         let name: String
         let type: String
+        let latencyMs: Int?
+        let alive: Bool?
         var id: String { name }
+
+        var label: String {
+            var parts = [name, type == "group" ? "策略组" : type]
+            if alive == false {
+                parts.append("不可用")
+            } else if let latencyMs {
+                parts.append("\(latencyMs) ms")
+            }
+            return parts.joined(separator: " · ")
+        }
     }
 
     struct Connection: Decodable, Identifiable {
@@ -32,6 +44,29 @@ struct ProxyStatus: Decodable {
         let sent: Int64
         let received: Int64
         let error: String?
+        let stage: String?
+        let route: [String]?
+        let server: String?
+        let dnsMs: Int?
+        let connectMs: Int?
+        let handshakeMs: Int?
+        let firstByteMs: Int?
+
+        /// Where the connection failed and how long each stage took, for the tooltip.
+        var diagnosis: String {
+            var lines: [String] = []
+            if let error { lines.append(error) }
+            if let stage {
+                let names = ["route": "路由策略", "dns": "DNS 解析", "connect": "连接服务器", "handshake": "TLS / 协议握手", "upstream": "代理无响应"]
+                lines.append("失败阶段：" + (names[stage] ?? stage))
+            }
+            if let route, !route.isEmpty { lines.append("路径：" + (route + [via]).joined(separator: " → ")) }
+            if let server { lines.append("服务器：" + server) }
+            let timings = [("DNS", dnsMs), ("连接", connectMs), ("握手", handshakeMs), ("首字节", firstByteMs)]
+                .compactMap { name, value in value.map { "\(name) \($0) ms" } }
+            if !timings.isEmpty { lines.append(timings.joined(separator: "  ")) }
+            return lines.isEmpty ? target : lines.joined(separator: "\n")
+        }
 
         var stateLabel: String {
             switch state {

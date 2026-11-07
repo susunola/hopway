@@ -8,13 +8,15 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
+	"mac-proxy/internal/backend"
 	"mac-proxy/internal/outbound"
+	"mac-proxy/internal/trace"
 	"mac-proxy/internal/wire"
 )
 
@@ -24,14 +26,9 @@ type Config struct {
 	Mode      string          `json:"mode"`
 	Selected  string          `json:"selected"`
 	Nodes     []outbound.Node `json:"nodes"`
+	Groups    []Group         `json:"groups,omitempty"`
 	Rules     []Rule          `json:"rules"`
-}
-
-type Rule struct {
-	Type  string `json:"type"`
-	Value string `json:"value"`
-	Via   string `json:"via"`
-	cidr  netip.Prefix
+	Health    *Health         `json:"health,omitempty"`
 }
 
 func Default() Config {
@@ -58,25 +55,48 @@ type Policy struct {
 }
 
 type NodeSummary struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	LatencyMs int64  `json:"latencyMs,omitempty"`
+	Alive     *bool  `json:"alive,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
+type GroupStatus struct {
+	Name    string   `json:"name"`
+	Type    string   `json:"type"`
+	Members []string `json:"members"`
+	Now     string   `json:"now"` // node currently used
+}
+
+// Record describes one connection. Timings are milliseconds.
 type Record struct {
-	ID      uint64 `json:"id"`
-	Inbound string `json:"inbound"`
-	Target  string `json:"target"`
-	Via     string `json:"via"`
-	Rule    string `json:"rule"`
-	State   string `json:"state"`
-	Sent    uint64 `json:"sent"`
-	Recv    uint64 `json:"received"`
-	Error   string `json:"error,omitempty"`
+	ID          uint64   `json:"id"`
+	Start       int64    `json:"start"`
+	Inbound     string   `json:"inbound"`
+	Target      string   `json:"target"`
+	Via         string   `json:"via"`
+	Route       []string `json:"route,omitempty"`
+	Rule        string   `json:"rule"`
+	State       string   `json:"state"`
+	Sent        uint64   `json:"sent"`
+	Recv        uint64   `json:"received"`
+	Error       string   `json:"error,omitempty"`
+	Stage       string   `json:"stage,omitempty"`
+	Server      string   `json:"server,omitempty"`
+	Shared      bool     `json:"shared,omitempty"` // rode a multiplexed session, no socket of its own
+	Attempts    int      `json:"attempts,omitempty"`
+	DNSMs       int64    `json:"dnsMs,omitempty"`
+	ConnectMs   int64    `json:"connectMs,omitempty"`
+	HandshakeMs int64    `json:"handshakeMs,omitempty"`
+	FirstByteMs int64    `json:"firstByteMs,omitempty"`
 }
 
 type Status struct {
+	Backend     string        `json:"backend"`
 	Policy      Policy        `json:"policy"`
 	Nodes       []NodeSummary `json:"nodes"`
+	Groups      []GroupStatus `json:"groups,omitempty"`
 	Connections []Record      `json:"connections"`
 	Active      int           `json:"active"`
 }
@@ -84,79 +104,135 @@ type Status struct {
 type Engine struct {
 	mu       sync.Mutex
 	policy   Policy
-	nodes    map[string]outbound.Node
-	summary  []NodeSummary
-	rules    []Rule
+	backend  string
+	instance backend.Instance
+	dialers  map[string]backend.Dialer
+	types    map[string]string
+	servers  map[string]string
+	order    []string
+	groups   map[string]*group
+	health   map[string]*nodeHealth
+	rules    *matcher
+	probeURL string
 	sequence uint64
 	live     map[uint64]*tracked
 	recent   []Record
 	ports    map[uint16]bool
+	stop     context.CancelFunc
 }
 
-func New(config Config, localPorts ...int) (*Engine, error) {
+const (
+	dialTimeout    = 10 * time.Second
+	attemptTimeout = 5 * time.Second
+	maxAttempts    = 3
+)
+
+// New builds an engine; localPorts are HopWay's own listeners, which no
+// connection may be sent back to.
+func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error) {
 	if config.SOCKSPort < 0 || config.SOCKSPort > 65535 || config.HTTPPort < 0 || config.HTTPPort > 65535 ||
 		(config.SOCKSPort != 0 && config.SOCKSPort == config.HTTPPort) {
 		return nil, errors.New("proxy ports must be distinct or 0 for automatic assignment")
 	}
-	engine := &Engine{
-		nodes: make(map[string]outbound.Node), live: make(map[uint64]*tracked),
-		summary: []NodeSummary{{"DIRECT", "direct"}, {"REJECT", "reject"}},
-		ports:   make(map[uint16]bool),
+	engine := &Engine{dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
+		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
+		live: make(map[uint64]*tracked), ports: make(map[uint16]bool), probeURL: defaultProbeURL,
 	}
 	for _, port := range localPorts {
 		engine.ports[uint16(port)] = true
 	}
 	for _, node := range config.Nodes {
-		if node.Name == "" || strings.TrimSpace(node.Name) != node.Name || engine.validVia(node.Name) || node.Name == "SELECT" {
+		if node.Name == "" || strings.TrimSpace(node.Name) != node.Name || engine.types[node.Name] != "" || node.Name == "SELECT" {
 			return nil, fmt.Errorf("invalid or duplicate node name %q", node.Name)
 		}
 		if err := node.Validate(); err != nil {
 			return nil, fmt.Errorf("node %q: %w", node.Name, err)
 		}
-		engine.nodes[node.Name] = node
-		engine.summary = append(engine.summary, NodeSummary{node.Name, node.Type})
+		engine.types[node.Name] = node.Type
+		engine.servers[node.Name] = node.Server
+		engine.order = append(engine.order, node.Name)
 	}
-	for index, rule := range config.Rules {
-		if !engine.validVia(rule.Via) && rule.Via != "SELECT" {
-			return nil, fmt.Errorf("rule %d refers to unknown outbound %q", index+1, rule.Via)
+	groups, err := validateGroups(config.Groups, func(name string) bool { return engine.types[name] != "" })
+	if err != nil {
+		return nil, err
+	}
+	engine.groups = groups
+	for _, g := range config.Groups {
+		engine.order = append(engine.order, g.Name)
+	}
+	engine.rules, err = newMatcher(config.Rules, func(via string) bool { return engine.valid(via) || via == "SELECT" })
+	if err != nil {
+		return nil, err
+	}
+	interval := defaultProbeInterval
+	if config.Health != nil {
+		if config.Health.URL != "" {
+			if !strings.HasPrefix(config.Health.URL, "http://") && !strings.HasPrefix(config.Health.URL, "https://") {
+				return nil, errors.New("health URL must be http or https")
+			}
+			engine.probeURL = config.Health.URL
 		}
-		switch rule.Type {
-		case "domain", "domain-suffix":
-			rule.Value = normalizeHost(rule.Value)
-			if rule.Value == "" || strings.ContainsAny(rule.Value, "/: *") {
-				return nil, fmt.Errorf("rule %d needs a domain name", index+1)
+		if config.Health.Interval != 0 {
+			if config.Health.Interval < 30 {
+				return nil, errors.New("health interval must be at least 30 seconds")
 			}
-		case "ip-cidr":
-			prefix, err := netip.ParsePrefix(rule.Value)
-			if err != nil {
-				return nil, fmt.Errorf("rule %d has an invalid IP prefix", index+1)
-			}
-			rule.cidr = prefix
-		case "match":
-			if rule.Value != "" || index != len(config.Rules)-1 {
-				return nil, errors.New("match must be the last rule and have no value")
-			}
-		default:
-			return nil, fmt.Errorf("rule %d has unknown type %q", index+1, rule.Type)
+			interval = config.Health.Interval
 		}
-		engine.rules = append(engine.rules, rule)
 	}
 	if err := engine.SetPolicy(Policy{config.Mode, config.Selected}); err != nil {
 		return nil, err
 	}
+	if impl == nil {
+		return engine, nil // validation only
+	}
+	engine.backend = impl.Name()
+	engine.instance, err = impl.Open(config.Nodes, engine.guard)
+	if err != nil {
+		return nil, err
+	}
+	for _, node := range config.Nodes {
+		engine.dialers[node.Name], _ = engine.instance.Dialer(node.Name)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	engine.stop = cancel
+	if len(engine.autoMembers()) != 0 {
+		go engine.healthLoop(ctx, time.Duration(interval)*time.Second)
+	}
 	return engine, nil
 }
 
-func (engine *Engine) validVia(name string) bool {
-	_, exists := engine.nodes[name]
-	return exists || name == "DIRECT" || name == "REJECT"
+// Validate checks a configuration without opening any node.
+func Validate(config Config, impl backend.Backend) error {
+	if _, err := New(config, nil); err != nil {
+		return err
+	}
+	for _, node := range config.Nodes {
+		if err := impl.Check(node); err != nil {
+			return fmt.Errorf("node %q: %w", node.Name, err)
+		}
+	}
+	return nil
+}
+
+func (engine *Engine) Close() error {
+	if engine.stop != nil {
+		engine.stop()
+	}
+	if engine.instance != nil {
+		return engine.instance.Close()
+	}
+	return nil
+}
+
+func (engine *Engine) valid(name string) bool {
+	return engine.types[name] != "" || engine.groups[name] != nil
 }
 
 func (engine *Engine) SetPolicy(policy Policy) error {
 	if policy.Mode != "rule" && policy.Mode != "direct" && policy.Mode != "global" {
 		return errors.New("mode must be rule, direct or global")
 	}
-	if !engine.validVia(policy.Selected) {
+	if !engine.valid(policy.Selected) {
 		return errors.New("selected outbound does not exist")
 	}
 	engine.mu.Lock()
@@ -165,10 +241,21 @@ func (engine *Engine) SetPolicy(policy Policy) error {
 	return nil
 }
 
-func normalizeHost(host string) string {
-	return strings.ToLower(strings.TrimSuffix(host, "."))
+func (engine *Engine) guard(peer netip.AddrPort) error {
+	if engine.ports[peer.Port()] && (peer.Addr().Unmap().IsLoopback() || peer.Addr().IsUnspecified()) {
+		return backend.ErrLoop
+	}
+	return nil
 }
 
+func resolveForRules(host string) []netip.Addr {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	addrs, _ := backend.Resolver.Lookup(ctx, host)
+	return addrs
+}
+
+// route picks the outbound name for host. Rules are immutable after New.
 func (engine *Engine) route(host string, policy Policy) (string, string) {
 	switch policy.Mode {
 	case "direct":
@@ -176,40 +263,16 @@ func (engine *Engine) route(host string, policy Policy) (string, string) {
 	case "global":
 		return policy.Selected, "global mode"
 	}
-	host = normalizeHost(host)
-	ip, _ := netip.ParseAddr(host)
-	for _, rule := range engine.rules {
-		match := false
-		switch rule.Type {
-		case "domain":
-			match = host == rule.Value
-		case "domain-suffix":
-			match = host == rule.Value || strings.HasSuffix(host, "."+rule.Value)
-		case "ip-cidr":
-			match = ip.IsValid() && (rule.cidr.Contains(ip) || rule.cidr.Contains(ip.Unmap()))
-		case "match":
-			match = true
-		}
-		if match {
-			via := rule.Via
-			if via == "SELECT" {
-				via = policy.Selected
-			}
-			return via, strings.TrimSpace(rule.Type + " " + rule.Value)
-		}
+	index := engine.rules.match(host, resolveForRules)
+	if index < 0 {
+		return "DIRECT", "default"
 	}
-	return "DIRECT", "default"
-}
-
-func (engine *Engine) networkDial(ctx context.Context, target string) (net.Conn, error) {
-	dialer := net.Dialer{ControlContext: func(_ context.Context, _, address string, _ syscall.RawConn) error {
-		peer, err := netip.ParseAddrPort(address)
-		if err == nil && engine.ports[peer.Port()] && (peer.Addr().Unmap().IsLoopback() || peer.Addr().IsUnspecified()) {
-			return errors.New("destination points to this proxy")
-		}
-		return nil
-	}}
-	return dialer.DialContext(ctx, "tcp", target)
+	rule := engine.rules.rules[index]
+	via := rule.Via
+	if via == "SELECT" {
+		via = policy.Selected
+	}
+	return via, rule.String()
 }
 
 func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Conn, error) {
@@ -219,38 +282,129 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	}
 	engine.mu.Lock()
 	engine.sequence++
-	via, rule := engine.route(host, engine.policy)
-	record := Record{ID: engine.sequence, Target: target, Inbound: inbound, Via: via, Rule: rule, State: "active"}
+	record := Record{ID: engine.sequence, Start: time.Now().UnixMilli(), Target: target, Inbound: inbound, State: "active"}
+	policy := engine.policy
 	engine.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	// Rule evaluation may resolve DNS, so it runs outside the lock.
+	via, rule := engine.route(host, policy)
+	record.Rule = rule
+	engine.mu.Lock()
+	candidates := engine.choices(via)
+	engine.mu.Unlock()
+	if len(candidates) > maxAttempts {
+		candidates = candidates[:maxAttempts]
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 	var conn net.Conn
-	switch via {
-	case "DIRECT":
-		conn, err = engine.networkDial(ctx, target)
-	case "REJECT":
-		err = outbound.ErrRejected
-	default:
-		conn, err = engine.nodes[via].Dial(ctx, target, engine.networkDial)
+	for i, candidate := range candidates {
+		record.Via, record.Route, record.Attempts = candidate.via, candidate.route, i+1
+		attempt := ctx
+		cancelAttempt := context.CancelFunc(func() {})
+		if i < len(candidates)-1 {
+			attempt, cancelAttempt = context.WithTimeout(ctx, attemptTimeout)
+		}
+		conn, err = engine.dialOnce(attempt, candidate.via, target, &record)
+		cancelAttempt()
+		if err == nil || ctx.Err() != nil {
+			break
+		}
+		// Only fail over when the node itself is at fault; a dead target
+		// would fail the same way through every node.
+		if record.Stage != trace.StageDNS && record.Stage != trace.StageConnect && record.Stage != trace.StageHandshake {
+			break
+		}
+		if candidate.via == "DIRECT" {
+			break
+		}
 	}
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if err != nil {
-		record.State, record.Error = "failed", err.Error()
+		record.State, record.Error = "failed", describe(err)
 		if errors.Is(err, outbound.ErrRejected) {
-			record.State = "blocked"
+			record.State, record.Stage = "blocked", trace.StageRoute
 		}
 		engine.remember(record)
 		return nil, err
 	}
-	tracked := &tracked{Conn: conn, engine: engine, record: record}
+	record.Stage, record.Error = "", ""
+	tracked := &tracked{Conn: conn, engine: engine, record: record, opened: time.Now()}
 	engine.live[record.ID] = tracked
 	return tracked, nil
 }
 
+// dialOnce dials through one node and fills in stage timings.
+func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *Record) (net.Conn, error) {
+	ctx, t := trace.With(ctx)
+	start := time.Now()
+	var conn net.Conn
+	var err error
+	switch via {
+	case "DIRECT":
+		conn, err = backend.NetDial(ctx, "tcp", target, engine.guard)
+	case "REJECT":
+		err = outbound.ErrRejected
+	default:
+		dialer := engine.dialers[via]
+		if dialer == nil {
+			err = errors.New("outbound is not available")
+		} else {
+			conn, err = dialer.DialContext(ctx, target)
+		}
+	}
+	total := time.Since(start)
+	server, dns, connect, reached, failStage := t.Snapshot()
+	record.Server, record.DNSMs, record.ConnectMs = server, dns.Milliseconds(), connect.Milliseconds()
+	record.HandshakeMs, record.Shared = 0, false
+	if via != "DIRECT" && reached {
+		record.HandshakeMs = max(total-dns-connect, 0).Milliseconds()
+	}
+	if server == "" && engine.servers[via] != "" {
+		// gRPC, QUIC and mux transports open their socket on a background
+		// context and share it; the stream itself took only total.
+		record.Server, record.Shared, record.HandshakeMs = engine.servers[via], true, total.Milliseconds()
+	}
+	record.Stage = ""
+	if err != nil {
+		switch {
+		case failStage != "":
+			record.Stage = failStage
+		case via == "REJECT":
+			record.Stage = trace.StageRoute
+		default:
+			// Reached the server (or reused a session) but the protocol failed.
+			record.Stage = trace.StageHandshake
+		}
+	}
+	if via != "DIRECT" && via != "REJECT" {
+		engine.mu.Lock()
+		h := engine.health[via]
+		if err != nil && record.Stage != trace.StageRoute {
+			if h == nil {
+				h = &nodeHealth{}
+				engine.health[via] = h
+			}
+			h.alive, h.checked, h.err = false, time.Now(), describe(err)
+		} else if err == nil && h != nil && !h.alive {
+			h.alive, h.err = true, ""
+		}
+		engine.mu.Unlock()
+	}
+	return conn, err
+}
+
+func describe(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timed out"
+	}
+	return err.Error()
+}
+
 func (engine *Engine) remember(record Record) {
-	const limit = 150
+	const limit = 300
 	if len(engine.recent) == limit {
 		copy(engine.recent, engine.recent[1:])
 		engine.recent = engine.recent[:limit-1]
@@ -265,27 +419,57 @@ func (engine *Engine) Status() Status {
 	for _, conn := range engine.live {
 		records = append(records, conn.snapshot())
 	}
+	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
 	records = append(records, engine.recent...)
-	return Status{engine.policy, engine.summary, records, len(engine.live)}
+	status := Status{Backend: engine.backend, Policy: engine.policy, Connections: records, Active: len(engine.live)}
+	for _, name := range engine.order {
+		summary := NodeSummary{Name: name, Type: engine.types[name]}
+		if g := engine.groups[name]; g != nil {
+			summary.Type = "group"
+			now := ""
+			if list := engine.choices(name); len(list) != 0 {
+				now = list[0].via
+			}
+			status.Groups = append(status.Groups, GroupStatus{Name: name, Type: g.Type, Members: g.Members, Now: now})
+		}
+		if h := engine.health[name]; h != nil {
+			alive := h.alive
+			summary.Alive, summary.Error = &alive, h.err
+			if h.alive {
+				summary.LatencyMs = max(h.latency.Milliseconds(), 1)
+			}
+		}
+		status.Nodes = append(status.Nodes, summary)
+	}
+	return status
 }
 
 type tracked struct {
 	net.Conn
 	engine     *Engine
 	record     Record
+	opened     time.Time
 	sent, recv atomic.Uint64
+	firstByte  atomic.Int64
+	readErr    atomic.Value
 	once       sync.Once
 }
 
 func (conn *tracked) snapshot() Record {
 	record := conn.record
 	record.Sent, record.Recv = conn.sent.Load(), conn.recv.Load()
+	record.FirstByteMs = conn.firstByte.Load()
 	return record
 }
 
 func (conn *tracked) Read(data []byte) (int, error) {
 	count, err := conn.Conn.Read(data)
-	conn.recv.Add(uint64(count))
+	if count > 0 && conn.recv.Add(uint64(count)) == uint64(count) {
+		conn.firstByte.Store(max(time.Since(conn.opened).Milliseconds(), 1))
+	}
+	if err != nil && conn.recv.Load() == 0 {
+		conn.readErr.CompareAndSwap(nil, err.Error())
+	}
 	return count, err
 }
 
@@ -307,6 +491,15 @@ func (conn *tracked) Close() error {
 		defer conn.engine.mu.Unlock()
 		record := conn.snapshot()
 		record.State = "closed"
+		// Protocols such as VLESS and Trojan finish their handshake lazily: a
+		// bad credential shows up as the server hanging up before any reply.
+		if record.Sent > 0 && record.Recv == 0 && record.Via != "DIRECT" {
+			record.State, record.Stage = "failed", trace.StageUpstream
+			record.Error = "the proxy closed the connection without a response"
+			if text, ok := conn.readErr.Load().(string); ok && text != "EOF" {
+				record.Error += " (" + text + ")"
+			}
+		}
 		delete(conn.engine.live, record.ID)
 		conn.engine.remember(record)
 	})

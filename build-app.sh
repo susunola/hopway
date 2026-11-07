@@ -8,7 +8,10 @@ trap 'rm -rf "$staging"' EXIT
 app="$staging/HopWay.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp ui/Info.plist "$app/Contents/Info.plist"
-go build -trimpath -o "$app/Contents/Resources/mac-proxy-core" .
+# sing-box protocol features: QUIC (Hysteria2, TUIC) and uTLS (REALITY, fingerprints).
+# Set HOPWAY_TAGS=hopway_native for a build without the sing-box stack.
+tags="${HOPWAY_TAGS:-with_quic,with_utls,badlinkname,tfogo_checklinkname0}"
+go build -trimpath -tags "$tags" -ldflags "-s -w -checklinkname=0" -o "$app/Contents/Resources/mac-proxy-core" .
 arch="$(uname -m)"
 xcrun swiftc -O -target "$arch-apple-macosx14.0" -o "$app/Contents/MacOS/MacProxy" ui/*.swift
 codesign --force --sign - "$app/Contents/Resources/mac-proxy-core"
