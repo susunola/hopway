@@ -633,8 +633,15 @@ func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *
 				engine.health[via] = h
 			}
 			h.alive, h.checked, h.err = false, time.Now(), describe(err)
-		} else if err == nil && h != nil && !h.alive {
-			h.alive, h.err = true, ""
+		} else if err == nil {
+			if h == nil {
+				h = &nodeHealth{}
+				engine.health[via] = h
+			}
+			if !h.alive {
+				h.alive, h.err = true, ""
+			}
+			h.succeeded = time.Now()
 		}
 		engine.mu.Unlock()
 	}
