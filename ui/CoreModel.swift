@@ -20,9 +20,10 @@ struct Policy: Codable, Equatable {
     static func label(_ mode: String) -> String {
         switch mode {
         case "rule": "按规则"
-        case "global": "全局"
+        case "global": "手动"
         case "direct": "直连"
-        case "auto": "自动"
+        case "auto": "按地区自动"
+        case "fastest": "自动最快"
         default: mode
         }
     }
@@ -479,7 +480,7 @@ final class CoreModel: ObservableObject {
     {
       "socksPort": 1080,
       "httpPort": 8080,
-      "mode": "rule",
+      "mode": "fastest",
       "selected": "DIRECT",
       "nodes": [],
       "rules": [
@@ -568,7 +569,14 @@ final class CoreModel: ObservableObject {
         let launchedConfiguration = saved
         let child = Process()
         child.executableURL = executable
-        child.arguments = ["-managed", "-config", configURL.path]
+        var arguments = ["-managed", "-desktop-routing", "-config", configURL.path]
+        if let policy {
+            arguments += ["-startup-node", policy.selected]
+            if let key = policy.expectedProbeKey {
+                arguments += ["-startup-probe-key", key]
+            }
+        }
+        child.arguments = arguments
         let inputPipe = Pipe()
         let output = Pipe()
         child.standardInput = inputPipe
@@ -595,11 +603,8 @@ final class CoreModel: ObservableObject {
                 }
                 let info = try JSONDecoder().decode(Endpoint.self, from: data)
                 guard process === child, phase == .starting else { return }
-                if let policy {
-                    try await applyPolicy(policy, to: info)
-                    guard process === child, phase == .starting else { return }
-                }
                 endpoint = info
+                if policy != nil { reloadConfiguredNodes() }
                 appliedPorts = configuredPorts(in: launchedConfiguration)
                 phase = .running
                 configurationNotice = nil
@@ -927,6 +932,7 @@ final class CoreModel: ObservableObject {
             defer { if endpoint?.token == info.token { updatingPolicy = false } }
             do {
                 try await applyPolicy(policy, to: info)
+                reloadConfiguredNodes()
                 await refresh(info)
             } catch {
                 if endpoint?.token == info.token { message = error.localizedDescription }
@@ -1430,6 +1436,7 @@ final class CoreModel: ObservableObject {
         let output = Pipe()
         child.executableURL = executable
         child.arguments = [flag, "-config", destination.path]
+        if flag == "-inspect" { child.arguments?.append("-desktop-routing") }
         if let subscriptionID { child.arguments?.append(contentsOf: ["-subscription-id", subscriptionID]) }
         let lifetime = flag == "-refresh-subscriptions" ? Pipe() : nil
         if let lifetime {

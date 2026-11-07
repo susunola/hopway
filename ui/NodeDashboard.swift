@@ -145,7 +145,9 @@ struct NodeDashboard: View {
     var body: some View {
         let providers = providers
         let rows = rows(providers: providers)
-        let currentName = core.status?.auto?.node ?? core.status?.policy.selected
+        let currentName = core.status.flatMap { status in
+            status.auto == nil ? status.policy.selected : status.auto?.node
+        }
         let current = core.status?.nodes.first(where: { $0.name == currentName })?.probeIdentity
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center) {
@@ -285,13 +287,6 @@ struct NodeDashboard: View {
                     if selection.count == 1, let id = selection.first, let node = rows.first(where: { $0.id == id })?.node {
                         Button("连接此节点") { core.connectToNode(node.name) }
                             .disabled(!core.canConnectToNode)
-                        if let status = core.status, status.policy.mode != "auto",
-                           status.nodes.contains(where: { $0.probeIdentity == node.probeIdentity }) {
-                            Button("设为出站") {
-                                core.selectNode(node, mode: status.policy.mode)
-                            }
-                            .disabled(core.updatingPolicy)
-                        }
                     }
                 } primaryAction: { selection in
                     if selection.count == 1, let id = selection.first, let node = rows.first(where: { $0.id == id })?.node {

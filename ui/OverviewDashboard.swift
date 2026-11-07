@@ -13,15 +13,18 @@ struct OverviewDashboard: View {
     private struct ConfigurationSummary: Decodable {
         let socksPort: Int?
         let httpPort: Int?
-        let mode: String?
-        let selected: String?
+    }
 
-        var modeLabel: String {
-            switch mode {
-            case "global": "全局"
-            case "direct": "直连"
-            case "auto": "自动"
-            default: "按规则"
+    private enum OutboundChoice: Hashable {
+        case fastest, rule, direct, region, node(String)
+
+        init(policy: Policy) {
+            switch policy.mode {
+            case "fastest": self = .fastest
+            case "auto": self = .region
+            case "direct": self = .direct
+            case "global": self = policy.selected == "DIRECT" ? .direct : .node(policy.selected)
+            default: self = .rule
             }
         }
     }
@@ -132,7 +135,7 @@ struct OverviewDashboard: View {
                 Label("路由策略", systemImage: "arrow.triangle.branch").font(.headline)
                 Spacer()
                 if running {
-                    Button("自动选路…") { showsAuto = true }.disabled(core.updatingPolicy)
+                    Button("按地区选路…") { showsAuto = true }.disabled(core.updatingPolicy || core.statusReadFailed)
                 }
                 if core.configuredNodes.isEmpty {
                     Button("导入链接…", action: importLink).disabled(core.saving)
@@ -142,20 +145,17 @@ struct OverviewDashboard: View {
 
             if running, let status = core.status {
                 policyControls(status)
-            } else if !running, let configuration {
+            } else if !running, let mode = core.configuredProfile?.mode {
                 HStack(spacing: 18) {
-                    LabeledContent("配置模式", value: configuration.modeLabel)
+                    LabeledContent("启动出站", value: Policy.label(mode))
                         .fixedSize()
-                    if let selected = configuration.selected, !selected.isEmpty {
-                        HStack(spacing: 8) {
-                            Text("配置出站").foregroundStyle(.secondary)
-                            Text(selected).lineLimit(1).help(selected)
-                        }
+                    if mode == "global", let selected = core.configuredProfile?.selected {
+                        Text(selected).lineLimit(1).help(selected)
                     }
                 }
                 .font(.callout)
             } else {
-                Text(running ? "正在读取当前策略…" : "启动代理后可切换模式和出站。")
+                Text(running ? "正在读取当前出站…" : "正在读取启动出站…")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -164,44 +164,66 @@ struct OverviewDashboard: View {
     }
 
     private func policyControls(_ status: ProxyStatus) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(alignment: .center, spacing: 16) {
-                Picker("模式", selection: Binding(
-                    get: { status.policy.mode },
-                    set: { if $0 != "auto" { core.updatePolicy(Policy(mode: $0, selected: status.policy.selected)) } }
-                )) {
-                    Text("按规则").tag("rule")
-                    Text("全局").tag("global")
-                    Text("直连").tag("direct")
-                    if status.policy.mode == "auto" { Text("自动").tag("auto") }
+        HStack(alignment: .center, spacing: 14) {
+            Picker("出站", selection: Binding(
+                get: { OutboundChoice(policy: status.policy) },
+                set: { selectOutbound($0, status: status) }
+            )) {
+                Text("自动最快").tag(OutboundChoice.fastest)
+                Text("按规则").tag(OutboundChoice.rule)
+                Text("直连").tag(OutboundChoice.direct)
+                if status.policy.mode == "auto" { Text("按地区自动").tag(OutboundChoice.region) }
+                if status.policy.mode == "global", status.policy.selected == "REJECT" {
+                    Text("阻断连接").tag(OutboundChoice.node("REJECT"))
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 226)
-                if status.policy.mode != "auto" {
-                    Picker("出站", selection: Binding(
-                        get: { status.policy.selected },
-                        set: { core.updatePolicy(Policy(mode: status.policy.mode, selected: $0)) }
-                    )) {
-                        ForEach(status.nodes) { node in
-                            Text(node.name).tag(node.name)
-                        }
+                Section("手动节点") {
+                    ForEach(status.nodes.filter { $0.name != "DIRECT" && $0.name != "REJECT" && $0.type != "group" }) { node in
+                        Text(node.name).tag(OutboundChoice.node(node.name))
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                } else if let auto = status.auto {
-                    if let provider = auto.provider, let node = auto.node {
-                        Label("\(provider) · \(node)", systemImage: "point.3.connected.trianglepath.dotted")
-                            .font(.callout)
-                            .lineLimit(1)
-                            .help(node)
-                    } else {
-                        Text(auto.probing ? "正在检测同地区节点…" : "暂未找到可用节点。")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
+                }
+                let groups = status.nodes.filter { $0.type == "group" }
+                if !groups.isEmpty {
+                    Section("策略组") {
+                        ForEach(groups) { group in Text(group.name).tag(OutboundChoice.node(group.name)) }
                     }
                 }
             }
-            .disabled(core.updatingPolicy)
+            .pickerStyle(.menu)
+            .frame(maxWidth: 320)
+            .disabled(core.updatingPolicy || core.statusReadFailed)
+            if let auto = status.auto {
+                if let node = auto.node {
+                    let latency = status.nodes.first { $0.name == node }?.latencyMs.map { "\($0) ms" }
+                    let detail = [auto.provider, node, latency].compactMap { $0 }.joined(separator: " · ")
+                    Label(detail, systemImage: "point.3.connected.trianglepath.dotted")
+                        .font(.callout)
+                        .lineLimit(1)
+                        .help(detail)
+                } else {
+                    let detail = if auto.probing {
+                        "正在测速，等待可用节点…"
+                    } else if status.policy.mode == "fastest", auto.candidates == nil {
+                        "没有可测速的代理节点"
+                    } else {
+                        "暂未找到可用节点"
+                    }
+                    Text(detail).font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func selectOutbound(_ option: OutboundChoice, status: ProxyStatus) {
+        switch option {
+        case .fastest: core.updatePolicy(Policy(mode: "fastest", selected: status.policy.selected))
+        case .rule: core.updatePolicy(Policy(mode: "rule", selected: status.policy.selected))
+        case .direct: core.updatePolicy(Policy(mode: "direct", selected: "DIRECT"))
+        case .region: break
+        case .node(let name):
+            if let node = status.nodes.first(where: { $0.name == name }) {
+                core.selectNode(node, mode: "global")
+            }
         }
     }
 

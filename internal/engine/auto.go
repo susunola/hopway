@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -52,9 +53,10 @@ func (config AutoSwitchConfig) effective() (AutoSwitchConfig, error) {
 }
 
 type AutoStatus struct {
-	Provider string `json:"provider,omitempty"`
-	Node     string `json:"node,omitempty"`
-	Probing  bool   `json:"probing"`
+	Provider   string `json:"provider,omitempty"`
+	Node       string `json:"node,omitempty"`
+	Probing    bool   `json:"probing"`
+	Candidates int    `json:"candidates,omitempty"`
 }
 
 type autoNode struct {
@@ -79,6 +81,67 @@ type autoState struct {
 	probing           bool
 	cancel            context.CancelFunc
 	orderedCandidates []string
+	fastest           bool
+	eligible          []string
+	ready             chan struct{}
+}
+
+func (state *autoState) finishFirstProbe() {
+	if state.ready != nil {
+		close(state.ready)
+		state.ready = nil
+	}
+}
+
+// fastestNodes contains only concrete proxy nodes, even if a subscription's
+// strategy group lists DIRECT. Paused or exhausted providers are excluded.
+func (engine *Engine) fastestNodes() []string {
+	blocked := make(map[string]bool)
+	now := time.Now()
+	for _, sub := range engine.subscriptions {
+		if sub.Paused || providerUnavailable(sub, now) {
+			for _, name := range sub.Nodes {
+				blocked[name] = true
+			}
+		}
+	}
+	var names []string
+	for _, name := range engine.order {
+		if name != "DIRECT" && name != "REJECT" && engine.types[name] != "" && !blocked[name] {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// rankFastest runs under engine.mu. Use comparable results from the primary
+// target first, and use measurements from the fallback when necessary.
+func (engine *Engine) rankFastest(state *autoState) {
+	var verified []string
+	for _, name := range state.eligible {
+		if health := engine.health[name]; health != nil && health.alive && health.target != "" {
+			verified = append(verified, name)
+		}
+	}
+	slices.SortStableFunc(verified, func(a, b string) int {
+		left, right := engine.health[a], engine.health[b]
+		if left.target != right.target {
+			// Primary and fallback have different response latencies.
+			if left.target == engine.probeHost {
+				return -1
+			}
+			if right.target == engine.probeHost {
+				return 1
+			}
+		}
+		return cmp.Compare(left.latency, right.latency)
+	})
+	state.activeNode = ""
+	if len(verified) > 0 {
+		state.activeNode = verified[0]
+		state.finishFirstProbe()
+	}
+	state.orderedCandidates = verified[:min(len(verified), engine.attempts)]
 }
 
 func (engine *Engine) validateAuto(config *AutoConfig) error {
@@ -161,33 +224,48 @@ func (engine *Engine) MonitorAuto(ctx context.Context) {
 		default:
 		}
 		if state != nil {
-			state.unavailable = engine.unavailableProviders(state.config)
-			state.orderedCandidates = state.candidates()
+			var names []string
+			if state.fastest {
+				state.eligible = engine.fastestNodes()
+				engine.rankFastest(state)
+				names = state.eligible
+			} else {
+				state.unavailable = engine.unavailableProviders(state.config)
+				state.orderedCandidates = state.candidates()
+				seen := make(map[string]bool)
+				for _, group := range state.config.Groups {
+					for _, name := range group.Nodes {
+						if !seen[name] {
+							names = append(names, name)
+							seen[name] = true
+						}
+					}
+				}
+			}
 			epoch := engine.networkEpoch.Load()
 			probeCtx, cancel := context.WithCancel(ctx)
 			state.cancel, state.probing = cancel, true
 			engine.mu.Unlock()
-			var names []string
-			seen := make(map[string]bool)
-			for _, group := range state.config.Groups {
-				for _, name := range group.Nodes {
-					if !seen[name] {
-						names = append(names, name)
-						seen[name] = true
-					}
+			var measurements []ProbeResult
+			var emit func(ProbeResult) error
+			if !state.fastest {
+				measurements = make([]ProbeResult, 0, len(names))
+				emit = func(result ProbeResult) error {
+					measurements = append(measurements, result)
+					return nil
 				}
 			}
-			measurements := make([]ProbeResult, 0, len(names))
-			err := engine.probeNodes(probeCtx, names, func(result ProbeResult) error {
-				measurements = append(measurements, result)
-				return nil
-			})
+			err := engine.probeNodes(probeCtx, names, emit)
 			cancel()
 			engine.mu.Lock()
 			if engine.auto == state {
 				state.probing, state.cancel = false, nil
 				if err == nil && engine.networkEpoch.Load() == epoch {
-					state.apply(measurements)
+					if state.fastest {
+						state.finishFirstProbe()
+					} else {
+						state.apply(measurements)
+					}
 				}
 			}
 			engine.mu.Unlock()
@@ -365,14 +443,21 @@ func (engine *Engine) unavailableProviders(config *AutoConfig) map[int]bool {
 			if sub.Key() != group.ProviderID || sub.Usage == nil {
 				continue
 			}
-			usage := sub.Usage
-			expired := usage.ExpiresAt > 0 && now.Unix() >= usage.ExpiresAt
-			if date, err := time.ParseInLocation(time.DateOnly, usage.ExpiryDate, now.Location()); err == nil {
-				expired = expired || !now.Before(date.AddDate(0, 0, 1))
-			}
-			exhausted := usage.Used != nil && usage.Total != nil && *usage.Total > 0 && *usage.Used >= *usage.Total
-			blocked[index] = expired || exhausted
+			blocked[index] = providerUnavailable(sub, now)
 		}
 	}
 	return blocked
+}
+
+func providerUnavailable(sub Subscription, now time.Time) bool {
+	usage := sub.Usage
+	if usage == nil {
+		return false
+	}
+	expired := usage.ExpiresAt > 0 && now.Unix() >= usage.ExpiresAt
+	if date, err := time.ParseInLocation(time.DateOnly, usage.ExpiryDate, now.Location()); err == nil {
+		expired = expired || !now.Before(date.AddDate(0, 0, 1))
+	}
+	exhausted := usage.Used != nil && usage.Total != nil && *usage.Total > 0 && *usage.Used >= *usage.Total
+	return expired || exhausted
 }

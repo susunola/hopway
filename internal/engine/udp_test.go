@@ -7,6 +7,8 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
@@ -98,11 +100,24 @@ func TestUDPThroughNodes(t *testing.T) {
 }
 
 func TestSOCKS5UDPAssociate(t *testing.T) {
+	for _, mode := range []string{"global", "fastest"} {
+		t.Run(mode, func(t *testing.T) { testSOCKS5UDPAssociate(t, mode) })
+	}
+}
+
+func testSOCKS5UDPAssociate(t *testing.T, mode string) {
 	_, nodes := startServer(t)
 	echo := udpEchoServer(t)
 	config := Default()
 	config.Nodes = []outbound.Node{nodes["ss2022"]}
-	config.Mode, config.Selected = "global", "ss2022"
+	config.Mode, config.Selected = mode, "ss2022"
+	if mode == "fastest" {
+		health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		t.Cleanup(health.Close)
+		config.Health = &Health{URL: health.URL}
+	}
 	core, err := New(config, backend.Default())
 	if err != nil {
 		t.Fatal(err)

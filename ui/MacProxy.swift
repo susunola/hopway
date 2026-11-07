@@ -333,8 +333,8 @@ private struct Dashboard: View {
                     .foregroundStyle(HopAppearance.accent)
             }
             if let mode = status?.policy.mode ?? profile?.mode {
-                let outbound: String? = if mode == "auto", status != nil {
-                    status?.auto?.node ?? "等待可用节点"
+                let outbound: String? = if mode == "auto" || mode == "fastest" {
+                    status.map { $0.auto?.node ?? "等待可用节点" }
                 } else if mode == "direct" {
                     "DIRECT"
                 } else {

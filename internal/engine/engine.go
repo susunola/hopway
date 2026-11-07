@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -238,6 +239,7 @@ type Engine struct {
 	autoSwitch    AutoSwitchConfig
 	probeURL      string
 	probeFallback string
+	probeHost     string
 	sequence      uint64
 	live          map[uint64]*tracked
 	livePackets   map[uint64]*trackedPacket
@@ -414,6 +416,8 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 			interval = config.Health.Interval
 		}
 	}
+	primary, _ := url.Parse(engine.probeURL)
+	engine.probeHost = primary.Hostname()
 	if err := engine.SetPolicy(Policy{Mode: config.Mode, Selected: config.Selected}); err != nil {
 		return nil, err
 	}
@@ -497,15 +501,27 @@ func (engine *Engine) NetworkChanged() {
 	}
 	clear(engine.health)
 	if state := engine.auto; state != nil {
-		clear(state.health)
-		state.challenger, state.challengerWins = "", 0
-		state.orderedCandidates = state.candidates()
+		if state.fastest {
+			state.finishFirstProbe()
+			if len(state.eligible) > 0 {
+				state.ready = make(chan struct{})
+			}
+			engine.rankFastest(state)
+		} else {
+			clear(state.health)
+			state.challenger, state.challengerWins = "", 0
+			state.orderedCandidates = state.candidates()
+		}
 		select {
 		case engine.autoWake <- struct{}{}:
 		default:
 		}
 	}
+	fastest := engine.policy.Mode == "fastest"
 	engine.mu.Unlock()
+	if fastest {
+		return
+	}
 	if members := engine.autoMembers(); len(members) != 0 && engine.ctx != nil {
 		engine.work.Start(engine.ctx, func(ctx context.Context) { _ = engine.probeNodes(ctx, members, nil) })
 	}
@@ -561,14 +577,16 @@ func (engine *Engine) valid(name string) bool {
 }
 
 func (engine *Engine) ValidatePolicy(policy Policy) error {
-	if policy.Mode != "rule" && policy.Mode != "direct" && policy.Mode != "global" && policy.Mode != "auto" {
-		return errors.New("mode must be rule, direct, global or auto")
+	switch policy.Mode {
+	case "rule", "direct", "global", "auto", "fastest":
+	default:
+		return errors.New("mode must be rule, direct, global, auto or fastest")
 	}
 	if policy.Mode == "auto" {
 		if err := engine.validateAuto(policy.Auto); err != nil {
 			return err
 		}
-	} else if !engine.valid(policy.Selected) {
+	} else if !engine.valid(policy.Selected) && (policy.Mode != "fastest" || policy.Selected != "") {
 		return errors.New("selected outbound does not exist")
 	}
 	if policy.ExpectedProbeKey != "" && policy.ExpectedProbeKey != engine.probeKeys[policy.Selected] {
@@ -582,15 +600,32 @@ func (engine *Engine) SetPolicy(policy Policy) error {
 		return err
 	}
 	policy.ExpectedProbeKey = ""
+	if policy.Mode == "fastest" && policy.Selected == "" {
+		policy.Selected = "DIRECT"
+	}
 	engine.mu.Lock()
-	if engine.auto != nil && engine.auto.cancel != nil {
-		engine.auto.cancel()
+	if policy.Mode == "fastest" && engine.policy.Mode == policy.Mode && engine.policy.Selected == policy.Selected {
+		engine.mu.Unlock()
+		return nil
+	}
+	if engine.auto != nil {
+		engine.auto.finishFirstProbe()
+		if engine.auto.cancel != nil {
+			engine.auto.cancel()
+		}
 	}
 	engine.auto = nil
 	if policy.Mode == "auto" {
 		engine.auto = &autoState{config: policy.Auto, switching: engine.autoSwitch,
 			unavailable: engine.unavailableProviders(policy.Auto), health: make(map[string]autoNode), activeGroup: -1}
 		engine.auto.orderedCandidates = engine.auto.candidates()
+	} else if policy.Mode == "fastest" {
+		state := &autoState{fastest: true, eligible: engine.fastestNodes(), activeGroup: -1}
+		if len(state.eligible) > 0 {
+			state.ready = make(chan struct{})
+		}
+		engine.rankFastest(state)
+		engine.auto = state
 	}
 	engine.policy = policy
 	select {
@@ -663,6 +698,8 @@ func (engine *Engine) route(ctx context.Context, host string, policy Policy, own
 		return "DIRECT", "direct mode", specificRoute
 	case "auto":
 		return "AUTO", "automatic · " + policy.Auto.Region, specificRoute
+	case "fastest":
+		return "AUTO", "automatic · lowest latency", specificRoute
 	case "global":
 		return policy.Selected, "global mode", specificRoute
 	}
@@ -769,9 +806,10 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	}
 	record.Rule = rule
 	engine.countRuleOutcome(outcome)
-	engine.mu.Lock()
-	candidates := engine.choices(via)
-	engine.mu.Unlock()
+	candidates, err := engine.dialChoices(ctx, via)
+	if err != nil {
+		return nil, err
+	}
 	if len(candidates) > engine.attempts {
 		candidates = candidates[:engine.attempts]
 	}
@@ -940,9 +978,10 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 	}
 	record.Rule = rule
 	engine.countRuleOutcome(outcome)
-	engine.mu.Lock()
-	candidates := engine.choices(via)
-	engine.mu.Unlock()
+	candidates, err := engine.dialChoices(ctx, via)
+	if err != nil {
+		return nil, err
+	}
 	if len(candidates) > engine.attempts {
 		candidates = candidates[:engine.attempts]
 	}
@@ -1195,12 +1234,16 @@ func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *
 		}
 		h := engine.health[via]
 		if err != nil && record.Stage != trace.StageRoute && record.Stage != trace.StageUpstream {
+			wasVerified := h != nil && h.alive && h.target != ""
 			if h == nil {
 				h = &nodeHealth{}
 				engine.health[via] = h
 			}
 			h.alive, h.checked, h.err = false, time.Now(), record.Error
 			h.stage, h.code, h.target = record.Stage, record.FailureCode, ""
+			if wasVerified && engine.auto != nil && engine.auto.fastest {
+				engine.rankFastest(engine.auto)
+			}
 		} else if err == nil {
 			if h == nil {
 				h = &nodeHealth{}
@@ -1253,8 +1296,10 @@ func (engine *Engine) status(includeConnections bool) Status {
 		}
 	}
 	if state := engine.auto; state != nil {
-		status.Auto = &AutoStatus{Node: state.activeNode, Probing: state.probing}
-		if state.activeGroup >= 0 {
+		status.Auto = &AutoStatus{Node: state.activeNode, Probing: state.probing || state.ready != nil}
+		if state.fastest {
+			status.Auto.Candidates = len(state.eligible)
+		} else if state.activeGroup >= 0 {
 			status.Auto.Provider = state.config.Groups[state.activeGroup].Name
 		}
 	}

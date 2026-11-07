@@ -48,6 +48,9 @@ func main() {
 	port := flag.Int("port", -1, "override the SOCKS5 listen port")
 	check := flag.Bool("check", false, "validate configuration and exit")
 	managed := flag.Bool("managed", false, "start the local control API and exit when stdin closes")
+	desktopRouting := flag.Bool("desktop-routing", false, "internal: use the app's saved outbound choice")
+	startupNode := flag.String("startup-node", "", "internal: connect through this node when the app starts")
+	startupProbeKey := flag.String("startup-probe-key", "", "internal: verify the requested node configuration")
 	inspect := flag.Bool("inspect", false, "print the effective configuration's node and subscription summaries")
 	probe := flag.Bool("probe", false, "measure latency through configured nodes")
 	var probeNames []string
@@ -100,7 +103,7 @@ func main() {
 	if *inspect || *probe || *refresh {
 		ctx, cancel := profileCommandContext(*watchStdin)
 		defer cancel()
-		if err := inspectProfile(ctx, *path, *inspect, *probe, *refresh, probeNames, *refreshID); err != nil {
+		if err := inspectProfile(ctx, *path, *inspect, *probe, *refresh, probeNames, *refreshID, *desktopRouting); err != nil {
 			log.SetFlags(0)
 			log.Fatal(err)
 		}
@@ -149,7 +152,11 @@ func main() {
 		return
 	}
 
-	if err := run(*path, *port, *check, *managed); err != nil {
+	var initialPolicy *engine.Policy
+	if *startupNode != "" {
+		initialPolicy = &engine.Policy{Mode: "global", Selected: *startupNode, ExpectedProbeKey: *startupProbeKey}
+	}
+	if err := run(*path, *port, *check, *managed, *desktopRouting, initialPolicy); err != nil {
 		if *managed {
 			json.NewEncoder(os.Stdout).Encode(map[string]string{"error": err.Error()})
 		}
@@ -311,7 +318,7 @@ func dataDir(configPath string) string {
 	return ""
 }
 
-func run(path string, port int, check, managed bool) error {
+func run(path string, port int, check, managed, desktopRouting bool, initialPolicy *engine.Policy) error {
 	impl := backend.Default()
 	validate := func(config engine.Config) error { return engine.Validate(config, impl) }
 	if check {
@@ -340,6 +347,9 @@ func run(path string, port int, check, managed bool) error {
 		return err
 	}
 	defer supervisor.Close()
+	if desktopRouting {
+		supervisor.EnableDesktopRouting(initialPolicy)
+	}
 	config := supervisor.Config()
 	if port != -1 {
 		config.SOCKSPort = port
@@ -755,7 +765,7 @@ func flushControlStream(writer http.ResponseWriter, write func() error) error {
 	return controller.SetWriteDeadline(time.Time{})
 }
 
-func inspectProfile(ctx context.Context, path string, inspect, probe, refresh bool, names []string, refreshID string) error {
+func inspectProfile(ctx context.Context, path string, inspect, probe, refresh bool, names []string, refreshID string, desktopRouting bool) error {
 	impl := backend.Default()
 	validate := func(config engine.Config) error { return engine.ValidateContext(ctx, config, impl, nil) }
 	dir := dataDir(path)
@@ -811,6 +821,10 @@ func inspectProfile(ctx context.Context, path string, inspect, probe, refresh bo
 			Mode: config.Mode, Selected: config.Selected, Backend: impl.Name(), SnapshotAt: loaded.SnapshotUpdated, Revision: loaded.Revision,
 			SOCKSPort: config.SOCKSPort, HTTPPort: config.HTTPPort,
 			SystemProxy: config.SystemProxy, TUNEnabled: config.TUN != nil && config.TUN.Enabled,
+		}
+		if desktopRouting {
+			policy := app.DesktopStartupPolicy(loaded, dir)
+			result.Mode, result.Selected = policy.Mode, policy.Selected
 		}
 		if build, ok := debug.ReadBuildInfo(); ok && impl.Name() == "sing-box" {
 			for _, dep := range build.Deps {

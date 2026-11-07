@@ -86,6 +86,9 @@ type Supervisor struct {
 	mu               sync.Mutex // serializes reloads; guards the fields below
 	loaded           profile.Loaded
 	autoPolicy       *engine.Policy
+	desktopRouting   bool
+	initialPolicy    *engine.Policy
+	desktopPolicy    *desktopPolicy
 	subErr           map[string]string
 	subMeta          map[string]SubscriptionStatus // nodes and update time of each snapshot
 	subReloadPending bool
@@ -195,9 +198,39 @@ func (s *Supervisor) StartContext(ctx context.Context, target sysproxy.Target, p
 	if err != nil {
 		return err
 	}
-	core, err := engine.NewContext(ctx, s.loaded.Merged, s.impl, budget, indexes, ports...)
+	config := s.loaded.Merged
+	var startupPolicy engine.Policy
+	if s.desktopRouting {
+		startupPolicy = chooseDesktopPolicy(s.loaded, s.desktopPolicy, s.autoPolicy)
+		if s.initialPolicy != nil {
+			startupPolicy = *s.initialPolicy
+		}
+		if startupPolicy.Mode != "auto" {
+			config.Mode, config.Selected = startupPolicy.Mode, startupPolicy.Selected
+		}
+	}
+	core, err := engine.NewContext(ctx, config, s.impl, budget, indexes, ports...)
 	if err != nil {
 		return err
+	}
+	if s.desktopRouting {
+		if policy := s.initialPolicy; policy != nil {
+			if err := core.ValidatePolicy(*policy); err != nil {
+				core.Close()
+				return err
+			}
+			if err := s.saveDesktopPolicy(*policy); err != nil {
+				core.Close()
+				return err
+			}
+		}
+		if startupPolicy.Mode == "auto" {
+			policy := core.BindAutoNodes(startupPolicy)
+			if s.desktopPolicy == nil && s.autoPolicy != nil {
+				s.autoPolicy = &policy
+			}
+			core.RestorePolicy(engine.Runtime{}, &policy)
+		}
 	}
 	if s.path != "" {
 		ledger, err := engine.OpenTrafficLedger(filepath.Join(filepath.Dir(s.path), "traffic-history.json"))
@@ -213,7 +246,7 @@ func (s *Supervisor) StartContext(ctx context.Context, target sysproxy.Target, p
 	s.proxyTarget = target
 	s.started = time.Now()
 	s.generation = 1
-	if s.autoPolicy != nil {
+	if !s.desktopRouting && s.autoPolicy != nil {
 		bound := core.BindAutoNodes(*s.autoPolicy)
 		s.autoPolicy = &bound
 		core.Restore(engine.Runtime{Policy: *s.autoPolicy})
@@ -588,17 +621,26 @@ func (s *Supervisor) reloadLocked(ctx context.Context, expected string) error {
 	if s.budget != nil && !s.budget.Matches(loaded.Merged.Resources) {
 		return ErrResourcesChanged
 	}
-	core, err := engine.NewContext(ctx, loaded.Merged, s.impl, s.budget, indexes, s.ports...)
+	config := loaded.Merged
+	var preferred *engine.Policy
+	if s.desktopRouting {
+		policy := chooseDesktopPolicy(loaded, s.desktopPolicy, s.autoPolicy)
+		preferred = &policy
+		if policy.Mode != "auto" {
+			config.Mode, config.Selected = policy.Mode, policy.Selected
+		}
+	}
+	core, err := engine.NewContext(ctx, config, s.impl, s.budget, indexes, s.ports...)
 	if err != nil {
 		return err
 	}
 	core.SetTrafficLedger(s.ledger)
 	if old != nil {
 		state := old.Runtime()
-		if s.autoPolicy != nil {
+		if preferred == nil && s.autoPolicy != nil {
 			state.Policy = *s.autoPolicy
 		}
-		core.Restore(state)
+		core.RestorePolicy(state, preferred)
 	}
 	if err := ctx.Err(); err != nil {
 		core.Close()
@@ -826,16 +868,12 @@ func (s *Supervisor) loadAutoPolicy() {
 	if s.path == "" || s.dataDir == "" {
 		return
 	}
-	data, err := os.ReadFile(s.autoPolicyPath())
-	if errors.Is(err, os.ErrNotExist) {
-		return
-	}
-	var policy engine.Policy
-	if err != nil || json.Unmarshal(data, &policy) != nil || policy.Mode != "auto" || policy.Auto == nil {
+	policy, err := readRegionalPolicy(s.dataDir)
+	if err != nil {
 		s.loaded.Warnings = append(s.loaded.Warnings, "无法恢复上次的自动选路设置")
 		return
 	}
-	s.autoPolicy = &policy
+	s.autoPolicy = policy
 }
 
 func (s *Supervisor) SetPolicy(policy engine.Policy) error {
@@ -849,6 +887,12 @@ func (s *Supervisor) SetPolicy(policy engine.Policy) error {
 		return err
 	}
 	policy = core.BindAutoNodes(policy)
+	if s.desktopRouting {
+		if err := s.saveDesktopPolicy(policy); err != nil {
+			return err
+		}
+		return core.SetPolicy(policy)
+	}
 	if s.path != "" && s.dataDir != "" {
 		if policy.Mode == "auto" {
 			data, err := json.Marshal(policy)

@@ -229,6 +229,22 @@ func (engine *Engine) choices(name string) []choice {
 	return prefix(list)
 }
 
+func (engine *Engine) dialChoices(ctx context.Context, via string) ([]choice, error) {
+	engine.mu.Lock()
+	for via == "AUTO" && engine.auto != nil && engine.auto.ready != nil {
+		ready := engine.auto.ready
+		engine.mu.Unlock()
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		engine.mu.Lock()
+	}
+	defer engine.mu.Unlock()
+	return engine.choices(via), nil
+}
+
 // autoMembers lists nodes reachable from url-test and fallback groups.
 func (engine *Engine) autoMembers() []string {
 	seen := map[string]bool{}
@@ -256,7 +272,15 @@ func (engine *Engine) autoMembers() []string {
 }
 
 func (engine *Engine) healthLoop(ctx context.Context, interval time.Duration) {
-	engine.Probe(ctx, engine.autoMembers())
+	probeGroups := func() {
+		engine.mu.Lock()
+		fastest := engine.policy.Mode == "fastest"
+		engine.mu.Unlock()
+		if !fastest {
+			engine.Probe(ctx, engine.autoMembers())
+		}
+	}
+	probeGroups()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -264,7 +288,7 @@ func (engine *Engine) healthLoop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			engine.Probe(ctx, engine.autoMembers())
+			probeGroups()
 		}
 	}
 }
@@ -413,6 +437,9 @@ func (engine *Engine) saveProbe(ctx context.Context, epoch uint64, result *Probe
 			h.succeeded = previous.succeeded
 		}
 		engine.health[result.Name] = h
+		if state := engine.auto; state != nil && state.fastest {
+			engine.rankFastest(state)
+		}
 	}
 	return true
 }
@@ -601,6 +628,12 @@ func (engine *Engine) Runtime() Runtime {
 
 // Restore applies what still makes sense of a previous engine's runtime state.
 func (engine *Engine) Restore(runtime Runtime) {
+	engine.RestorePolicy(runtime, nil)
+}
+
+// RestorePolicy carries prior health and selections across a reload. An
+// explicit preferred policy has already been resolved in the new catalog.
+func (engine *Engine) RestorePolicy(runtime Runtime, preferred *Policy) {
 	resolve := func(name string) string {
 		if runtime.identities != nil {
 			return engine.outboundNames[runtime.identities[name]]
@@ -611,16 +644,18 @@ func (engine *Engine) Restore(runtime Runtime) {
 		engine.SelectInGroup(resolve(name), resolve(member))
 	}
 	policy := runtime.Policy
-	if policy.Mode != "auto" && runtime.identities != nil {
+	if preferred != nil {
+		policy = *preferred
+	} else if policy.Mode != "auto" && runtime.identities != nil {
 		policy.Selected = resolve(policy.Selected)
 		if policy.Selected == "" {
 			policy.Selected = "REJECT"
 		}
 	}
-	if runtime.Policy.Mode == "auto" && runtime.Policy.Auto != nil {
-		config := *runtime.Policy.Auto
+	if policy.Mode == "auto" && policy.Auto != nil {
+		config := *policy.Auto
 		config.Groups = nil
-		for _, group := range runtime.Policy.Auto.Groups {
+		for _, group := range policy.Auto.Groups {
 			saved, savedIDs := group.Nodes, group.NodeIDs
 			group.Nodes, group.NodeIDs = nil, nil
 			var providerNodes []string
@@ -638,9 +673,11 @@ func (engine *Engine) Restore(runtime Runtime) {
 				}
 			}
 			for i, original := range saved {
-				name := resolve(original)
+				name := original
 				if i < len(savedIDs) && savedIDs[i] != "" {
 					name = engine.outboundNames[savedIDs[i]]
+				} else if preferred == nil {
+					name = resolve(original)
 				}
 				if engine.types[name] != "" && (group.ProviderID == "" || slices.Contains(providerNodes, name)) {
 					group.Nodes = append(group.Nodes, name)
@@ -675,6 +712,10 @@ func (engine *Engine) restoreProbeHistory(runtime Runtime) {
 		}
 	}
 	if state := engine.auto; state != nil {
+		if state.fastest {
+			engine.rankFastest(state)
+			return
+		}
 		for _, group := range state.config.Groups {
 			for _, name := range group.Nodes {
 				if sample, ok := runtime.autoHealth[engine.probeKeys[name]]; ok {

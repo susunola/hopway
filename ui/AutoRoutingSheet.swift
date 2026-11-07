@@ -16,6 +16,7 @@ struct AutoRoutingStatus: Decodable, Equatable {
     let provider: String?
     let node: String?
     let probing: Bool
+    let candidates: Int?
 }
 
 struct AutoRoutingSheet: View {
