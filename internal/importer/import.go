@@ -20,6 +20,7 @@ import (
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
 	"mac-proxy/internal/outbound"
+	"mac-proxy/internal/ruleset"
 )
 
 const MaxSize = 1 << 20
@@ -29,6 +30,7 @@ type Result struct {
 	Added   int           `json:"added"`
 	Skipped int           `json:"skipped"`
 	Notes   []string      `json:"notes"`
+	Source  string        `json:"source,omitempty"` // subscription URL the content came from
 	names   map[string]bool
 	seen    map[string]bool
 	renamed map[string]string // original name -> final node name
@@ -36,10 +38,11 @@ type Result struct {
 }
 
 type clash struct {
-	Proxies   []yaml.Node `yaml:"proxies"`
-	Groups    []yaml.Node `yaml:"proxy-groups"`
-	Rules     []string    `yaml:"rules"`
-	Providers yaml.Node   `yaml:"proxy-providers"`
+	Proxies       []yaml.Node              `yaml:"proxies"`
+	Groups        []yaml.Node              `yaml:"proxy-groups"`
+	Rules         []string                 `yaml:"rules"`
+	RuleProviders map[string]clashProvider `yaml:"rule-providers"`
+	Providers     yaml.Node                `yaml:"proxy-providers"`
 }
 
 type clashNode struct {
@@ -76,6 +79,14 @@ type clashNode struct {
 	UDPRelayMode string            `yaml:"udp-relay-mode"`
 	Up           string            `yaml:"up"`
 	Down         string            `yaml:"down"`
+}
+
+type clashProvider struct {
+	Type     string `yaml:"type"`
+	Behavior string `yaml:"behavior"`
+	Format   string `yaml:"format"`
+	URL      string `yaml:"url"`
+	Interval int    `yaml:"interval"`
 }
 
 type clashReality struct {
@@ -239,11 +250,18 @@ func readBounded(reader io.Reader) ([]byte, error) {
 	return data, nil
 }
 
-func fetch(ctx context.Context, source *url.URL) ([]byte, error) {
+// Options adjust how Import fetches subscriptions.
+type Options struct {
+	// Transport carries subscription downloads; nil means a direct connection.
+	// Background refreshes pass one that goes through HopWay's own routing.
+	Transport http.RoundTripper
+}
+
+func fetch(ctx context.Context, source *url.URL, options Options) ([]byte, error) {
 	if source.User != nil || source.Hostname() == "" {
 		return nil, errors.New("订阅地址无效")
 	}
-	client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(next *http.Request, via []*http.Request) error {
+	client := &http.Client{Transport: options.Transport, Timeout: 30 * time.Second, CheckRedirect: func(next *http.Request, via []*http.Request) error {
 		if len(via) >= 5 || next.URL.User != nil ||
 			(next.URL.Scheme != "https" && (next.URL.Scheme != "http" || via[len(via)-1].URL.Scheme == "https")) {
 			return errors.New("invalid subscription redirect")
@@ -267,6 +285,10 @@ func fetch(ctx context.Context, source *url.URL) ([]byte, error) {
 }
 
 func Import(ctx context.Context, input io.Reader, base engine.Config, impl backend.Backend) (Result, error) {
+	return ImportWith(ctx, input, base, impl, Options{})
+}
+
+func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl backend.Backend, options Options) (Result, error) {
 	data, err := readBounded(input)
 	if err != nil {
 		return Result{}, err
@@ -275,12 +297,14 @@ func Import(ctx context.Context, input io.Reader, base engine.Config, impl backe
 	if raw == "" {
 		return Result{}, errors.New("没有可导入的内容")
 	}
+	sourceURL := ""
 	if !strings.ContainsAny(raw, " \r\n\t") {
 		if source, err := url.Parse(raw); err == nil && (source.Scheme == "https" || source.Scheme == "http") {
-			data, err := fetch(ctx, source)
+			data, err := fetch(ctx, source, options)
 			if err != nil {
 				return Result{}, err
 			}
+			sourceURL = raw
 			raw = strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
 		}
 	}
@@ -349,6 +373,7 @@ func Import(ctx context.Context, input io.Reader, base engine.Config, impl backe
 	if err := engine.Validate(result.Config, impl); err != nil {
 		return Result{}, err
 	}
+	result.Source = sourceURL
 	return result, nil
 }
 
@@ -454,16 +479,21 @@ func (result *Result) importClash(profile clash) {
 	if dropped > 0 {
 		result.Notes = append(result.Notes, fmt.Sprintf("%d 个策略组无法导入", dropped))
 	}
+	sets := &ruleSetBuilder{providers: profile.RuleProviders}
 	rules, skipped := convertRules(profile.Rules, func(target string) string {
 		name := resolve(target)
 		if name == "" || (taken[name] && !isGroupName(groups, name)) {
 			return ""
 		}
 		return name
-	})
+	}, sets)
 	if skipped > 0 {
-		result.Notes = append(result.Notes, fmt.Sprintf("%d 条规则未导入（GEOIP、RULE-SET 等类型暂不支持）", skipped))
+		result.Notes = append(result.Notes, fmt.Sprintf("%d 条规则未导入（类型不支持，或指向的组不存在）", skipped))
 	}
+	if len(sets.list) != 0 {
+		result.Notes = append(result.Notes, fmt.Sprintf("已导入 %d 个规则集，首次启动后在后台下载", len(sets.list)))
+	}
+	result.Config.RuleSets = sets.list
 	result.Config.Groups, result.Config.Rules = groups, rules
 	if health.URL != "" {
 		result.Config.Health = health
@@ -481,7 +511,62 @@ func isGroupName(groups []engine.Group, name string) bool {
 	return false
 }
 
-func convertRules(lines []string, target func(string) string) ([]engine.Rule, int) {
+// Public GeoIP/GeoSite rule sets in sing-box binary format.
+const (
+	geoIPURL   = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-%s.srs"
+	geoSiteURL = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-%s.srs"
+)
+
+// Private ranges, what Clash calls GEOIP,LAN.
+var lanCIDRs = []string{"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+	"172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"}
+
+type ruleSetBuilder struct {
+	providers map[string]clashProvider
+	list      []engine.RuleSet
+	names     map[string]bool
+}
+
+// use returns the rule-set name for a provider or Geo code, adding it once.
+func (b *ruleSetBuilder) use(kind, value string) string {
+	if b.names == nil {
+		b.names = map[string]bool{}
+	}
+	var set engine.RuleSet
+	switch kind {
+	case "GEOIP":
+		code := strings.ToLower(value)
+		set = engine.RuleSet{Name: "geoip-" + code, URL: fmt.Sprintf(geoIPURL, code)}
+	case "GEOSITE":
+		code := strings.ToLower(value)
+		set = engine.RuleSet{Name: "geosite-" + code, URL: fmt.Sprintf(geoSiteURL, code)}
+	case "RULE-SET":
+		provider, ok := b.providers[value]
+		if !ok || provider.Type != "http" || provider.URL == "" || provider.Format == "mrs" {
+			return ""
+		}
+		format := provider.Format
+		if format == "" {
+			format = ruleset.DetectFormat(provider.URL)
+			if format == ruleset.FormatText && !strings.HasSuffix(strings.ToLower(provider.URL), ".txt") {
+				format = ruleset.FormatYAML // Clash's default
+			}
+		}
+		set = engine.RuleSet{Name: value, URL: provider.URL, Format: format, Behavior: provider.Behavior}
+		if provider.Interval >= 600 {
+			set.Interval = provider.Interval
+		}
+	default:
+		return ""
+	}
+	if !b.names[set.Name] {
+		b.names[set.Name] = true
+		b.list = append(b.list, set)
+	}
+	return set.Name
+}
+
+func convertRules(lines []string, target func(string) string, sets *ruleSetBuilder) ([]engine.Rule, int) {
 	var rules []engine.Rule
 	skipped := 0
 	var final *engine.Rule
@@ -503,19 +588,35 @@ func convertRules(lines []string, target func(string) string) ([]engine.Rule, in
 			skipped++
 			continue
 		}
-		types := map[string]string{"DOMAIN": engine.RuleDomain, "DOMAIN-SUFFIX": engine.RuleDomainSuffix,
-			"DOMAIN-KEYWORD": engine.RuleDomainKeyword, "IP-CIDR": engine.RuleIPCIDR, "IP-CIDR6": engine.RuleIPCIDR,
-			"PROCESS-NAME": engine.RuleProcessName, "PROCESS-PATH": engine.RuleProcessPath}
-		ruleType, via := types[kind], target(parts[2])
-		if ruleType == "" || via == "" {
+		via := target(parts[2])
+		noResolve := false
+		for _, option := range parts[3:] {
+			if strings.EqualFold(option, "no-resolve") {
+				noResolve = true
+			}
+		}
+		if via == "" {
 			skipped++
 			continue
 		}
-		rule := engine.Rule{Type: ruleType, Value: parts[1], Via: via}
-		for _, option := range parts[3:] {
-			if strings.EqualFold(option, "no-resolve") {
-				rule.NoResolve = true
+		if kind == "GEOIP" && strings.EqualFold(parts[1], "LAN") {
+			for _, cidr := range lanCIDRs {
+				rules = append(rules, engine.Rule{Type: engine.RuleIPCIDR, Value: cidr, Via: via, NoResolve: noResolve})
 			}
+			continue
+		}
+		types := map[string]string{"DOMAIN": engine.RuleDomain, "DOMAIN-SUFFIX": engine.RuleDomainSuffix,
+			"DOMAIN-KEYWORD": engine.RuleDomainKeyword, "IP-CIDR": engine.RuleIPCIDR, "IP-CIDR6": engine.RuleIPCIDR,
+			"PROCESS-NAME": engine.RuleProcessName, "PROCESS-PATH": engine.RuleProcessPath}
+		rule := engine.Rule{Type: types[kind], Value: parts[1], Via: via, NoResolve: noResolve}
+		if rule.Type == "" && sets != nil {
+			if name := sets.use(kind, parts[1]); name != "" {
+				rule.Type, rule.Value = engine.RuleRuleSet, name
+			}
+		}
+		if rule.Type == "" {
+			skipped++
+			continue
 		}
 		rules = append(rules, rule)
 	}

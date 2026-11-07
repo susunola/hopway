@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"mac-proxy/internal/process"
+	"mac-proxy/internal/ruleset"
 )
 
 // Rule types, matching Clash semantics where they overlap.
@@ -49,7 +50,14 @@ type matcher struct {
 	procPath map[string]int
 	procDirs []indexed
 	procMin  int
+	sets     []setRule // rule-set rules in order
 	final    int
+}
+
+type setRule struct {
+	index     int
+	set       *ruleset.Set
+	noResolve bool
 }
 
 type indexed struct {
@@ -108,7 +116,7 @@ func (set *prefixSet) lookup(addr netip.Addr) int {
 	return best
 }
 
-func newMatcher(rules []Rule, valid func(string) bool) (*matcher, error) {
+func newMatcher(rules []Rule, valid func(string) bool, sets map[string]*ruleset.Set) (*matcher, error) {
 	m := &matcher{exact: make(map[string]int), suffix: make(map[string]int), final: none,
 		procName: make(map[string]int), procPath: make(map[string]int), procMin: none,
 		ip: prefixSet{first: none}, resolved: prefixSet{first: none}}
@@ -171,6 +179,12 @@ func newMatcher(rules []Rule, valid func(string) bool) (*matcher, error) {
 				m.procPath[rule.Value] = index
 			}
 			m.procMin = min(m.procMin, index)
+		case RuleRuleSet:
+			set := sets[rule.Value]
+			if set == nil {
+				return nil, fmt.Errorf("rule %d refers to unknown rule-set %q", index+1, rule.Value)
+			}
+			m.sets = append(m.sets, setRule{index, set, rule.NoResolve})
 		case RuleMatch:
 			if rule.Value != "" || index != len(rules)-1 {
 				return nil, fmt.Errorf("rule %d: match must be the last rule and have no value", index+1)
@@ -192,6 +206,7 @@ func (m *matcher) match(host string, resolve func(string) []netip.Addr, owner fu
 	best := m.final
 	if addr, err := netip.ParseAddr(host); err == nil {
 		best = min(best, m.ip.lookup(addr))
+		best = m.matchSetIP(best, addr, false)
 		return found(m.matchProcess(best, owner))
 	}
 	if index, ok := m.exact[host]; ok {
@@ -215,13 +230,54 @@ func (m *matcher) match(host string, resolve func(string) []netip.Addr, owner fu
 			best = keyword.index
 		}
 	}
+	for _, rule := range m.sets {
+		if rule.index >= best {
+			break
+		}
+		if rule.set.MatchDomain(host) {
+			best = rule.index
+			break
+		}
+	}
 	best = m.matchProcess(best, owner)
-	if m.resolved.first < best && resolve != nil {
+	if m.resolveCould(best) && resolve != nil {
 		for _, addr := range resolve(host) {
 			best = min(best, m.resolved.lookup(addr))
+			best = m.matchSetIP(best, addr, true)
 		}
 	}
 	return found(best)
+}
+
+// resolveCould reports whether an IP rule that may resolve names sits before best.
+func (m *matcher) resolveCould(best int) bool {
+	if m.resolved.first < best {
+		return true
+	}
+	for _, rule := range m.sets {
+		if rule.index >= best {
+			return false
+		}
+		if !rule.noResolve && rule.set.HasIP() {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *matcher) matchSetIP(best int, addr netip.Addr, resolved bool) int {
+	for _, rule := range m.sets {
+		if rule.index >= best {
+			break
+		}
+		if resolved && rule.noResolve {
+			continue
+		}
+		if rule.set.MatchIP(addr) {
+			return rule.index
+		}
+	}
+	return best
 }
 
 // matchProcess runs before DNS: finding the process is a local table lookup,

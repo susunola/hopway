@@ -82,6 +82,7 @@ struct ProxyStatus: Decodable {
     }
 
     let policy: Policy
+    let warnings: [String]?
     let nodes: [Node]
     let connections: [Connection]
     let active: Int
@@ -266,11 +267,26 @@ final class CoreModel: ObservableObject {
         return data
     }
 
+    /// Applies the saved configuration to the running core without a restart.
+    private func applyRunning() async -> String {
+        guard let info = endpoint else { return "重启内核后生效。" }
+        do {
+            _ = try await call(info, path: "reload", method: "POST")
+            await refresh(info)
+            return "已生效，无需重启。"
+        } catch {
+            return "未能热加载（" + error.localizedDescription + "），重启内核后生效。"
+        }
+    }
+
     private func refresh(_ info: Endpoint) async {
         do {
             let data = try await call(info, path: "status")
             guard endpoint?.token == info.token else { return }
             status = try JSONDecoder().decode(ProxyStatus.self, from: data)
+            if message == nil, let warnings = status?.warnings, !warnings.isEmpty {
+                message = warnings.joined(separator: "；")
+            }
         } catch {
             guard !Task.isCancelled, endpoint?.token == info.token else { return }
             message = "读取内核状态失败 · " + error.localizedDescription
@@ -314,7 +330,10 @@ final class CoreModel: ObservableObject {
                 }.value
                 draft = text
                 saved = text
-                let next = phase == .running ? "重启内核后生效。" : "启动后可在概览切换出站。"
+                var next = "启动后可在概览切换出站。"
+                if phase == .running {
+                    next = await applyRunning()
+                }
                 message = summary + " " + next
             } catch {
                 message = "导入失败 · " + error.localizedDescription
@@ -337,10 +356,9 @@ final class CoreModel: ObservableObject {
         let output = Pipe()
         let child = Process()
         child.executableURL = executable
-        child.arguments = ["-import"]
-        if files.fileExists(atPath: destination.path) {
-            child.arguments?.append(contentsOf: ["-config", destination.path])
-        }
+        // Always name the config path, even before the file exists: the core
+        // keeps subscription caches next to it.
+        child.arguments = ["-import", "-config", destination.path]
         child.standardInput = input
         child.standardOutput = output
         child.standardError = output
@@ -418,7 +436,12 @@ final class CoreModel: ObservableObject {
             do {
                 try await Task.detached { try Self.validateAndSave(candidate, to: destination, with: executable) }.value
                 saved = candidate
-                message = phase == .running ? "配置已保存。重启内核后生效。" : "配置已保存。"
+                if phase == .running {
+                    let applied = await applyRunning()
+                    message = "配置已保存，" + applied
+                } else {
+                    message = "配置已保存。"
+                }
             } catch {
                 message = error.localizedDescription
             }

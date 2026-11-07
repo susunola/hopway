@@ -30,7 +30,21 @@ type Config struct {
 	Nodes     []outbound.Node `json:"nodes"`
 	Groups    []Group         `json:"groups,omitempty"`
 	Rules     []Rule          `json:"rules"`
+	RuleSets  []RuleSet       `json:"ruleSets,omitempty"`
 	Health    *Health         `json:"health,omitempty"`
+	// Subscriptions are merged in by the profile package; the engine only
+	// sees their nodes, groups and rules.
+	Subscriptions []Subscription `json:"subscriptions,omitempty"`
+
+	// DataDir holds caches (downloaded rule sets). Set by the caller, not saved.
+	DataDir string `json:"-"`
+}
+
+// Subscription is a remote node list refreshed in the background.
+type Subscription struct {
+	Name     string `json:"name"`
+	URL      string `json:"url"`
+	Interval int    `json:"intervalSec,omitempty"` // default 12 hours
 }
 
 func Default() Config {
@@ -98,12 +112,13 @@ type Record struct {
 }
 
 type Status struct {
-	Backend     string        `json:"backend"`
-	Policy      Policy        `json:"policy"`
-	Nodes       []NodeSummary `json:"nodes"`
-	Groups      []GroupStatus `json:"groups,omitempty"`
-	Connections []Record      `json:"connections"`
-	Active      int           `json:"active"`
+	Backend     string          `json:"backend"`
+	Policy      Policy          `json:"policy"`
+	Nodes       []NodeSummary   `json:"nodes"`
+	Groups      []GroupStatus   `json:"groups,omitempty"`
+	RuleSets    []RuleSetStatus `json:"ruleSets,omitempty"`
+	Connections []Record        `json:"connections"`
+	Active      int             `json:"active"`
 }
 
 type Engine struct {
@@ -126,6 +141,8 @@ type Engine struct {
 	stop     context.CancelFunc
 
 	lookupProcess func(client, server netip.AddrPort) (*process.Owner, error)
+	dataDir       string
+	ruleSets      []*ruleSetState
 }
 
 const (
@@ -168,7 +185,12 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 	for _, g := range config.Groups {
 		engine.order = append(engine.order, g.Name)
 	}
-	engine.rules, err = newMatcher(config.Rules, func(via string) bool { return engine.valid(via) || via == "SELECT" })
+	engine.dataDir = config.DataDir
+	sets, err := engine.openRuleSets(config)
+	if err != nil {
+		return nil, err
+	}
+	engine.rules, err = newMatcher(config.Rules, func(via string) bool { return engine.valid(via) || via == "SELECT" }, sets)
 	if err != nil {
 		return nil, err
 	}
@@ -205,6 +227,12 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 	engine.stop = cancel
 	if len(engine.autoMembers()) != 0 {
 		go engine.healthLoop(ctx, time.Duration(interval)*time.Second)
+	}
+	for _, state := range engine.ruleSets {
+		if state.URL != "" {
+			go engine.ruleSetLoop(ctx)
+			break
+		}
 	}
 	return engine, nil
 }
@@ -475,7 +503,8 @@ func (engine *Engine) Status() Status {
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
 	records = append(records, engine.recent...)
-	status := Status{Backend: engine.backend, Policy: engine.policy, Connections: records, Active: len(engine.live)}
+	status := Status{Backend: engine.backend, Policy: engine.policy, Connections: records, Active: len(engine.live),
+		RuleSets: engine.ruleSetStatus()}
 	for _, name := range engine.order {
 		summary := NodeSummary{Name: name, Type: engine.types[name]}
 		if g := engine.groups[name]; g != nil {
