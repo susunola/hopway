@@ -87,7 +87,7 @@ struct OverviewDashboard: View {
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, 20)
         .frame(maxWidth: .infinity)
         .background {
             RoundedRectangle(cornerRadius: 12)
@@ -278,7 +278,7 @@ struct OverviewDashboard: View {
         let todayCount = days.last?.count
         let rates = running ? core.liveTraffic : nil
         let ratePlaceholder = running ? "等待采样" : core.phase.rawValue
-        let chartHeight: CGFloat = 112
+        let chartHeight: CGFloat = 120
 
         return VStack(alignment: .leading, spacing: 11) {
             HStack(spacing: 8) {
