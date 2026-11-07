@@ -88,9 +88,17 @@ struct ProxyStatus: Decodable {
         let recovered: Bool?
     }
 
+    struct TUN: Decodable {
+        let supported: Bool
+        let enabled: Bool
+        let device: String?
+        let error: String?
+    }
+
     let policy: Policy
     let warnings: [String]?
     let systemProxy: SystemProxy?
+    let tun: TUN?
     let nodes: [Node]
     let connections: [Connection]
     let active: Int
@@ -332,6 +340,21 @@ final class CoreModel: ObservableObject {
                 await refresh(info)
             } catch {
                 if endpoint?.token == info.token { message = "系统代理设置失败 · " + error.localizedDescription }
+            }
+        }
+    }
+
+    /// Turns on TUN mode (macOS asks for the administrator password) or off.
+    func setTUN(_ enabled: Bool) {
+        guard let info = endpoint else { return }
+        message = enabled ? "正在开启增强模式，请在系统弹窗中输入管理员密码…" : nil
+        Task {
+            do {
+                struct Body: Encodable { let enabled: Bool }
+                _ = try await call(info, path: "tun", method: "PUT", body: JSONEncoder().encode(Body(enabled: enabled)))
+                await refresh(info)
+            } catch {
+                if endpoint?.token == info.token { message = "增强模式切换失败 · " + error.localizedDescription }
             }
         }
     }

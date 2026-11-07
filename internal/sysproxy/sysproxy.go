@@ -292,10 +292,12 @@ func (m *Manager) Disable() error {
 // Recover undoes a previous run that changed the settings and never put
 // them back (crash, kill -9, power loss). Call it before Enable.
 func (m *Manager) Recover() (bool, error) {
-	if _, err := os.Stat(m.backup); err != nil {
+	_, proxyErr := os.Stat(m.backup)
+	_, dnsErr := os.Stat(m.dnsBackupPath())
+	if proxyErr != nil && dnsErr != nil {
 		return false, nil
 	}
-	return true, m.Disable()
+	return true, errors.Join(m.Disable(), m.RestoreDNS())
 }
 
 // Enabled reports whether HopWay currently owns the system proxy.

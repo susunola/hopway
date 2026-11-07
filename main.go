@@ -28,6 +28,7 @@ import (
 	"mac-proxy/internal/profile"
 	"mac-proxy/internal/socks5"
 	"mac-proxy/internal/sysproxy"
+	"mac-proxy/internal/tun"
 )
 
 type ready struct {
@@ -43,7 +44,15 @@ func main() {
 	check := flag.Bool("check", false, "validate configuration and exit")
 	managed := flag.Bool("managed", false, "start the local control API and exit when stdin closes")
 	importInput := flag.Bool("import", false, "read a subscription URL or profile from stdin and print converted JSON")
+	tunHelper := flag.String("tun-helper", "", "internal: create the TUN device as root and hand it to the core over this socket")
 	flag.Parse()
+	if *tunHelper != "" {
+		if err := tun.RunHelper(*tunHelper, tun.Options{}); err != nil {
+			log.SetFlags(0)
+			log.Fatal(err)
+		}
+		return
+	}
 	if *importInput {
 		result, err := runImport(*path)
 		if err == nil {
@@ -284,6 +293,21 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 			return
 		}
 		writer.WriteHeader(http.StatusNoContent)
+	})
+	// TUN can wait on the administrator password dialog, longer than the
+	// control API's write timeout, so it is applied in the background.
+	router.HandleFunc("PUT /tun", func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			Enabled bool `json:"enabled"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 1024))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		go supervisor.SetTUN(body.Enabled)
+		writer.WriteHeader(http.StatusAccepted)
 	})
 	router.HandleFunc("PUT /system-proxy", func(writer http.ResponseWriter, request *http.Request) {
 		var body struct {

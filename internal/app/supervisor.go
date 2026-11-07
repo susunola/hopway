@@ -6,8 +6,10 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,7 @@ import (
 	"mac-proxy/internal/netmon"
 	"mac-proxy/internal/profile"
 	"mac-proxy/internal/sysproxy"
+	"mac-proxy/internal/tun"
 )
 
 type SubscriptionStatus struct {
@@ -35,9 +38,17 @@ type SystemProxyStatus struct {
 	Recovered bool   `json:"recovered,omitempty"` // settings left by a crashed run were restored at start
 }
 
+type TUNStatus struct {
+	Supported bool   `json:"supported"`
+	Enabled   bool   `json:"enabled"`
+	Device    string `json:"device,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
 type Status struct {
 	engine.Status
 	SystemProxy   SystemProxyStatus    `json:"systemProxy"`
+	TUN           TUNStatus            `json:"tun"`
 	Network       []netmon.Event       `json:"network,omitempty"` // recent changes, newest last
 	Warnings      []string             `json:"warnings,omitempty"`
 	Subscriptions []SubscriptionStatus `json:"subscriptions,omitempty"`
@@ -63,7 +74,16 @@ type Supervisor struct {
 	proxyErr    string
 	recovered   bool
 	events      []netmon.Event
+
+	tunMu     sync.Mutex // serializes TUN changes; the helper prompt can take minutes
+	tunDevice *tun.Service
+	tunName   string
+	tunErr    string
 }
+
+// TUNSupported is true where HopWay can create the device: macOS through
+// the privileged helper, Linux when running as root.
+var TUNSupported = runtime.GOOS == "darwin" || (runtime.GOOS == "linux" && os.Geteuid() == 0)
 
 // Retirement: an engine replaced by a reload keeps serving its open
 // connections and is closed once they finish, or after this long.
@@ -125,6 +145,86 @@ func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
 	if s.loaded.Merged.SystemProxy {
 		s.SetSystemProxy(true)
 	}
+	if t := s.loaded.Merged.TUN; t != nil && t.Enabled {
+		go s.SetTUN(true) // may wait for the user to enter a password
+	}
+	return nil
+}
+
+// SetTUN turns the TUN device on or off. On macOS without root this shows
+// the system's administrator password dialog once per start.
+func (s *Supervisor) SetTUN(enabled bool) error {
+	s.tunMu.Lock()
+	defer s.tunMu.Unlock()
+	err := s.setTUNLocked(enabled)
+	s.mu.Lock()
+	s.tunErr = ""
+	if err != nil {
+		s.tunErr = err.Error()
+	}
+	s.mu.Unlock()
+	return err
+}
+
+func (s *Supervisor) setTUNLocked(enabled bool) error {
+	if !enabled {
+		if s.tunDevice == nil {
+			return nil
+		}
+		err := s.tunDevice.Close()
+		s.mu.Lock()
+		s.tunDevice, s.tunName = nil, ""
+		s.mu.Unlock()
+		if SystemProxySupported {
+			err = errors.Join(err, s.proxy.RestoreDNS())
+		}
+		return err
+	}
+	if s.tunDevice != nil {
+		return nil
+	}
+	if !TUNSupported {
+		return errors.New("TUN mode needs macOS, or root on Linux")
+	}
+	options := tun.Options{}
+	if t := s.loaded.Merged.TUN; t != nil {
+		options.MTU = t.MTU
+	}
+	// Read the real DNS servers before the system DNS is pointed at the device.
+	options.UpstreamDNS = tun.SystemDNS(options.DNSAddress())
+	if len(options.UpstreamDNS) == 0 {
+		options.UpstreamDNS = []string{"223.5.5.5:53", "1.1.1.1:53"}
+	}
+	if os.Geteuid() == 0 {
+		options.AutoRoute = true
+	} else {
+		executable, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		fd, name, err := tun.OpenWithHelper(executable)
+		if err != nil {
+			return err
+		}
+		options.FD, options.Name = fd, name
+	}
+	device, err := tun.Start(options, s.Dial, func(target string) string { return s.current.Load().Decide(target) })
+	if err != nil {
+		return err
+	}
+	name := options.Name
+	if SystemProxySupported {
+		// A DNS server on the local network has a more specific route than
+		// the tunnel; point the system at the device so queries reach it.
+		if err := s.proxy.SetDNS(options.DNSAddress().String()); err != nil {
+			s.proxy.RestoreDNS()
+			device.Close()
+			return fmt.Errorf("cannot point the system DNS at the tunnel: %w", err)
+		}
+	}
+	s.mu.Lock()
+	s.tunDevice, s.tunName = device, name
+	s.mu.Unlock()
 	return nil
 }
 
@@ -153,6 +253,12 @@ func (s *Supervisor) SetSystemProxy(enabled bool) error {
 
 func (s *Supervisor) networkChanged(event netmon.Event) {
 	s.current.Load().NetworkChanged()
+	s.mu.Lock()
+	device := s.tunDevice
+	s.mu.Unlock()
+	if device != nil {
+		device.ResetNetwork()
+	}
 	if SystemProxySupported {
 		if _, err := s.proxy.Refresh(); err != nil {
 			s.mu.Lock()
@@ -181,6 +287,7 @@ func (s *Supervisor) Close() {
 	if SystemProxySupported && s.proxy.Enabled() {
 		s.proxy.Disable()
 	}
+	s.SetTUN(false)
 	if core := s.current.Load(); core != nil {
 		core.Close()
 	}
@@ -240,6 +347,7 @@ func (s *Supervisor) Status() Status {
 	status.SystemProxy = SystemProxyStatus{Supported: SystemProxySupported, Enabled: s.proxy.Enabled(),
 		Error: s.proxyErr, Recovered: s.recovered}
 	status.Network = append([]netmon.Event(nil), s.events...)
+	status.TUN = TUNStatus{Supported: TUNSupported, Enabled: s.tunDevice != nil, Device: s.tunName, Error: s.tunErr}
 	status.Reloaded = s.started.UnixMilli()
 	for _, sub := range s.loaded.User.Subscriptions {
 		entry := s.subMeta[sub.URL]

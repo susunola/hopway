@@ -30,4 +30,10 @@
 1. ~~不用 TUN 也能识别发起连接的进程~~：已完成。支持 `process-name`、`process-path` 规则，连接表新增「应用」列。
 2. ~~规则集与订阅刷新~~：已完成。支持 `.srs`、Clash yaml/text 规则集，导入 Clash 的 GEOIP、GEOSITE 和 RULE-SET，订阅后台刷新并热加载，配置损坏时回退到上一次可用的配置。
 3. ~~可恢复的系统代理开关~~：已完成。改动前先备份，崩溃后下次启动自动还原。网络切换、睡眠唤醒后会清空 DNS 缓存、重置失效会话并重新测速。
-4. 用 Network Extension 做 TUN，处理 UDP、DNS 和 IPv6。
+4. ~~TUN~~：已完成，采用特权助手方案（创建 utun 后通过 SCM_RIGHTS 移交给普通权限的内核），配合 fake-ip DNS、SNI/HTTP 嗅探、绑定物理网卡防回环、UDP 直连。在真实的 TUN 网卡上做了端到端测试。上架时换成 Network Extension 即可，内核部分可以复用。
+
+后续：
+
+5. 经代理节点转发 UDP（sing-box 的 `ListenPacket`），覆盖 QUIC、游戏和语音通话。
+6. IPv6 fake-ip，以及 TUN 下的 IPv6 路由。
+7. 常驻的特权服务（SMAppService），免去每次开启 TUN 都要输入密码。

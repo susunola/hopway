@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	sbprocess "github.com/sagernet/sing-box/common/process"
+	"github.com/sagernet/sing-box/log"
 )
 
 var (
@@ -20,7 +21,10 @@ var (
 // server. On macOS this reads net.inet.tcp.pcblist_n (cached briefly by
 // sing-box) and resolves the executable with proc_pidpath.
 func Lookup(client, server netip.AddrPort) (*Owner, error) {
-	searcherOnce.Do(func() { searcher, searcherErr = sbprocess.NewSearcher(sbprocess.Config{}) })
+	// A logger is required: the Linux searcher logs through it unconditionally.
+	searcherOnce.Do(func() {
+		searcher, searcherErr = sbprocess.NewSearcher(sbprocess.Config{Logger: log.NewNOPFactory().Logger()})
+	})
 	if searcherErr != nil {
 		return nil, searcherErr
 	}

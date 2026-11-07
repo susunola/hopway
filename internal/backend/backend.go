@@ -10,6 +10,8 @@ import (
 	"net/netip"
 	"sort"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"mac-proxy/internal/outbound"
@@ -49,8 +51,83 @@ type Backend interface {
 
 var ErrLoop = errors.New("destination points to this proxy")
 
+// SocketControl, when set, is applied to every socket HopWay opens itself.
+// In TUN mode it binds sockets to the physical interface, so HopWay's own
+// traffic never loops back into the tunnel.
+var socketControl atomic.Pointer[func(network, address string, c syscall.RawConn) error]
+
+// goResolver, when set, replaces the system resolver for HopWay's own
+// lookups. In TUN mode the system resolver's queries would be hijacked and
+// answered with fake IPs, so HopWay asks the DNS servers directly over
+// bound sockets instead.
+var goResolver atomic.Pointer[net.Resolver]
+
+// upstream DNS servers for HopWay's own lookups while SocketControl is set.
+var upstreamDNS atomic.Pointer[[]string]
+
+func SetSocketControl(control func(network, address string, c syscall.RawConn) error, upstreams ...string) {
+	if control == nil {
+		socketControl.Store(nil)
+		goResolver.Store(nil)
+		upstreamDNS.Store(nil)
+		Resolver.Flush()
+		return
+	}
+	// Loopback never goes through the tunnel, and a socket bound to the
+	// physical interface cannot receive loopback replies.
+	bound := func(network, address string, c syscall.RawConn) error {
+		if host, _, err := net.SplitHostPort(address); err == nil {
+			if addr, err := netip.ParseAddr(host); err == nil && addr.Unmap().IsLoopback() {
+				return nil
+			}
+		}
+		return control(network, address, c)
+	}
+	socketControl.Store(&bound)
+	if len(upstreams) != 0 {
+		upstreamDNS.Store(&upstreams)
+	}
+	var next atomic.Uint32
+	goResolver.Store(&net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		// The system's DNS setting may point at the tunnel itself; ask the
+		// servers that were configured before it instead.
+		if list := upstreamDNS.Load(); list != nil && len(*list) != 0 {
+			address = (*list)[int(next.Add(1))%len(*list)]
+		}
+		return BoundDial(ctx, network, address)
+	}})
+	Resolver.Flush()
+}
+
+// UpstreamDNS returns the servers HopWay's own lookups use in TUN mode.
+func UpstreamDNS() []string {
+	if list := upstreamDNS.Load(); list != nil {
+		return *list
+	}
+	return nil
+}
+
+// BoundDial opens a socket with SocketControl applied.
+func BoundDial(ctx context.Context, network, address string) (net.Conn, error) {
+	dialer := net.Dialer{}
+	if control := socketControl.Load(); control != nil {
+		dialer.Control = *control
+	}
+	return dialer.DialContext(ctx, network, address)
+}
+
+// ListenPacket opens an unconnected UDP socket for sending to peer, with
+// SocketControl applied unless peer is a loopback address.
+func ListenPacket(ctx context.Context, peer netip.Addr) (net.PacketConn, error) {
+	config := net.ListenConfig{}
+	if control := socketControl.Load(); control != nil && !peer.Unmap().IsLoopback() {
+		config.Control = *control
+	}
+	return config.ListenPacket(ctx, "udp", "")
+}
+
 // Resolver is the DNS cache shared by DIRECT connections and node servers.
-var Resolver = &cache{entries: make(map[string]cached)}
+var Resolver = &cache{entries: make(map[string]cached), pinned: make(map[string][]netip.Addr)}
 
 type cached struct {
 	addrs   []netip.Addr
@@ -60,6 +137,18 @@ type cached struct {
 type cache struct {
 	mu      sync.Mutex
 	entries map[string]cached
+	pinned  map[string][]netip.Addr // fixed answers (hosts entries), never flushed
+}
+
+// Pin makes host always resolve to addrs; nil removes the entry.
+func (c *cache) Pin(host string, addrs []netip.Addr) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if addrs == nil {
+		delete(c.pinned, host)
+		return
+	}
+	c.pinned[host] = addrs
 }
 
 const cacheTTL = 30 * time.Second
@@ -69,12 +158,20 @@ func (c *cache) Lookup(ctx context.Context, host string) ([]netip.Addr, error) {
 		return []netip.Addr{addr.Unmap()}, nil
 	}
 	c.mu.Lock()
+	if addrs, ok := c.pinned[host]; ok {
+		c.mu.Unlock()
+		return addrs, nil
+	}
 	entry, ok := c.entries[host]
 	c.mu.Unlock()
 	if ok && time.Now().Before(entry.expires) {
 		return entry.addrs, nil
 	}
-	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	resolver := net.DefaultResolver
+	if r := goResolver.Load(); r != nil {
+		resolver = r
+	}
+	addrs, err := resolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
 		return nil, err
 	}
@@ -119,6 +216,9 @@ func NetDial(ctx context.Context, network, address string, guard Guard) (net.Con
 	}
 	connectStart := time.Now()
 	var dialer net.Dialer
+	if control := socketControl.Load(); control != nil {
+		dialer.Control = *control
+	}
 	for i, addr := range addrs {
 		target := netip.AddrPortFrom(addr, port)
 		if guard != nil {
