@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math/bits"
 	"net"
 	"net/netip"
 	"sync"
@@ -23,12 +24,9 @@ const (
 	udpSendQueue             = 8
 	udpSessionIdle           = 5 * time.Minute
 	udpWriteTimeout          = 2 * time.Second
-	maxUDPQueuedBytes        = 8 << 20
-	udpQueueOverhead         = 32
 	maxUDPAssociations       = 256
 )
 
-var udpQueuedBytes atomic.Int64
 var udpAssociations = make(chan struct{}, maxUDPAssociations)
 var errFragmentedDatagram = errors.New("fragmented datagrams are not supported")
 
@@ -163,22 +161,12 @@ func (s *udpSession) touch() {
 }
 
 func (s *udpSession) enqueue(payload []byte) bool {
-	if len(s.queue) == cap(s.queue) {
+	if len(s.queue) == cap(s.queue) || !wire.UDPQueue.TryReserve(udpQueueCharge(len(payload))) {
 		wire.SOCKSUDPDrops.Add(wire.UDPQueueFull, 1)
 		return false
 	}
-	cost := int64(len(payload) + udpQueueOverhead)
-	for {
-		used := udpQueuedBytes.Load()
-		if used+cost > maxUDPQueuedBytes {
-			wire.SOCKSUDPDrops.Add(wire.UDPQueueFull, 1)
-			return false
-		}
-		if udpQueuedBytes.CompareAndSwap(used, used+cost) {
-			s.queue <- bytes.Clone(payload)
-			return true
-		}
-	}
+	s.queue <- bytes.Clone(payload)
+	return true
 }
 
 // discard runs with the association lock, after the only consumer exits.
@@ -192,7 +180,12 @@ func (s *udpSession) discard(err error) {
 }
 
 func releaseUDPData(data []byte) {
-	udpQueuedBytes.Add(-int64(len(data) + udpQueueOverhead))
+	wire.UDPQueue.Release(udpQueueCharge(len(data)))
+}
+
+func udpQueueCharge(size int) int {
+	// Include the slice header and round up to cover allocation size classes.
+	return 32 + 1<<bits.Len(uint(max(size, 1)-1))
 }
 
 func (s *udpSession) run(relay *net.UDPConn, client netip.AddrPort, target string, dial DialPacketFunc) error {

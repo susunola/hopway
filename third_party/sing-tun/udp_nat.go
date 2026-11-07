@@ -3,6 +3,7 @@ package tun
 import (
 	"context"
 	"io"
+	"math/bits"
 	"net"
 	"net/netip"
 	"os"
@@ -43,14 +44,23 @@ const (
 
 type UDPNatPrepareFunc func(source M.Socksaddr, destination M.Socksaddr, userData any) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc)
 
+// UDPQueueBudget admits queued packet memory without waiting. A caller can
+// share it with other stacks and ingress queues.
+type UDPQueueBudget interface {
+	TryReserve(bytes int) bool
+	Release(bytes int)
+}
+
 type UDPNatOptions struct {
-	Handler   N.UDPConnectionHandlerEx
-	Prepare   UDPNatPrepareFunc
-	Timeout   time.Duration
-	Shared    bool
-	Mapping   NATMapping
-	Filtering NATFiltering
-	MaxSize   uint32
+	Handler     N.UDPConnectionHandlerEx
+	Prepare     UDPNatPrepareFunc
+	Timeout     time.Duration
+	Shared      bool
+	Mapping     NATMapping
+	Filtering   NATFiltering
+	MaxSize     uint32
+	QueueBudget UDPQueueBudget
+	OnQueueDrop func()
 
 	InterfaceFinder  control.InterfaceFinder
 	ExcludeInterface []string
@@ -92,6 +102,8 @@ type UDPNat struct {
 	timeout             time.Duration
 	mapping             NATMapping
 	filtering           NATFiltering
+	queueBudget         UDPQueueBudget
+	onQueueDrop         func()
 	cache               *freelru.Cache[udpNatSessionKey, *udpNatConn]
 	filterCache         *freelru.Cache[udpNatFilterKey, *udpNatConn]
 	nextFilterSessionID atomic.Uint64
@@ -136,6 +148,8 @@ func NewUDPNat(options UDPNatOptions) *UDPNat {
 		timeout:          options.Timeout,
 		mapping:          options.Mapping,
 		filtering:        options.Filtering,
+		queueBudget:      options.QueueBudget,
+		onQueueDrop:      options.OnQueueDrop,
 		cache:            cache,
 		filterCache:      filterCache,
 		interfaceFinder:  options.InterfaceFinder,
@@ -319,14 +333,36 @@ func (s *UDPNat) unregisterClass(conn *udpNatConn) {
 }
 
 func (s *UDPNat) NewPacket(bufferSlices [][]byte, source M.Socksaddr, destination M.Socksaddr, userData any) {
-	conn, ok := s.getOrCreateConn(source, destination, userData)
-	if !ok {
-		return
-	}
-	readWaitOptions := conn.loadReadWaitOptions()
 	var dataLen int
 	for _, bufferSlice := range bufferSlices {
 		dataLen += len(bufferSlice)
+	}
+	var reserved int
+	if s.queueBudget != nil {
+		reserved = udpQueueCharge(dataLen)
+		if !s.tryReserveQueue(reserved) {
+			return
+		}
+	}
+	conn, ok := s.getOrCreateConn(source, destination, userData)
+	if !ok {
+		if reserved != 0 {
+			s.queueBudget.Release(reserved)
+		}
+		return
+	}
+	readWaitOptions := conn.loadReadWaitOptions()
+	if reserved != 0 {
+		if len(conn.packetChan) == cap(conn.packetChan) {
+			s.queueBudget.Release(reserved)
+			s.dropQueuePacket()
+			return
+		}
+		extra := udpQueueCharge(dataLen+readWaitOptions.FrontHeadroom+readWaitOptions.RearHeadroom) - reserved
+		if extra > 0 && !s.tryReserveQueue(extra) {
+			s.queueBudget.Release(reserved)
+			return
+		}
 	}
 	buffer := readWaitOptions.NewBufferSize(dataLen)
 	for _, bufferSlice := range bufferSlices {
@@ -334,6 +370,32 @@ func (s *UDPNat) NewPacket(bufferSlices [][]byte, source M.Socksaddr, destinatio
 	}
 	readWaitOptions.PostReturn(buffer)
 	conn.enqueue(buffer, destination)
+}
+
+func udpQueueCharge(size int) int {
+	// Allow for the buffer and packet wrapper and round up to cover the
+	// allocator's backing array, even when RawCap reports a smaller size.
+	return 128 + 1<<bits.Len(uint(max(size, 64)-1))
+}
+
+func (s *UDPNat) tryReserveQueue(bytes int) bool {
+	if s.queueBudget.TryReserve(bytes) {
+		return true
+	}
+	s.dropQueuePacket()
+	return false
+}
+
+func (s *UDPNat) dropQueuePacket() {
+	if s.onQueueDrop != nil {
+		s.onQueueDrop()
+	}
+}
+
+func (c *udpNatConn) releaseQueue(buffer *buf.Buffer) {
+	if budget := c.service.queueBudget; budget != nil {
+		budget.Release(udpQueueCharge(buffer.RawCap()))
+	}
 }
 
 func (s *UDPNat) getOrCreateConn(source M.Socksaddr, destination M.Socksaddr, userData any) (*udpNatConn, bool) {
@@ -423,6 +485,7 @@ func (c *udpNatConn) enqueue(buffer *buf.Buffer, destination M.Socksaddr) {
 	c.packetAccess.RLock()
 	select {
 	case <-c.doneChan:
+		c.releaseQueue(buffer)
 		buffer.Release()
 		c.packetAccess.RUnlock()
 		return
@@ -435,11 +498,14 @@ func (c *udpNatConn) enqueue(buffer *buf.Buffer, destination M.Socksaddr) {
 	}
 	select {
 	case c.packetChan <- packet:
+		c.packetAccess.RUnlock()
 	default:
+		c.releaseQueue(packet.Buffer)
 		packet.Buffer.Release()
 		N.PutPacketBuffer(packet)
+		c.packetAccess.RUnlock()
+		c.service.dropQueuePacket()
 	}
-	c.packetAccess.RUnlock()
 }
 
 func (s *UDPNat) NewPacketBatch(buffers []*buf.Buffer, sources []M.Socksaddr, destination M.Socksaddr, userData any) {
@@ -448,6 +514,13 @@ func (s *UDPNat) NewPacketBatch(buffers []*buf.Buffer, sources []M.Socksaddr, de
 		return
 	}
 	for index, buffer := range buffers {
+		if s.queueBudget != nil {
+			// A supplied buffer may be a view into a much larger backing
+			// array. Store an independently sized buffer under the budget.
+			s.NewPacket([][]byte{buffer.Bytes()}, sources[index], destination, userData)
+			buffer.Release()
+			continue
+		}
 		conn, ok := s.getOrCreateConn(sources[index], destination, userData)
 		if !ok {
 			buffer.Release()
@@ -596,6 +669,7 @@ func (c *udpNatConn) allowPeer(destination M.Socksaddr) bool {
 func (c *udpNatConn) ReadPacket(buffer *buf.Buffer) (addr M.Socksaddr, err error) {
 	select {
 	case p := <-c.packetChan:
+		c.releaseQueue(p.Buffer)
 		_, err = buffer.ReadOnceFrom(p.Buffer)
 		destination := p.Destination
 		p.Buffer.Release()
@@ -641,6 +715,7 @@ func (c *udpNatConn) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksad
 func (c *udpNatConn) waitReadPacket(options N.ReadWaitOptions) (buffer *buf.Buffer, destination M.Socksaddr, err error) {
 	select {
 	case packet := <-c.packetChan:
+		c.releaseQueue(packet.Buffer)
 		buffer = options.Copy(packet.Buffer)
 		destination = packet.Destination
 		N.PutPacketBuffer(packet)
@@ -685,6 +760,7 @@ func (c *udpNatConn) WaitReadPackets() (buffers []*buf.Buffer, destinations []M.
 	for len(buffers) < batchSize {
 		select {
 		case packet := <-c.packetChan:
+			c.releaseQueue(packet.Buffer)
 			buffers = append(buffers, options.Copy(packet.Buffer))
 			destinations = append(destinations, packet.Destination)
 			N.PutPacketBuffer(packet)
@@ -720,14 +796,21 @@ func (c *udpNatConn) SetTimeout(timeout time.Duration) bool {
 }
 
 func (c *udpNatConn) Close() error {
-	c.close()
-	if c.service.state.Load() == udpNatStateStarted {
-		c.service.cleanup.addOrUpdate(c.cleanupEntry, time.Now())
-	}
+	c.CloseAndDiscardQueued()
 	return nil
 }
 
-func (c *udpNatConn) close() {
+// CloseAndDiscardQueued returns the number of unread datagrams discarded by
+// this call, so a failed outbound can attribute the loss to its cause.
+func (c *udpNatConn) CloseAndDiscardQueued() int {
+	discarded := c.close()
+	if c.service.state.Load() == udpNatStateStarted {
+		c.service.cleanup.addOrUpdate(c.cleanupEntry, time.Now())
+	}
+	return discarded
+}
+
+func (c *udpNatConn) close() (discarded int) {
 	c.closeOnce.Do(func() {
 		c.packetAccess.Lock()
 		close(c.doneChan)
@@ -735,6 +818,8 @@ func (c *udpNatConn) close() {
 		for !drained {
 			select {
 			case packet := <-c.packetChan:
+				discarded++
+				c.releaseQueue(packet.Buffer)
 				packet.Buffer.Release()
 				N.PutPacketBuffer(packet)
 			default:
@@ -747,6 +832,7 @@ func (c *udpNatConn) close() {
 			c.service.unregisterClass(c)
 		}
 	})
+	return discarded
 }
 
 func (c *udpNatConn) closeFromCache() {

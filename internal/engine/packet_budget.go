@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"mac-proxy/internal/wire"
 )
 
 // ResourceLimits bounds work shared by all generations of the proxy.
@@ -55,6 +57,8 @@ type ResourceStatus struct {
 	ConnectionsRefused uint64 `json:"connectionsRefused"`
 	UDPSessions        int    `json:"udpSessions"`
 	UDPOpening         int    `json:"udpOpening"`
+	UDPQueuedBytes     int64  `json:"udpQueuedBytes"`
+	UDPQueueLimitBytes int    `json:"udpQueueLimitBytes"`
 }
 
 const (
@@ -120,7 +124,8 @@ func (b *ResourceBudget) status() *ResourceStatus {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return &ResourceStatus{ResourceLimits: b.limits(), Connections: len(b.connections),
-		ConnectionsRefused: b.connectionsRefused.Load(), UDPSessions: len(b.sessions), UDPOpening: len(b.opening)}
+		ConnectionsRefused: b.connectionsRefused.Load(), UDPSessions: len(b.sessions), UDPOpening: len(b.opening),
+		UDPQueuedBytes: wire.UDPQueue.Bytes(), UDPQueueLimitBytes: wire.UDPQueueLimit}
 }
 
 // A slot covers the dial and the resulting connection, across engine generations.

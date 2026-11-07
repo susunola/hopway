@@ -346,6 +346,9 @@ struct AdvancedSettingsPanel: View {
                     if let idle = active.udpIdleTimeoutSec {
                         hint("运行中 · UDP 空闲 \(idle) 秒后回收")
                     }
+                    if let queued = active.udpQueuedBytes, let limit = active.udpQueueLimitBytes {
+                        hint("UDP 暂存额度（SOCKS5 与 TUN 共用）\(ByteCountFormatter.string(fromByteCount: queued, countStyle: .memory)) / \(ByteCountFormatter.string(fromByteCount: limit, countStyle: .memory))")
+                    }
                 }
                 fieldRow {
                     field("代理连接总上限（16–4096）", text: values.connectionLimit, prompt: "4096")

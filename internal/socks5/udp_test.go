@@ -354,13 +354,13 @@ func TestUDPAssociationRelaysOutOfOrderAndDuplicateReplies(t *testing.T) {
 }
 
 func TestSOCKSUDPQueuedBytesSharedAcrossSessions(t *testing.T) {
-	before := udpQueuedBytes.Load()
+	before := wire.UDPQueue.Bytes()
 	var sessions []*udpSession
 	defer func() {
 		for _, session := range sessions {
 			session.discard(nil)
 		}
-		if got := udpQueuedBytes.Load(); got != before {
+		if got := wire.UDPQueue.Bytes(); got != before {
 			t.Errorf("queue cleanup left %d charged bytes, started with %d", got, before)
 		}
 	}()
@@ -375,8 +375,8 @@ func TestSOCKSUDPQueuedBytesSharedAcrossSessions(t *testing.T) {
 			}
 		}
 	}
-	if got := udpQueuedBytes.Load(); rejected == 0 || got > maxUDPQueuedBytes ||
-		got+int64(len(payload)+udpQueueOverhead) <= maxUDPQueuedBytes {
+	if got := wire.UDPQueue.Bytes(); rejected == 0 || got > wire.UDPQueueLimit ||
+		got+int64(udpQueueCharge(len(payload))) <= wire.UDPQueueLimit {
 		t.Fatalf("shared queue did not stop at its byte limit: charged=%d dropped=%d", got, rejected)
 	}
 }

@@ -257,6 +257,8 @@ struct ProxyStatus: Decodable, Equatable {
         let udpOpenLimit: Int
         let endpointDialLimit: Int
         let udpIdleTimeoutSec: Int?
+        let udpQueuedBytes: Int64?
+        let udpQueueLimitBytes: Int64?
     }
     let resources: Resources?
     let reloaded: Double?

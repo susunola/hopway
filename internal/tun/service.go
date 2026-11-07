@@ -135,7 +135,9 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 		// The first packet selects the outbound. Separate destinations
 		// must not share that choice even if the app uses one UDP socket.
 		UDPMapping: stun.NATMappingAddressAndPortDependent, UDPNATMax: 1024,
-		Handler: s, Logger: logger.NOP(), InterfaceFinder: finder,
+		UDPQueueBudget: &wire.UDPQueue,
+		OnUDPQueueDrop: func() { wire.TUNUDPDrops.Add(wire.UDPQueueFull, 1) },
+		Handler:        s, Logger: logger.NOP(), InterfaceFinder: finder,
 	})
 	if err != nil {
 		return fail(err)
@@ -380,8 +382,7 @@ func (s *Service) NewConnectionEx(ctx context.Context, conn net.Conn, source, de
 func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	target, release, err := s.routeTarget(destination)
 	if err != nil {
-		wire.TUNUDPDrops.Add(wire.UDPInvalid, 1)
-		conn.Close()
+		wire.TUNUDPDrops.Add(wire.UDPInvalid, discardUDPPackets(conn))
 		done(onClose, err)
 		return
 	}
@@ -391,10 +392,10 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	ctx = peer.WithAddrs(ctx, peer.Addrs{Client: source.AddrPort(), Server: destination.AddrPort(), Local: true})
 	remote, err := s.dialPacket(ctx, "TUN", target)
 	if err != nil {
+		discarded := discardUDPPackets(conn)
 		if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
-			wire.TUNUDPDrops.Add(backend.PacketDropReason(err), 1)
+			wire.TUNUDPDrops.Add(backend.PacketDropReason(err), discarded)
 		}
-		conn.Close()
 		done(onClose, err)
 		return
 	}
@@ -456,4 +457,13 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		}
 		packet.Release()
 	}
+}
+
+func discardUDPPackets(conn N.PacketConn) int {
+	if queue, ok := conn.(interface{ CloseAndDiscardQueued() int }); ok {
+		// A dial can fail before the stack has queued its triggering packet.
+		return max(1, queue.CloseAndDiscardQueued())
+	}
+	conn.Close()
+	return 1
 }

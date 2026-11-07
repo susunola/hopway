@@ -85,6 +85,8 @@ func NewGVisor(
 			Mapping:          options.UDPMapping,
 			Filtering:        options.UDPFiltering,
 			MaxSize:          options.UDPNATMax,
+			QueueBudget:      options.UDPQueueBudget,
+			OnQueueDrop:      options.OnUDPQueueDrop,
 			InterfaceFinder:  options.InterfaceFinder,
 			ExcludeInterface: []string{options.TunOptions.Name},
 		},

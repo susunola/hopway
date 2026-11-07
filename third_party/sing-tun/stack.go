@@ -27,6 +27,8 @@ type StackOptions struct {
 	UDPMapping             NATMapping
 	UDPFiltering           NATFiltering
 	UDPNATMax              uint32
+	UDPQueueBudget         UDPQueueBudget
+	OnUDPQueueDrop         func()
 	Handler                Handler
 	Logger                 logger.Logger
 	ForwarderBindInterface bool
