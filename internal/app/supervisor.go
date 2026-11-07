@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,7 @@ type SystemProxyStatus struct {
 type TUNStatus struct {
 	Supported bool   `json:"supported"`
 	Enabled   bool   `json:"enabled"`
+	Service   bool   `json:"service"` // the password-free service is installed and answering
 	Device    string `json:"device,omitempty"`
 	Error     string `json:"error,omitempty"`
 }
@@ -197,6 +199,12 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 	}
 	if os.Geteuid() == 0 {
 		options.AutoRoute = true
+	} else if tun.ServiceAvailable(tun.ServiceSocket) {
+		fd, name, err := tun.OpenWithService(tun.ServiceSocket, options.IPv6)
+		if err != nil {
+			return fmt.Errorf("TUN service: %w", err)
+		}
+		options.FD, options.Name = fd, name
 	} else {
 		executable, err := os.Executable()
 		if err != nil {
@@ -246,6 +254,42 @@ func (s *Supervisor) SetSystemProxy(enabled bool) error {
 	s.proxyErr = ""
 	if err != nil {
 		s.proxyErr = err.Error()
+	}
+	s.mu.Unlock()
+	return err
+}
+
+// serviceInstalled checks the files only; status polling must not wake the
+// root service.
+func serviceInstalled() bool {
+	if _, err := os.Stat(tun.ServicePlist); err != nil {
+		return false
+	}
+	_, err := os.Stat(tun.ServiceSocket)
+	return err == nil
+}
+
+// SetTUNService installs or removes the password-free TUN service. Either
+// way macOS asks for the administrator password once.
+func (s *Supervisor) SetTUNService(installed bool) error {
+	err := func() error {
+		if runtime.GOOS != "darwin" {
+			return errors.New("the TUN service is only used on macOS")
+		}
+		executable, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		if installed {
+			return tun.RunAsAdmin(executable, "安装 HopWay 增强模式服务后，开启增强模式（TUN）时不再需要输入密码。",
+				"-tun-install", strconv.Itoa(os.Getuid()))
+		}
+		return tun.RunAsAdmin(executable, "卸载 HopWay 增强模式服务。", "-tun-uninstall")
+	}()
+	s.mu.Lock()
+	s.tunErr = ""
+	if err != nil {
+		s.tunErr = err.Error()
 	}
 	s.mu.Unlock()
 	return err
@@ -351,7 +395,8 @@ func (s *Supervisor) Status() Status {
 	status.SystemProxy = SystemProxyStatus{Supported: SystemProxySupported, Enabled: s.proxy.Enabled(),
 		Error: s.proxyErr, Recovered: s.recovered}
 	status.Network = append([]netmon.Event(nil), s.events...)
-	status.TUN = TUNStatus{Supported: TUNSupported, Enabled: s.tunDevice != nil, Device: s.tunName, Error: s.tunErr}
+	status.TUN = TUNStatus{Supported: TUNSupported, Enabled: s.tunDevice != nil, Device: s.tunName, Error: s.tunErr,
+		Service: runtime.GOOS == "darwin" && serviceInstalled()}
 	status.Reloaded = s.started.UnixMilli()
 	for _, sub := range s.loaded.User.Subscriptions {
 		entry := s.subMeta[sub.URL]

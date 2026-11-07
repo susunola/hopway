@@ -24,18 +24,29 @@ import (
 // and exits without closing it: the device (and the routes, which belong to
 // it) lives exactly as long as the core keeps the descriptor open.
 func RunHelper(socketPath string, options Options) error {
+	fd, name, err := CreateDevice(options)
+	if err != nil {
+		return err
+	}
+	return SendDevice(socketPath, fd, name)
+}
+
+// CreateDevice makes a TUN device with routes (root only) and returns its
+// descriptor without closing it: the device and its routes then live as
+// long as whoever receives the descriptor keeps it open.
+func CreateDevice(options Options) (int, string, error) {
 	if os.Geteuid() != 0 {
-		return errors.New("the TUN helper must run as root")
+		return 0, "", errors.New("creating the TUN device needs root")
 	}
 	options.defaults()
 	finder := control.NewDefaultInterfaceFinder()
 	network, err := stun.NewNetworkUpdateMonitor(logger.NOP())
 	if err != nil {
-		return err
+		return 0, "", err
 	}
 	monitor, err := stun.NewDefaultInterfaceMonitor(network, logger.NOP(), stun.DefaultInterfaceMonitorOptions{InterfaceFinder: finder})
 	if err != nil {
-		return err
+		return 0, "", err
 	}
 	network.Start()
 	monitor.Start()
@@ -50,22 +61,18 @@ func RunHelper(socketPath string, options Options) error {
 	}
 	device, err := stun.New(tunOptions)
 	if err != nil {
-		return err
+		return 0, "", err
 	}
 	if err := device.Start(); err != nil {
 		device.Close()
-		return err
+		return 0, "", err
 	}
 	fd, err := deviceFD(device)
 	if err != nil {
 		device.Close()
-		return err
+		return 0, "", err
 	}
-	if err := SendDevice(socketPath, fd, name); err != nil {
-		device.Close()
-		return err
-	}
-	return nil
+	return fd, name, nil
 }
 
 // deviceFD reads the descriptor sing-tun keeps for the device.

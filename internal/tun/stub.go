@@ -17,3 +17,16 @@ func (*Service) ResetNetwork()                          {}
 func RunHelper(string, Options) error                   { return errUnsupported }
 func OpenWithHelper(string, bool) (int, string, error)  { return 0, "", errUnsupported }
 func SystemDNS(netip.Addr) []string                     { return nil }
+
+const (
+	ServiceSocket = ""
+	ServicePlist  = ""
+)
+
+func RunService(string, uint32, func(Options) (int, string, error)) error { return errUnsupported }
+func CreateDevice(Options) (int, string, error)                           { return 0, "", errUnsupported }
+func OpenWithService(string, bool) (int, string, error)                   { return 0, "", errUnsupported }
+func ServiceAvailable(string) bool                                        { return false }
+func InstallService(string, uint32) error                                 { return errUnsupported }
+func UninstallService() error                                             { return errUnsupported }
+func RunAsAdmin(string, string, ...string) error                          { return errUnsupported }

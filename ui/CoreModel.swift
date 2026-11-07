@@ -94,6 +94,7 @@ struct ProxyStatus: Decodable {
     struct TUN: Decodable {
         let supported: Bool
         let enabled: Bool
+        let service: Bool?
         let device: String?
         let error: String?
     }
@@ -358,6 +359,22 @@ final class CoreModel: ObservableObject {
                 await refresh(info)
             } catch {
                 if endpoint?.token == info.token { message = "增强模式切换失败 · " + error.localizedDescription }
+            }
+        }
+    }
+
+    /// Installs or removes the service that lets TUN start without a password.
+    func setTUNService(_ installed: Bool) {
+        guard let info = endpoint else { return }
+        message = "请在系统弹窗中输入管理员密码…"
+        Task {
+            do {
+                struct Body: Encodable { let installed: Bool }
+                _ = try await call(info, path: "tun-service", method: "PUT", body: JSONEncoder().encode(Body(installed: installed)))
+                message = nil
+                await refresh(info)
+            } catch {
+                if endpoint?.token == info.token { message = "增强模式服务操作失败 · " + error.localizedDescription }
             }
         }
     }

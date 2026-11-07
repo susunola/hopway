@@ -46,7 +46,27 @@ func main() {
 	importInput := flag.Bool("import", false, "read a subscription URL or profile from stdin and print converted JSON")
 	tunHelper := flag.String("tun-helper", "", "internal: create the TUN device as root and hand it to the core over this socket")
 	tunIPv6 := flag.Bool("tun-ipv6", false, "internal: give the helper's TUN device an IPv6 address and route")
+	tunService := flag.Int("tun-service", -1, "internal: run the installed TUN service for this uid")
+	tunInstall := flag.Int("tun-install", -1, "internal: install the TUN service for this uid (root)")
+	tunUninstall := flag.Bool("tun-uninstall", false, "internal: remove the TUN service (root)")
 	flag.Parse()
+	if *tunService >= 0 || *tunInstall >= 0 || *tunUninstall {
+		var err error
+		switch {
+		case *tunService >= 0:
+			err = tun.RunService(tun.ServiceSocket, uint32(*tunService), tun.CreateDevice)
+		case *tunInstall >= 0:
+			executable, _ := os.Executable()
+			err = tun.InstallService(executable, uint32(*tunInstall))
+		default:
+			err = tun.UninstallService()
+		}
+		if err != nil {
+			log.SetFlags(0)
+			log.Fatal(err)
+		}
+		return
+	}
 	if *tunHelper != "" {
 		if err := tun.RunHelper(*tunHelper, tun.Options{IPv6: *tunIPv6}); err != nil {
 			log.SetFlags(0)
@@ -308,6 +328,19 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 			return
 		}
 		go supervisor.SetTUN(body.Enabled)
+		writer.WriteHeader(http.StatusAccepted)
+	})
+	router.HandleFunc("PUT /tun-service", func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			Installed bool `json:"installed"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 1024))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		go supervisor.SetTUNService(body.Installed) // waits on the password dialog
 		writer.WriteHeader(http.StatusAccepted)
 	})
 	router.HandleFunc("PUT /system-proxy", func(writer http.ResponseWriter, request *http.Request) {
