@@ -26,12 +26,12 @@ struct ConnectionsDashboard: View {
 
     private struct Row: Identifiable {
         let connection: ProxyStatus.Connection
-        let generation: Double?
+        let generation: UInt64?
         var id: String { "\(generation ?? 0):\(connection.id)" }
     }
 
     var body: some View {
-        let all = core.status?.connections ?? []
+        let all = core.connections
         let keyword = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let rows = all
             .filter { row in
@@ -43,12 +43,16 @@ struct ConnectionsDashboard: View {
                 if (lhs.state == "active") != (rhs.state == "active") { return lhs.state == "active" }
                 return lhs.id > rhs.id
             }
-            .map { Row(connection: $0, generation: core.status?.reloaded) }
+            .map { Row(connection: $0, generation: core.status?.generation) }
         let selected = rows.first { $0.id == selection }?.connection
         VStack(alignment: .leading, spacing: 12) {
             HopPageHeading(title: "连接", detail: core.status == nil
                            ? "查看应用、出站和匹配规则。"
                            : "\(core.status?.active ?? 0) 个活动 · \(all.filter(Scope.failed.includes).count) 个失败 · \(all.filter(Scope.blocked.includes).count) 个拦截")
+            if core.connectionReadFailed {
+                Label("暂时无法更新连接，显示上次读取的记录。", systemImage: "exclamationmark.circle")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             if let drops = core.status?.udpDrops, !drops.isEmpty {
                 HStack(spacing: 12) {
                     Label("本机 UDP 丢弃", systemImage: "exclamationmark.circle")
@@ -95,6 +99,8 @@ struct ConnectionsDashboard: View {
                 }
             }
         }
+        .onAppear { core.watchConnections(true) }
+        .onDisappear { core.watchConnections(false) }
     }
 
     private func table(_ rows: [Row]) -> some View {

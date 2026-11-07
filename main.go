@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -338,7 +339,27 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	router := http.NewServeMux()
 	router.HandleFunc("GET /status", func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Query().Get("view") == "compact" {
+			json.NewEncoder(writer).Encode(supervisor.CompactStatus())
+			return
+		}
 		json.NewEncoder(writer).Encode(supervisor.Status())
+	})
+	router.HandleFunc("GET /connections", func(writer http.ResponseWriter, request *http.Request) {
+		query := request.URL.Query()
+		var generation uint64
+		var cursor *uint64
+		if query.Has("generation") || query.Has("cursor") {
+			g, generationErr := strconv.ParseUint(query.Get("generation"), 10, 64)
+			c, cursorErr := strconv.ParseUint(query.Get("cursor"), 10, 64)
+			if generationErr != nil || cursorErr != nil {
+				http.Error(writer, "invalid connection cursor", http.StatusBadRequest)
+				return
+			}
+			generation, cursor = g, &c
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(supervisor.Connections(generation, cursor))
 	})
 	router.HandleFunc("GET /route", func(writer http.ResponseWriter, request *http.Request) {
 		decision, err := core().ExplainContext(request.Context(), request.URL.Query().Get("target"))

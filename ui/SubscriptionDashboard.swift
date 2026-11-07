@@ -8,7 +8,7 @@ struct SubscriptionSummary: Decodable, Identifiable {
         let total: UInt64
     }
 
-    struct Meter: Decodable {
+    struct Meter: Decodable, Equatable {
         let used: UInt64?
         let total: UInt64?
         let expiresAt: Int64?

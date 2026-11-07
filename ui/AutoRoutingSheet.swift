@@ -12,7 +12,7 @@ struct AutoRoutingConfig: Codable, Equatable {
     let groups: [Group]
 }
 
-struct AutoRoutingStatus: Decodable {
+struct AutoRoutingStatus: Decodable, Equatable {
     let provider: String?
     let node: String?
     let probing: Bool

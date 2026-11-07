@@ -224,7 +224,37 @@ def main(core):
         assert status()["active"] == 1024
         print(f"Verified 1,024 UDP sessions across 32 SOCKS5 associations ({retries} packet retries)", flush=True)
 
+        def get(path):
+            code, body = control("GET", path)
+            assert code == 200, (code, body)
+            return json.loads(body), len(body)
+
+        legacy, legacy_bytes = get("/status")
+        compact, compact_bytes = get("/status?view=compact")
+        assert legacy["active"] == compact["active"] == 1024
+        assert len(legacy["connections"]) == 1024 and "connections" not in compact
+        assert compact_bytes < legacy_bytes / 20
+        initial, _ = get("/connections")
+        assert initial["full"] and len(initial["records"]) == 1024
+        assert initial["generation"] == compact["generation"]
+
+        cursor = f"/connections?generation={initial['generation']}&cursor={initial['cursor']}"
+        idle, idle_bytes = get(cursor)
+        assert idle == {"generation": initial["generation"], "cursor": initial["cursor"]}
+        exchange(associations[15], targets[7], b"one live connection changed")
+        changed, changed_bytes = get(cursor)
+        assert not ("records" in changed or "removed" in changed or "full" in changed)
+        assert len(changed["counters"]) == 1 and changed["cursor"] > initial["cursor"]
+        patch = changed["counters"][0]
+        before = next(row for row in initial["records"] if row["id"] == patch["id"])
+        assert patch["sent"] - before["sent"] == len(b"one live connection changed")
+        assert patch["received"] - before["received"] == len(b"one live connection changed")
+        print(f"1,024 active connections: full status {legacy_bytes:,} bytes, compact status {compact_bytes:,} bytes, "
+              f"idle delta {idle_bytes} bytes, one counter patch {changed_bytes} bytes", flush=True)
+
         assert control("POST", "/reload")[0] == 204
+        reset, _ = get(cursor)
+        assert reset["full"] and reset["generation"] != initial["generation"] and not reset.get("records")
         fresh = udp_association(stack, ready["socks"])
         exchange(fresh, targets[0], b"first session after reload")
         assert status()["active"] == 1

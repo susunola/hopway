@@ -9,7 +9,6 @@ import (
 	"math"
 	"net"
 	"net/netip"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -157,7 +156,7 @@ type Status struct {
 	Nodes          []NodeSummary                 `json:"nodes"`
 	Groups         []GroupStatus                 `json:"groups,omitempty"`
 	RuleSets       []RuleSetStatus               `json:"ruleSets,omitempty"`
-	Connections    []Record                      `json:"connections"`
+	Connections    []Record                      `json:"connections,omitzero"`
 	Active         int                           `json:"active"`
 	SessionTraffic *trafficCount                 `json:"sessionTraffic,omitempty"`
 	UDPDrops       map[string]wire.UDPDropCounts `json:"udpDrops,omitempty"`
@@ -187,8 +186,13 @@ type Engine struct {
 	sequence      uint64
 	live          map[uint64]*tracked
 	livePackets   map[uint64]*trackedPacket
+	peakTCP       int
+	peakUDP       int
 	budget        *ResourceBudget
-	recent        []Record
+	recent        recentRecords
+	recentTimer   *time.Timer
+	recentTTL     time.Duration
+	journal       connectionJournal
 	ports         map[uint16]bool
 	ctx           context.Context
 	stop          context.CancelFunc
@@ -407,6 +411,10 @@ func (engine *Engine) Close() error {
 	engine.closeOnce.Do(func() {
 		engine.mu.Lock()
 		engine.closed = true
+		if engine.recentTimer != nil {
+			engine.recentTimer.Stop()
+			engine.recentTimer = nil
+		}
 		connections := make([]*tracked, 0, len(engine.live))
 		packets := make([]*trackedPacket, 0, len(engine.livePackets))
 		for _, conn := range engine.live {
@@ -670,6 +678,8 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	record.Stage, record.Error, record.FailureCode = "", "", ""
 	tracked := &tracked{Conn: conn, engine: engine, record: record, opened: time.Now()}
 	engine.live[record.ID] = tracked
+	engine.peakTCP = max(engine.peakTCP, len(engine.live))
+	engine.journal.mark(record.ID, true)
 	engine.mu.Unlock()
 	if local && !looked {
 		go engine.attribute(record.ID, addrs)
@@ -702,13 +712,12 @@ func (engine *Engine) attribute(id uint64, addrs peer.Addrs) {
 	defer engine.mu.Unlock()
 	if conn := engine.live[id]; conn != nil {
 		conn.record.setOwner(owner)
+		engine.journal.mark(id, true)
 		return
 	}
-	for i := len(engine.recent) - 1; i >= 0; i-- {
-		if engine.recent[i].ID == id {
-			engine.recent[i].setOwner(owner)
-			return
-		}
+	if record := engine.recent.get(id); record != nil {
+		record.setOwner(owner)
+		engine.journal.mark(id, true)
 	}
 }
 
@@ -810,6 +819,8 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 	tracked := &trackedPacket{PacketConn: conn, engine: engine, record: record, outbound: exit}
 	evicted := engine.budget.admit(tracked)
 	engine.livePackets[record.ID] = tracked
+	engine.peakUDP = max(engine.peakUDP, len(engine.livePackets))
+	engine.journal.mark(record.ID, true)
 	engine.mu.Unlock()
 	if evicted != nil {
 		_ = evicted.Close()
@@ -870,6 +881,7 @@ type trackedPacket struct {
 	engine     *Engine
 	record     Record
 	sent, recv atomic.Uint64
+	sampled    ConnectionCounters // guarded by engine.mu
 	outbound   *packetOutbound
 	lastActive atomic.Int64
 	closed     atomic.Bool
@@ -944,6 +956,7 @@ func (conn *trackedPacket) Close() error {
 		record := conn.snapshot()
 		record.State = "closed"
 		delete(conn.engine.livePackets, record.ID)
+		conn.engine.livePackets = shrinkConnectionIndex(conn.engine.livePackets, &conn.engine.peakUDP)
 		conn.engine.remember(record)
 	})
 	return err
@@ -1035,29 +1048,22 @@ func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *
 	return conn, err
 }
 
-func (engine *Engine) remember(record Record) {
-	const limit = 300
-	if len(engine.recent) == limit {
-		copy(engine.recent, engine.recent[1:])
-		engine.recent = engine.recent[:limit-1]
-	}
-	engine.recent = append(engine.recent, record)
+func (engine *Engine) Status() Status {
+	return engine.status(true)
 }
 
-func (engine *Engine) Status() Status {
+func (engine *Engine) CompactStatus() Status {
+	return engine.status(false)
+}
+
+func (engine *Engine) status(includeConnections bool) Status {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	records := make([]Record, 0, len(engine.live)+len(engine.recent))
-	for _, conn := range engine.live {
-		records = append(records, conn.snapshot())
-	}
-	for _, conn := range engine.livePackets {
-		records = append(records, conn.snapshot())
-	}
-	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
-	records = append(records, engine.recent...)
-	status := Status{Backend: engine.backend, Policy: engine.policy, Connections: records, Active: len(engine.live) + len(engine.livePackets),
+	status := Status{Backend: engine.backend, Policy: engine.policy, Active: len(engine.live) + len(engine.livePackets),
 		RuleSets: engine.ruleSetStatus(), SessionTraffic: engine.traffic.sessionTotals()}
+	if includeConnections {
+		status.Connections = engine.connectionSnapshot()
+	}
 	for _, inbound := range [...]struct {
 		name  string
 		drops wire.UDPDropCounts
@@ -1112,6 +1118,7 @@ type tracked struct {
 	opened     time.Time
 	sent, recv atomic.Uint64
 	firstByte  atomic.Int64
+	sampled    ConnectionCounters // guarded by engine.mu
 	relayErr   atomic.Pointer[wire.RelayError]
 	once       sync.Once
 }
@@ -1173,6 +1180,7 @@ func (conn *tracked) Close() error {
 			record.FailureCode = "upstream-no-response"
 		}
 		delete(conn.engine.live, record.ID)
+		conn.engine.live = shrinkConnectionIndex(conn.engine.live, &conn.engine.peakTCP)
 		conn.engine.remember(record)
 	})
 	return err

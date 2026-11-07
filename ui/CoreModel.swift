@@ -55,8 +55,8 @@ enum DialDiagnostic {
     }
 }
 
-struct ProxyStatus: Decodable {
-    struct Node: Decodable, Identifiable {
+struct ProxyStatus: Decodable, Equatable {
+    struct Node: Decodable, Equatable, Identifiable {
         let name: String
         let type: String
         let latencyMs: Int?
@@ -99,8 +99,8 @@ struct ProxyStatus: Decodable {
         let via: String
         let rule: String
         let state: String
-        let sent: Int64
-        let received: Int64
+        var sent: Int64
+        var received: Int64
         let error: String?
         let stage: String?
         let failureCode: String?
@@ -110,7 +110,7 @@ struct ProxyStatus: Decodable {
         let dnsMs: Int?
         let connectMs: Int?
         let handshakeMs: Int?
-        let firstByteMs: Int?
+        var firstByteMs: Int?
         let process: String?
         let processPath: String?
         let network: String?
@@ -146,14 +146,14 @@ struct ProxyStatus: Decodable {
         }
     }
 
-    struct SystemProxy: Decodable {
+    struct SystemProxy: Decodable, Equatable {
         let supported: Bool
         let enabled: Bool
         let error: String?
         let recovered: Bool?
     }
 
-    struct FakeIPPool: Decodable {
+    struct FakeIPPool: Decodable, Equatable {
         let capacity: Int
         let mapped: Int
         let pinned: Int
@@ -161,12 +161,12 @@ struct ProxyStatus: Decodable {
         let refused: UInt64
     }
 
-    struct FakeIP: Decodable {
+    struct FakeIP: Decodable, Equatable {
         let ipv4: FakeIPPool
         let ipv6: FakeIPPool?
     }
 
-    struct TUN: Decodable {
+    struct TUN: Decodable, Equatable {
         let supported: Bool
         let enabled: Bool
         let service: Bool?
@@ -176,7 +176,7 @@ struct ProxyStatus: Decodable {
         let fakeIP: FakeIP?
     }
 
-    struct PolicyGroup: Decodable, Identifiable {
+    struct PolicyGroup: Decodable, Equatable, Identifiable {
         let name: String
         let type: String
         let members: [String]
@@ -194,7 +194,7 @@ struct ProxyStatus: Decodable {
         }
     }
 
-    struct Subscription: Decodable, Identifiable {
+    struct Subscription: Decodable, Equatable, Identifiable {
         let name: String
         let id: String
         let nodes: Int
@@ -204,7 +204,7 @@ struct ProxyStatus: Decodable {
         let error: String?
     }
 
-    struct RuleSet: Decodable, Identifiable {
+    struct RuleSet: Decodable, Equatable, Identifiable {
         let name: String
         let entries: Int
         let updated: Double?
@@ -212,7 +212,7 @@ struct ProxyStatus: Decodable {
         var id: String { name }
     }
 
-    struct UDPDropCounts: Decodable {
+    struct UDPDropCounts: Decodable, Equatable {
         let invalid: UInt64
         let fragmented: UInt64
         let queueFull: UInt64
@@ -234,19 +234,35 @@ struct ProxyStatus: Decodable {
     let systemProxy: SystemProxy?
     let tun: TUN?
     let nodes: [Node]
-    let connections: [Connection]
     let active: Int
+    let generation: UInt64
     let sessionTraffic: TrafficHistory.Count?
     let udpDrops: [String: UDPDropCounts]?
     let reloaded: Double?
     let revision: String?
     let profileFallback: Bool?
-    struct Retirement: Decodable {
+    struct Retirement: Decodable, Equatable {
         let pending: UInt64
         let forced: UInt64
         let slow: UInt64
     }
     let retirement: Retirement?
+}
+
+private struct ConnectionUpdate: Decodable {
+    struct Counters: Decodable {
+        let id: UInt64
+        let sent: UInt64
+        let received: UInt64
+        let firstByteMs: Int?
+    }
+
+    let generation: UInt64
+    let cursor: UInt64
+    let full: Bool?
+    let records: [ProxyStatus.Connection]?
+    let counters: [Counters]?
+    let removed: [UInt64]?
 }
 
 struct ProfileInspection: Decodable {
@@ -297,6 +313,7 @@ final class CoreModel: ObservableObject {
     @Published private(set) var endpoint: Endpoint?
     @Published private(set) var status: ProxyStatus?
     @Published private(set) var statusReadFailed = false
+    @Published private(set) var connectionReadFailed = false
     @Published private(set) var configuredProfile: ProfileInspection?
     @Published private(set) var profileReadFailed = false
     private(set) var statusReadAt: Date?
@@ -336,6 +353,13 @@ final class CoreModel: ObservableObject {
     private var process: Process?
     private var input: FileHandle?
     private var polling: Task<Void, Never>?
+    private var statusRequest: Task<Void, Never>?
+    private var statusRequestedAgain = false
+    private var watchingConnections = false
+    private var connectionCursor: UInt64?
+    private var connectionRecords: [UInt64: ProxyStatus.Connection] = [:]
+
+    var connections: Dictionary<UInt64, ProxyStatus.Connection>.Values { connectionRecords.values }
     private var session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.connectionProxyDictionary = [
@@ -506,7 +530,7 @@ final class CoreModel: ObservableObject {
                 configurationNotice = nil
                 polling = Task {
                     while !Task.isCancelled {
-                        await refresh(info)
+                        await refresh(info, followUp: false)
                         try? await Task.sleep(for: .seconds(1))
                     }
                 }
@@ -534,6 +558,7 @@ final class CoreModel: ObservableObject {
         requestedTUNOperation = nil
         polling?.cancel()
         polling = nil
+        cancelStatusRequest()
         try? input?.close()
         input = nil
     }
@@ -543,6 +568,7 @@ final class CoreModel: ObservableObject {
         if phase == .running { message = "内核已退出（退出码 \(child.terminationStatus)）。" }
         polling?.cancel()
         polling = nil
+        cancelStatusRequest()
         try? input?.close()
         input = nil
         process = nil
@@ -551,6 +577,9 @@ final class CoreModel: ObservableObject {
         verification = nil
         verifying = false
         status = nil
+        connectionRecords.removeAll()
+        connectionCursor = nil
+        connectionReadFailed = false
         clearStatusFailure()
         statusReadAt = nil
         updateTrafficRate(nil)
@@ -560,8 +589,15 @@ final class CoreModel: ObservableObject {
     }
 
     private func call(_ info: Endpoint, path: String, method: String = "GET", body: Data? = nil,
-                      revision: String? = nil) async throws -> Data {
-        var request = URLRequest(url: info.control.appendingPathComponent(path))
+                      revision: String? = nil, query: [URLQueryItem] = []) async throws -> Data {
+        let url = info.control.appendingPathComponent(path)
+        var request = URLRequest(url: url)
+        if !query.isEmpty {
+            var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            components?.queryItems = query
+            guard let target = components?.url else { throw CoreError(message: "控制请求地址无效。") }
+            request.url = target
+        }
         if path == "verify" { request.timeoutInterval = 8 }
         request.httpMethod = method
         request.httpBody = body
@@ -646,10 +682,44 @@ final class CoreModel: ObservableObject {
         return try JSONDecoder().decode(RouteDecision.self, from: data)
     }
 
-    private func refresh(_ info: Endpoint) async {
+    private func cancelStatusRequest() {
+        statusRequest?.cancel()
+        statusRequest = nil
+        statusRequestedAgain = false
+    }
+
+    func watchConnections(_ enabled: Bool) {
+        watchingConnections = enabled
+        if enabled, let info = endpoint { Task { await refresh(info) } }
+    }
+
+    private func isRunning(_ info: Endpoint) -> Bool {
+        !Task.isCancelled && phase == .running && endpoint?.token == info.token
+    }
+
+    private func refresh(_ info: Endpoint, followUp: Bool = true) async {
+        guard isRunning(info) else { return }
+        if let statusRequest {
+            statusRequestedAgain = statusRequestedAgain || followUp
+            await statusRequest.value
+            return
+        }
+        let request = Task { [weak self] in
+            guard let self, isRunning(info) else { return }
+            repeat {
+                statusRequestedAgain = false
+                await readStatus(info)
+            } while statusRequestedAgain && isRunning(info)
+            if isRunning(info) { statusRequest = nil }
+        }
+        statusRequest = request
+        await request.value
+    }
+
+    private func readStatus(_ info: Endpoint) async {
         do {
-            let data = try await call(info, path: "status")
-            guard endpoint?.token == info.token else { return }
+            let data = try await call(info, path: "status", query: [URLQueryItem(name: "view", value: "compact")])
+            guard isRunning(info) else { return }
             let snapshot = try JSONDecoder().decode(ProxyStatus.self, from: data)
             let before = status?.subscriptions?.map { [$0.updated, $0.usage.map { Double($0.updatedAt) }] }
             if let previous = status,
@@ -658,7 +728,12 @@ final class CoreModel: ObservableObject {
             }
             statusReadAt = .now
             clearStatusFailure()
-            status = snapshot
+            if status?.generation != snapshot.generation {
+                connectionRecords.removeAll()
+                connectionCursor = nil
+                connectionReadFailed = false
+            }
+            if status != snapshot { status = snapshot }
             updateTrafficRate(snapshot.sessionTraffic)
             if before != snapshot.subscriptions?.map({ [$0.updated, $0.usage.map { Double($0.updatedAt) }] }) {
                 reloadConfiguredNodes()
@@ -671,13 +746,45 @@ final class CoreModel: ObservableObject {
                 announcedRecovery = true
                 message = "上次异常退出时留下的系统代理设置已自动还原。"
             }
+            if watchingConnections { await readConnectionFeed(info, generation: snapshot.generation) }
         } catch {
-            guard !Task.isCancelled, endpoint?.token == info.token else { return }
+            guard isRunning(info) else { return }
             if !statusReadFailed { statusReadFailed = true }
             updateTrafficRate(nil)
             let failure = "读取内核状态失败 · " + error.localizedDescription
             if message == nil || message == statusFailureMessage { message = failure }
             statusFailureMessage = failure
+        }
+    }
+
+    private func readConnectionFeed(_ info: Endpoint, generation: UInt64) async {
+        let query: [URLQueryItem] = connectionCursor.map { cursor in
+            [URLQueryItem(name: "generation", value: String(generation)),
+             URLQueryItem(name: "cursor", value: String(cursor))]
+        } ?? []
+        do {
+            let data = try await call(info, path: "connections", query: query)
+            guard isRunning(info), watchingConnections else { return }
+            let update = try JSONDecoder().decode(ConnectionUpdate.self, from: data)
+            guard update.generation == generation else { return }
+            if connectionReadFailed { connectionReadFailed = false }
+            connectionCursor = update.cursor
+            if update.full == true || update.records != nil || update.counters != nil || update.removed != nil {
+                objectWillChange.send()
+                if update.full == true { connectionRecords.removeAll(keepingCapacity: true) }
+                for id in update.removed ?? [] { connectionRecords.removeValue(forKey: id) }
+                for row in update.records ?? [] { connectionRecords[row.id] = row }
+                for counters in update.counters ?? [] {
+                    if var row = connectionRecords[counters.id] {
+                        row.sent = Int64(clamping: counters.sent)
+                        row.received = Int64(clamping: counters.received)
+                        row.firstByteMs = counters.firstByteMs
+                        connectionRecords[row.id] = row
+                    }
+                }
+            }
+        } catch {
+            if isRunning(info), watchingConnections, !connectionReadFailed { connectionReadFailed = true }
         }
     }
 
@@ -897,10 +1004,11 @@ final class CoreModel: ObservableObject {
               totals.download >= last.totals.download else { return }
         let elapsed = duration.components
         let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
-        liveTraffic = TrafficRate(
+        let rate = TrafficRate(
             upload: Double(totals.upload - last.totals.upload) / seconds,
             download: Double(totals.download - last.totals.download) / seconds
         )
+        if liveTraffic != rate { liveTraffic = rate }
         lastTrafficSample = (totals, now)
     }
 

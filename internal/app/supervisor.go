@@ -66,6 +66,7 @@ type Status struct {
 	Revision        string               `json:"revision,omitempty"`
 	ProfileFallback bool                 `json:"profileFallback,omitempty"`
 	Retirement      RetirementStatus     `json:"retirement,omitzero"`
+	Generation      uint64               `json:"generation"`
 }
 
 type Supervisor struct {
@@ -85,6 +86,7 @@ type Supervisor struct {
 	subMeta          map[string]SubscriptionStatus // nodes and update time of each snapshot
 	subReloadPending bool
 	started          time.Time
+	generation       uint64
 	ctx              context.Context
 	cancel           context.CancelFunc
 	networkCtx       context.Context
@@ -187,6 +189,7 @@ func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
 	s.ports = ports
 	s.proxyTarget = target
 	s.started = time.Now()
+	s.generation = 1
 	if s.autoPolicy != nil {
 		core.Restore(engine.Runtime{Policy: *s.autoPolicy})
 	}
@@ -530,6 +533,7 @@ func (s *Supervisor) reloadLocked(expected string) error {
 	s.readSnapshotMeta()
 	s.subReloadPending = false
 	s.started = time.Now()
+	s.generation++
 	s.current.Store(core)
 	if old != nil {
 		old.BeginDrain()
@@ -544,9 +548,17 @@ func (s *Supervisor) reloadLocked(expected string) error {
 }
 
 func (s *Supervisor) Status() Status {
+	return s.status(true)
+}
+
+func (s *Supervisor) CompactStatus() Status {
+	return s.status(false)
+}
+
+func (s *Supervisor) status(includeConnections bool) Status {
 	s.mu.Lock()
 	core := s.current.Load()
-	status := Status{Revision: s.loaded.Revision, ProfileFallback: s.loaded.Fallback, Retirement: s.retirement.status()}
+	status := Status{Revision: s.loaded.Revision, ProfileFallback: s.loaded.Fallback, Retirement: s.retirement.status(), Generation: s.generation}
 	status.Warnings = s.loaded.Warnings
 	status.SystemProxy = SystemProxyStatus{Supported: SystemProxySupported, Enabled: s.proxy.Enabled(),
 		Error: s.proxyErr, Recovered: s.recovered}
@@ -565,9 +577,31 @@ func (s *Supervisor) Status() Status {
 	}
 	s.mu.Unlock()
 	if core != nil {
-		status.Status = core.Status()
+		if includeConnections {
+			status.Status = core.Status()
+		} else {
+			status.Status = core.CompactStatus()
+		}
 	}
 	return status
+}
+
+type ConnectionFeed struct {
+	Generation uint64 `json:"generation"`
+	engine.ConnectionDelta
+}
+
+func (s *Supervisor) Connections(generation uint64, cursor *uint64) ConnectionFeed {
+	s.mu.Lock()
+	core, current := s.current.Load(), s.generation
+	s.mu.Unlock()
+	if current != generation {
+		cursor = nil
+	}
+	if core == nil {
+		return ConnectionFeed{Generation: current, ConnectionDelta: engine.ConnectionDelta{Full: true}}
+	}
+	return ConnectionFeed{Generation: current, ConnectionDelta: core.Connections(cursor)}
 }
 
 const subscriptionCheck = 10 * time.Minute

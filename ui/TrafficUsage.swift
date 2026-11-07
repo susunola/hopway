@@ -3,7 +3,7 @@ import Foundation
 import SwiftUI
 
 struct TrafficHistory: Decodable {
-    struct Count: Decodable {
+    struct Count: Decodable, Equatable {
         var upload: UInt64 = 0
         var download: UInt64 = 0
         var total: UInt64 { upload + download }
