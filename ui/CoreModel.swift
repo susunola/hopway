@@ -51,6 +51,8 @@ struct ProxyStatus: Decodable {
         let connectMs: Int?
         let handshakeMs: Int?
         let firstByteMs: Int?
+        let process: String?
+        let processPath: String?
 
         /// Where the connection failed and how long each stage took, for the tooltip.
         var diagnosis: String {
@@ -60,6 +62,7 @@ struct ProxyStatus: Decodable {
                 let names = ["route": "路由策略", "dns": "DNS 解析", "connect": "连接服务器", "handshake": "TLS / 协议握手", "upstream": "代理无响应"]
                 lines.append("失败阶段：" + (names[stage] ?? stage))
             }
+            if let processPath { lines.append("应用：" + processPath) }
             if let route, !route.isEmpty { lines.append("路径：" + (route + [via]).joined(separator: " → ")) }
             if let server { lines.append("服务器：" + server) }
             let timings = [("DNS", dnsMs), ("连接", connectMs), ("握手", handshakeMs), ("首字节", firstByteMs)]

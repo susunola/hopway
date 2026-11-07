@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"mac-proxy/internal/peer"
 	"net"
 	"net/http"
 	"strings"
@@ -39,7 +40,7 @@ func connect(writer http.ResponseWriter, request *http.Request, dial Dial) {
 		http.Error(writer, "CONNECT requires host:port", http.StatusBadRequest)
 		return
 	}
-	upstream, err := dial(request.Context(), "HTTP CONNECT", target)
+	upstream, err := dial(withPeer(request), "HTTP CONNECT", target)
 	if err != nil {
 		fail(writer, err)
 		return
@@ -65,7 +66,7 @@ func forward(writer http.ResponseWriter, request *http.Request, dial Dial) {
 		http.Error(writer, "Expected an absolute HTTP URL", http.StatusBadRequest)
 		return
 	}
-	outgoing := request.Clone(request.Context())
+	outgoing := request.Clone(withPeer(request))
 	outgoing.RequestURI = ""
 	outgoing.Host = outgoing.URL.Host
 	outgoing.Close = false
@@ -90,6 +91,16 @@ func forward(writer http.ResponseWriter, request *http.Request, dial Dial) {
 	}
 	writer.WriteHeader(response.StatusCode)
 	io.Copy(writer, response.Body)
+}
+
+// withPeer records the client's socket so the engine can find its process.
+func withPeer(request *http.Request) context.Context {
+	local, _ := request.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	remote, err := net.ResolveTCPAddr("tcp", request.RemoteAddr)
+	if err != nil || local == nil {
+		return request.Context()
+	}
+	return peer.With(request.Context(), remote, local)
 }
 
 func removeHopHeaders(header http.Header) {

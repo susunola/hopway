@@ -16,6 +16,8 @@ import (
 
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/outbound"
+	"mac-proxy/internal/peer"
+	"mac-proxy/internal/process"
 	"mac-proxy/internal/trace"
 	"mac-proxy/internal/wire"
 )
@@ -84,7 +86,10 @@ type Record struct {
 	Error       string   `json:"error,omitempty"`
 	Stage       string   `json:"stage,omitempty"`
 	Server      string   `json:"server,omitempty"`
-	Shared      bool     `json:"shared,omitempty"` // rode a multiplexed session, no socket of its own
+	Shared      bool     `json:"shared,omitempty"`      // rode a multiplexed session, no socket of its own
+	Process     string   `json:"process,omitempty"`     // app or executable name
+	ProcessPath string   `json:"processPath,omitempty"` // executable path
+	PID         uint32   `json:"pid,omitempty"`
 	Attempts    int      `json:"attempts,omitempty"`
 	DNSMs       int64    `json:"dnsMs,omitempty"`
 	ConnectMs   int64    `json:"connectMs,omitempty"`
@@ -119,6 +124,8 @@ type Engine struct {
 	recent   []Record
 	ports    map[uint16]bool
 	stop     context.CancelFunc
+
+	lookupProcess func(client, server netip.AddrPort) (*process.Owner, error)
 }
 
 const (
@@ -137,6 +144,7 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 	engine := &Engine{dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), ports: make(map[uint16]bool), probeURL: defaultProbeURL,
+		lookupProcess: process.Lookup,
 	}
 	for _, port := range localPorts {
 		engine.ports[uint16(port)] = true
@@ -256,14 +264,14 @@ func resolveForRules(host string) []netip.Addr {
 }
 
 // route picks the outbound name for host. Rules are immutable after New.
-func (engine *Engine) route(host string, policy Policy) (string, string) {
+func (engine *Engine) route(host string, policy Policy, owner func() *process.Owner) (string, string) {
 	switch policy.Mode {
 	case "direct":
 		return "DIRECT", "direct mode"
 	case "global":
 		return policy.Selected, "global mode"
 	}
-	index := engine.rules.match(host, resolveForRules)
+	index := engine.rules.match(host, resolveForRules, owner)
 	if index < 0 {
 		return "DIRECT", "default"
 	}
@@ -286,8 +294,21 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	policy := engine.policy
 	engine.mu.Unlock()
 
-	// Rule evaluation may resolve DNS, so it runs outside the lock.
-	via, rule := engine.route(host, policy)
+	// Rule evaluation may resolve DNS or look up the process, so it runs
+	// outside the lock. The process is looked up here only if a process rule
+	// could decide the route; otherwise later, off the connection's path.
+	addrs, local := peer.From(ctx)
+	local = local && addrs.Client.Addr().Unmap().IsLoopback()
+	var owner *process.Owner
+	looked := false
+	lookup := func() *process.Owner {
+		if !looked && local {
+			looked = true
+			owner, _ = engine.lookupProcess(addrs.Client, addrs.Server)
+		}
+		return owner
+	}
+	via, rule := engine.route(host, policy, lookup)
 	record.Rule = rule
 	engine.mu.Lock()
 	candidates := engine.choices(via)
@@ -320,6 +341,10 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 			break
 		}
 	}
+	if err != nil && local {
+		lookup() // the client is still waiting on its socket, so it can be found
+	}
+	record.setOwner(owner)
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if err != nil {
@@ -333,7 +358,36 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	record.Stage, record.Error = "", ""
 	tracked := &tracked{Conn: conn, engine: engine, record: record, opened: time.Now()}
 	engine.live[record.ID] = tracked
+	if local && !looked {
+		go engine.attribute(record.ID, addrs)
+	}
 	return tracked, nil
+}
+
+// attribute fills in the process of a connection after it was established.
+func (engine *Engine) attribute(id uint64, addrs peer.Addrs) {
+	owner, err := engine.lookupProcess(addrs.Client, addrs.Server)
+	if err != nil || owner == nil {
+		return
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if conn := engine.live[id]; conn != nil {
+		conn.record.setOwner(owner)
+		return
+	}
+	for i := len(engine.recent) - 1; i >= 0; i-- {
+		if engine.recent[i].ID == id {
+			engine.recent[i].setOwner(owner)
+			return
+		}
+	}
+}
+
+func (record *Record) setOwner(owner *process.Owner) {
+	if owner != nil {
+		record.Process, record.ProcessPath, record.PID = owner.Label(), owner.Path, owner.PID
+	}
 }
 
 // dialOnce dials through one node and fills in stage timings.
