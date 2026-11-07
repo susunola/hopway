@@ -9,6 +9,7 @@ package tun
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"strconv"
@@ -29,21 +30,33 @@ import (
 )
 
 type Service struct {
-	options    Options
-	device     stun.Tun
-	stack      stun.Stack
-	network    stun.NetworkUpdateMonitor
-	monitor    stun.DefaultInterfaceMonitor
-	fake       *FakeIP
-	dial       Dial
-	dialPacket DialPacket
-	ctx        context.Context
-	cancel     context.CancelFunc
-	once       sync.Once
+	options        Options
+	controlsSocket bool
+	device         stun.Tun
+	stack          stun.Stack
+	network        stun.NetworkUpdateMonitor
+	monitor        stun.DefaultInterfaceMonitor
+	fake           *FakeIP
+	dial           Dial
+	dialPacket     DialPacket
+	ctx            context.Context
+	cancel         context.CancelFunc
+	once           sync.Once
 }
 
 func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) {
 	options.defaults()
+	fd := options.FD
+	defer func() {
+		if fd > 0 {
+			closeFD(fd)
+		}
+	}()
+	if fd > 0 {
+		if err := verifyDevice(fd, options.Name); err != nil {
+			return nil, fmt.Errorf("invalid device from TUN helper: %w", err)
+		}
+	}
 	s := &Service{options: options, fake: NewFakeIP(options.FakeRange), dial: dial, dialPacket: dialPacket}
 	if options.IPv6 {
 		s.fake.EnableIPv6(DefaultFakeRange6)
@@ -51,18 +64,20 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	finder := control.NewDefaultInterfaceFinder()
 	var err error
+	fail := func(err error) (*Service, error) {
+		return nil, errors.Join(err, s.Close())
+	}
 	if s.network, err = stun.NewNetworkUpdateMonitor(logger.NOP()); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	if s.monitor, err = stun.NewDefaultInterfaceMonitor(s.network, logger.NOP(), stun.DefaultInterfaceMonitorOptions{InterfaceFinder: finder}); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	if err := s.network.Start(); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	if err := s.monitor.Start(); err != nil {
-		s.network.Close()
-		return nil, err
+		return fail(err)
 	}
 	// Everything HopWay sends itself leaves through the physical interface.
 	backend.SetSocketControl(func(network, address string, conn syscall.RawConn) error {
@@ -72,6 +87,7 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 		}
 		return control.BindToInterface(finder, iface.Name, iface.Index)(network, address, conn)
 	}, options.UpstreamDNS...)
+	s.controlsSocket = true
 	tunOptions := stun.Options{
 		Name: options.Name, Inet4Address: []netip.Prefix{options.Address}, MTU: options.MTU,
 		AutoRoute: options.AutoRoute, Inet4RouteAddress: options.RouteAddress, FileDescriptor: options.FD,
@@ -83,13 +99,10 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 	if tunOptions.Name == "" && options.FD == 0 {
 		tunOptions.Name = stun.CalculateInterfaceName("")
 	}
-	fail := func(err error) (*Service, error) {
-		s.Close()
-		return nil, err
-	}
 	if s.device, err = stun.New(tunOptions); err != nil {
 		return fail(err)
 	}
+	fd = 0 // the TUN device now owns the descriptor
 	s.stack, err = stun.NewStack("system", stun.StackOptions{
 		Context: s.ctx, Tun: s.device, TunOptions: tunOptions, UDPTimeout: 5 * time.Minute,
 		Handler: s, Logger: logger.NOP(), InterfaceFinder: finder,
@@ -110,7 +123,9 @@ func (s *Service) Close() error {
 	var err error
 	s.once.Do(func() {
 		s.cancel()
-		backend.SetSocketControl(nil)
+		if s.controlsSocket {
+			backend.SetSocketControl(nil)
+		}
 		var errs []error
 		if s.stack != nil {
 			errs = append(errs, s.stack.Close())

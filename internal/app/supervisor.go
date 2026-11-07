@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -65,6 +66,7 @@ type Supervisor struct {
 	path, dataDir string
 	impl          backend.Backend
 	ports         []int
+	lease         *os.File
 
 	ledger     *engine.TrafficLedger
 	refreshMu  sync.Mutex
@@ -77,7 +79,11 @@ type Supervisor struct {
 	started    time.Time
 	ctx        context.Context
 	cancel     context.CancelFunc
+	closing    bool
+	closeOnce  sync.Once
+	retiring   sync.WaitGroup
 
+	proxyMu     sync.Mutex
 	proxy       *sysproxy.Manager
 	proxyTarget sysproxy.Target
 	proxyErr    string
@@ -98,27 +104,38 @@ var TUNSupported = runtime.GOOS == "darwin" || (runtime.GOOS == "linux" && os.Ge
 // connections and is closed once they finish, or after this long.
 const retireAfter = 10 * time.Minute
 
-// Open loads the profile. Listeners are opened by the caller, using
-// Config().SOCKSPort and HTTPPort, before Start.
+var ErrProfileInUse = errors.New("HopWay 已在使用此配置")
+
+// Open claims the profile and recovers any abandoned network settings.
+// The caller must close it even if the listeners or Start fail afterward.
 func Open(path, dataDir string, impl backend.Backend) (*Supervisor, error) {
-	s := &Supervisor{path: path, dataDir: dataDir, impl: impl, subErr: map[string]string{}, subMeta: map[string]SubscriptionStatus{}}
-	loaded, err := profile.Load(path, dataDir, s.validate)
+	lease, err := acquireLease(dataDir)
 	if err != nil {
 		return nil, err
 	}
+	s := &Supervisor{path: path, dataDir: dataDir, impl: impl, lease: lease,
+		subErr: map[string]string{}, subMeta: map[string]SubscriptionStatus{}}
+	s.proxy = sysproxy.New(dataDir, nil)
+	var recoveryErr error
+	if SystemProxySupported {
+		// Recover before loading the profile: even a broken profile must
+		// not leave the previous process's dead proxy or DNS address in use.
+		s.recovered, recoveryErr = s.proxy.Recover()
+		if recoveryErr != nil {
+			s.proxyErr = "无法还原上次的系统代理设置：" + recoveryErr.Error()
+		}
+	}
+	loaded, err := profile.Load(path, dataDir, s.validate)
+	if err != nil {
+		if lease != nil {
+			lease.Close()
+		}
+		return nil, errors.Join(err, recoveryErr)
+	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.loaded = loaded
 	s.loadAutoPolicy()
 	s.readSnapshotMeta()
-	s.proxy = sysproxy.New(dataDir, nil)
-	if SystemProxySupported {
-		// A previous run that crashed with the system proxy on would leave
-		// every app pointing at a dead port: undo that first.
-		recovered, err := s.proxy.Recover()
-		s.recovered = recovered
-		if err != nil {
-			s.proxyErr = "无法还原上次的系统代理设置：" + err.Error()
-		}
-	}
 	return s, nil
 }
 
@@ -161,7 +178,6 @@ func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
 		core.Restore(engine.Runtime{Policy: *s.autoPolicy})
 	}
 	s.current.Store(core)
-	s.ctx, s.cancel = context.WithCancel(context.Background())
 	go s.subscriptionLoop()
 	if s.ledger != nil {
 		go s.flushTraffic()
@@ -196,14 +212,18 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 		if s.tunDevice == nil {
 			return nil
 		}
+		var restoreErr error
+		if SystemProxySupported {
+			restoreErr = s.proxy.RestoreDNS()
+			if restoreErr != nil && !s.isClosing() {
+				return restoreErr
+			}
+		}
 		err := s.tunDevice.Close()
 		s.mu.Lock()
 		s.tunDevice, s.tunName = nil, ""
 		s.mu.Unlock()
-		if SystemProxySupported {
-			err = errors.Join(err, s.proxy.RestoreDNS())
-		}
-		return err
+		return errors.Join(restoreErr, err)
 	}
 	if s.tunDevice != nil {
 		return nil
@@ -211,8 +231,15 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 	if !TUNSupported {
 		return errors.New("TUN mode needs macOS, or root on Linux")
 	}
+	s.mu.Lock()
+	closing := s.closing
+	t := s.loaded.Merged.TUN
+	s.mu.Unlock()
+	if closing {
+		return net.ErrClosed
+	}
 	options := tun.Options{}
-	if t := s.loaded.Merged.TUN; t != nil {
+	if t != nil {
 		options.MTU, options.IPv6 = t.MTU, t.IPv6
 	}
 	// Read the real DNS servers before the system DNS is pointed at the device.
@@ -223,7 +250,7 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 	if os.Geteuid() == 0 {
 		options.AutoRoute = true
 	} else if tun.ServiceAvailable(tun.ServiceSocket) {
-		fd, name, err := tun.OpenWithService(tun.ServiceSocket, options.IPv6)
+		fd, name, err := tun.OpenWithService(s.ctx, tun.ServiceSocket, options.IPv6)
 		if err != nil {
 			return fmt.Errorf("TUN service: %w", err)
 		}
@@ -233,7 +260,7 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 		if err != nil {
 			return err
 		}
-		fd, name, err := tun.OpenWithHelper(executable, options.IPv6)
+		fd, name, err := tun.OpenWithHelper(s.ctx, executable, options.IPv6)
 		if err != nil {
 			return err
 		}
@@ -248,9 +275,8 @@ func (s *Supervisor) setTUNLocked(enabled bool) error {
 		// A DNS server on the local network has a more specific route than
 		// the tunnel; point the system at the device so queries reach it.
 		if err := s.proxy.SetDNS(options.DNSAddress().String()); err != nil {
-			s.proxy.RestoreDNS()
-			device.Close()
-			return fmt.Errorf("cannot point the system DNS at the tunnel: %w", err)
+			return errors.Join(fmt.Errorf("cannot point the system DNS at the tunnel: %w", err),
+				s.proxy.RestoreDNS(), device.Close())
 		}
 	}
 	s.mu.Lock()
@@ -264,12 +290,14 @@ func (s *Supervisor) SetSystemProxy(enabled bool) error {
 	if !SystemProxySupported {
 		return errors.New("system proxy settings are only supported on macOS")
 	}
+	s.proxyMu.Lock()
+	defer s.proxyMu.Unlock()
+	if s.isClosing() {
+		return net.ErrClosed
+	}
 	var err error
 	if enabled {
 		err = s.proxy.Enable(s.proxyTarget)
-		if err != nil {
-			s.proxy.Disable() // never leave a half-applied change behind
-		}
 	} else {
 		err = s.proxy.Disable()
 	}
@@ -319,20 +347,25 @@ func (s *Supervisor) SetTUNService(installed bool) error {
 }
 
 func (s *Supervisor) networkChanged(event netmon.Event) {
-	s.current.Load().NetworkChanged()
-	s.mu.Lock()
-	device := s.tunDevice
-	s.mu.Unlock()
-	if device != nil {
-		device.ResetNetwork()
+	s.tunMu.Lock()
+	if s.isClosing() {
+		s.tunMu.Unlock()
+		return
 	}
-	if SystemProxySupported {
+	s.current.Load().NetworkChanged()
+	if s.tunDevice != nil {
+		s.tunDevice.ResetNetwork()
+	}
+	s.tunMu.Unlock()
+	s.proxyMu.Lock()
+	if SystemProxySupported && !s.isClosing() {
 		if _, err := s.proxy.Refresh(); err != nil {
 			s.mu.Lock()
 			s.proxyErr = err.Error()
 			s.mu.Unlock()
 		}
 	}
+	s.proxyMu.Unlock()
 	s.mu.Lock()
 	s.events = append(s.events, event)
 	if len(s.events) > 10 {
@@ -351,20 +384,43 @@ func (s *Supervisor) DialPacket(ctx context.Context, inbound, target string) (ne
 	return s.current.Load().DialPacket(ctx, inbound, target)
 }
 
+func (s *Supervisor) isClosing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closing
+}
+
 func (s *Supervisor) Close() {
-	if s.cancel != nil {
-		s.cancel()
-	}
-	if SystemProxySupported && s.proxy.Enabled() {
-		s.proxy.Disable()
-	}
-	s.SetTUN(false)
-	if core := s.current.Load(); core != nil {
-		core.Close()
-	}
-	if s.ledger != nil {
-		_ = s.ledger.Close()
-	}
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closing = true
+		s.mu.Unlock()
+		if s.cancel != nil {
+			s.cancel()
+		}
+		s.proxyMu.Lock()
+		if SystemProxySupported {
+			if err := s.proxy.Disable(); err != nil {
+				log.Printf("restore system proxy: %v", err)
+			}
+		}
+		s.proxyMu.Unlock()
+		if err := s.SetTUN(false); err != nil {
+			log.Printf("close TUN: %v", err)
+		}
+		if core := s.current.Load(); core != nil {
+			core.Close()
+		}
+		s.retiring.Wait()
+		s.refreshMu.Lock()
+		s.refreshMu.Unlock()
+		if s.ledger != nil {
+			_ = s.ledger.Close()
+		}
+		if s.lease != nil {
+			_ = s.lease.Close()
+		}
+	})
 }
 
 var ErrPortsChanged = errors.New("listening ports changed; restart HopWay to apply")
@@ -378,6 +434,9 @@ func (s *Supervisor) Reload() error {
 }
 
 func (s *Supervisor) reloadLocked() error {
+	if s.closing {
+		return net.ErrClosed
+	}
 	loaded, err := profile.Check(s.path, s.dataDir, s.validate)
 	if err != nil {
 		return err
@@ -408,17 +467,30 @@ func (s *Supervisor) reloadLocked() error {
 		s.loaded.Warnings = append(s.loaded.Warnings, "无法保存回滚配置")
 	}
 	if old != nil {
-		go retire(old)
+		s.retiring.Add(1)
+		go func() {
+			defer s.retiring.Done()
+			retire(s.ctx, old)
+		}()
 	}
 	return nil
 }
 
-func retire(old *engine.Engine) {
-	deadline := time.Now().Add(retireAfter)
-	for old.Active() > 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Second)
+func retire(ctx context.Context, old *engine.Engine) {
+	defer old.Close()
+	deadline := time.NewTimer(retireAfter)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for old.Active() > 0 {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			return
+		case <-ticker.C:
+		}
 	}
-	old.Close()
 }
 
 func (s *Supervisor) Status() Status {
@@ -466,9 +538,13 @@ func (s *Supervisor) RefreshSubscription(ctx context.Context, id string) {
 }
 
 func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id string) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer stop()
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || s.isClosing() {
 		return
 	}
 	s.mu.Lock()
@@ -543,6 +619,9 @@ func (s *Supervisor) loadAutoPolicy() {
 func (s *Supervisor) SetPolicy(policy engine.Policy) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closing {
+		return net.ErrClosed
+	}
 	core := s.Engine()
 	if err := core.ValidatePolicy(policy); err != nil {
 		return err

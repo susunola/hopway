@@ -3,10 +3,10 @@
 package tun
 
 import (
+	"context"
 	"errors"
 	"net"
 	"os"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -23,52 +23,49 @@ func SendDevice(socketPath string, fd int, name string) error {
 	return err
 }
 
-// ReceiveDevice waits on listener for one descriptor from SendDevice.
-// abort stops the wait early (the helper failed or the user cancelled).
-func ReceiveDevice(listener *net.UnixListener, timeout time.Duration, abort <-chan error) (int, string, error) {
-	type result struct {
-		fd   int
-		name string
-		err  error
-	}
-	results := make(chan result, 1)
-	go func() {
-		listener.SetDeadline(time.Now().Add(timeout))
-		conn, err := listener.AcceptUnix()
-		if err != nil {
-			results <- result{err: err}
-			return
-		}
-		defer conn.Close()
-		name := make([]byte, 64)
-		oob := make([]byte, unix.CmsgSpace(4))
-		n, oobn, _, _, err := conn.ReadMsgUnix(name, oob)
-		if err != nil {
-			results <- result{err: err}
-			return
-		}
-		messages, err := unix.ParseSocketControlMessage(oob[:oobn])
-		if err != nil || len(messages) != 1 {
-			results <- result{err: errors.New("helper sent no device")}
-			return
-		}
-		fds, err := unix.ParseUnixRights(&messages[0])
-		if err != nil || len(fds) != 1 {
-			results <- result{err: errors.New("helper sent no device")}
-			return
-		}
-		results <- result{fd: fds[0], name: string(name[:n])}
-	}()
-	select {
-	case r := <-results:
-		return r.fd, r.name, r.err
-	case err := <-abort:
-		listener.Close()
-		if err == nil {
-			err = errors.New("the helper exited without creating the device")
+// receiveDevice takes ownership of the listener and bounds both the accept
+// and read phases, including when a peer connects without sending a descriptor.
+func receiveDevice(ctx context.Context, listener *net.UnixListener, requireRoot bool) (int, string, error) {
+	defer listener.Close()
+	stopAccept := context.AfterFunc(ctx, func() { listener.Close() })
+	defer stopAccept()
+	conn, err := listener.AcceptUnix()
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, "", context.Cause(ctx)
 		}
 		return 0, "", err
 	}
+	stopAccept()
+	defer conn.Close()
+	if requireRoot {
+		uid, err := peerUID(conn)
+		if err != nil {
+			return 0, "", err
+		}
+		if uid != 0 {
+			return 0, "", errors.New("the TUN helper connection is not privileged")
+		}
+	}
+	stopRead := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopRead()
+	fd, data, err := receiveRights(conn)
+	if ctx.Err() != nil {
+		if fd > 0 {
+			closeFD(fd)
+		}
+		return 0, "", context.Cause(ctx)
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	if fd <= 0 || len(data) == 0 || len(data) > 64 {
+		if fd > 0 {
+			closeFD(fd)
+		}
+		return 0, "", errors.New("helper sent no valid device")
+	}
+	return fd, string(data), nil
 }
 
 // helperSocket makes a private directory for the hand-off socket.
@@ -95,17 +92,37 @@ func closeFD(fd int)           { unix.Close(fd) }
 func receiveRights(conn *net.UnixConn) (int, []byte, error) {
 	data := make([]byte, 4096)
 	oob := make([]byte, unix.CmsgSpace(4))
-	n, oobn, _, _, err := conn.ReadMsgUnix(data, oob)
+	n, oobn, flags, _, err := conn.ReadMsgUnix(data, oob)
 	if err != nil {
 		return 0, nil, err
 	}
-	fd := 0
-	if messages, err := unix.ParseSocketControlMessage(oob[:oobn]); err == nil && len(messages) == 1 {
-		if fds, err := unix.ParseUnixRights(&messages[0]); err == nil && len(fds) == 1 {
-			fd = fds[0]
+	messages, err := unix.ParseSocketControlMessage(oob[:oobn])
+	if err != nil {
+		return 0, nil, err
+	}
+	var fds []int
+	for i := range messages {
+		rights, err := unix.ParseUnixRights(&messages[i])
+		if err == nil {
+			fds = append(fds, rights...)
 		}
 	}
-	return fd, data[:n], nil
+	if flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 || len(fds) > 1 {
+		for _, fd := range fds {
+			closeFD(fd)
+		}
+		return 0, nil, errors.New("invalid descriptor message")
+	}
+	if len(fds) == 1 {
+		// FD zero is reserved in Options to mean opening a new device.
+		if fds[0] == 0 {
+			closeFD(0)
+			return 0, nil, errors.New("invalid device descriptor")
+		}
+		unix.CloseOnExec(fds[0])
+		return fds[0], data[:n], nil
+	}
+	return 0, data[:n], nil
 }
 
 func dialRaw(path string) (*net.UnixConn, error) {

@@ -55,7 +55,14 @@ func TestSubscriptionAnyTLSAlwaysVerifiesCertificates(t *testing.T) {
 			"anytls://fixture@example.test:443#%E8%AF%B7%E6%9B%B4%E6%96%B0%E5%AE%A2%E6%88%B7%E7%AB%AF"))
 	}))
 	defer server.Close()
-	result, err := Import(context.Background(), strings.NewReader(server.URL), engine.Default(), backend.Default())
+	impl := backend.Default()
+	result, err := Import(context.Background(), strings.NewReader(server.URL), engine.Default(), impl)
+	if impl.Name() == "native" {
+		if err == nil || !strings.Contains(err.Error(), "needs the sing-box backend") {
+			t.Fatalf("native build should report that AnyTLS is unsupported: %v", err)
+		}
+		return
+	}
 	if err != nil || result.Added != 1 || result.Skipped != 1 || result.Usage == nil || *result.Usage.Used != 5 {
 		t.Fatalf("subscription import failed: %v", err)
 	}

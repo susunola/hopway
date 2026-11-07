@@ -4,6 +4,7 @@ package tun
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -96,7 +97,7 @@ func deviceFD(device stun.Tun) (int, error) {
 
 // OpenWithHelper asks for administrator rights (macOS's standard password
 // dialog) to run executable as the helper, and returns the device it sends.
-func OpenWithHelper(executable string, ipv6 bool) (int, string, error) {
+func OpenWithHelper(ctx context.Context, executable string, ipv6 bool) (int, string, error) {
 	if runtime.GOOS != "darwin" {
 		return 0, "", errors.New("the TUN helper is only used on macOS")
 	}
@@ -111,31 +112,30 @@ func OpenWithHelper(executable string, ipv6 bool) (int, string, error) {
 	}
 	script := fmt.Sprintf(`do shell script quoted form of %s & "`+flags+`" & quoted form of %s with administrator privileges with prompt "HopWay 需要管理员权限来开启增强模式（TUN），用于创建虚拟网卡并接管路由。"`,
 		appleString(executable), appleString(path))
-	cmd := exec.Command("/usr/bin/osascript", "-e", script)
+	ctx, stop := context.WithTimeout(ctx, 2*time.Minute)
+	defer stop()
+	ctx, fail := context.WithCancelCause(ctx)
+	defer fail(nil)
+	cmd := exec.CommandContext(ctx, "/usr/bin/osascript", "-e", script)
+	cmd.WaitDelay = time.Second
 	var output strings.Builder
 	cmd.Stderr = &output
 	if err := cmd.Start(); err != nil {
 		return 0, "", err
 	}
-	exited := make(chan error, 1)
 	go func() {
-		err := cmd.Wait()
-		if err != nil {
+		if err := cmd.Wait(); err != nil {
 			message := strings.TrimSpace(output.String())
 			if strings.Contains(message, "-128") {
 				message = "已取消授权"
 			}
-			err = errors.New(message)
-		}
-		exited <- err
-	}()
-	abort := make(chan error, 1)
-	go func() {
-		if err := <-exited; err != nil {
-			abort <- err
+			if message != "" {
+				err = errors.New(message)
+			}
+			fail(err)
 		}
 	}()
-	return ReceiveDevice(listener, 2*time.Minute, abort)
+	return receiveDevice(ctx, listener, true)
 }
 
 // appleString quotes s as an AppleScript string literal.

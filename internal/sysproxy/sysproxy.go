@@ -5,38 +5,48 @@
 package sysproxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Proxy is one of the three proxy slots of a network service.
 type Proxy struct {
-	Enabled bool   `json:"enabled"`
-	Server  string `json:"server,omitempty"`
-	Port    int    `json:"port,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	Server        string `json:"server,omitempty"`
+	Port          int    `json:"port,omitempty"`
+	Authenticated bool   `json:"authenticated,omitempty"`
 }
 
 // Service is what HopWay changes on one network service.
 type Service struct {
-	Name   string   `json:"name"`
-	Web    Proxy    `json:"web"`
-	Secure Proxy    `json:"secure"`
-	SOCKS  Proxy    `json:"socks"`
-	Bypass []string `json:"bypass,omitempty"`
+	Name       string   `json:"name"`
+	Web        Proxy    `json:"web"`
+	Secure     Proxy    `json:"secure"`
+	SOCKS      Proxy    `json:"socks"`
+	Bypass     []string `json:"bypass,omitempty"`
+	Applied    *Service `json:"applied,omitempty"`    // present only in the recovery journal
+	RestoreOff uint8    `json:"restoreOff,omitempty"` // slots that may need switching off after an interrupted restore
 }
 
 // Runner executes networksetup; tests replace it.
 type Runner func(args ...string) (string, error)
 
 func networksetup(args ...string) (string, error) {
-	output, err := exec.Command("/usr/sbin/networksetup", args...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "/usr/sbin/networksetup", args...).CombinedOutput()
 	text := strings.TrimSpace(string(output))
 	if err != nil {
 		if text == "" {
@@ -55,7 +65,7 @@ type Manager struct {
 	run    Runner
 	backup string // path of the saved original settings
 	mu     sync.Mutex
-	active *Target
+	active atomic.Pointer[Target]
 }
 
 // Target is where the system proxy should point.
@@ -74,6 +84,10 @@ func New(dataDir string, run Runner) *Manager {
 
 // Services lists enabled network services ("*" marks disabled ones).
 func (m *Manager) Services() ([]string, error) {
+	return m.services(false)
+}
+
+func (m *Manager) services(includeDisabled bool) ([]string, error) {
 	output, err := m.run("-listallnetworkservices")
 	if err != nil {
 		return nil, err
@@ -81,8 +95,14 @@ func (m *Manager) Services() ([]string, error) {
 	var services []string
 	for i, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
-		if i == 0 && strings.Contains(line, "asterisk") || line == "" || strings.HasPrefix(line, "*") {
+		if i == 0 && strings.Contains(line, "asterisk") || line == "" {
 			continue
+		}
+		if name, disabled := strings.CutPrefix(line, "*"); disabled {
+			if !includeDisabled {
+				continue
+			}
+			line = strings.TrimSpace(name)
 		}
 		services = append(services, line)
 	}
@@ -130,38 +150,78 @@ func parseProxy(output string) Proxy {
 			proxy.Server = value
 		case "Port":
 			proxy.Port, _ = strconv.Atoi(value)
+		case "Authenticated Proxy Enabled":
+			proxy.Authenticated = value == "1" || value == "Yes"
 		}
 	}
 	return proxy
 }
 
-func (m *Manager) write(service Service) error {
-	for _, slot := range []struct {
+// write applies desired settings. During recovery it only touches fields
+// still pointing at HopWay, including a slot whose address was written before
+// the process could set its enabled state.
+func (m *Manager) write(service Service, current *Service) error {
+	slots := []struct {
 		set, state string
 		proxy      Proxy
 	}{
 		{"-setwebproxy", "-setwebproxystate", service.Web},
 		{"-setsecurewebproxy", "-setsecurewebproxystate", service.Secure},
 		{"-setsocksfirewallproxy", "-setsocksfirewallproxystate", service.SOCKS},
-	} {
-		if slot.proxy.Server != "" && slot.proxy.Port > 0 {
-			if _, err := m.run(slot.set, service.Name, slot.proxy.Server, strconv.Itoa(slot.proxy.Port)); err != nil {
+	}
+	var currentSlots, appliedSlots [3]Proxy
+	if current != nil {
+		currentSlots = [3]Proxy{current.Web, current.Secure, current.SOCKS}
+		appliedSlots = [3]Proxy{service.Applied.Web, service.Applied.Secure, service.Applied.SOCKS}
+	}
+	var failures []error
+	for i, slot := range slots {
+		if current != nil {
+			now, applied := currentSlots[i], appliedSlots[i]
+			if now.Authenticated {
+				continue
+			}
+			if now.Server != applied.Server || now.Port != applied.Port {
+				if service.RestoreOff&(1<<i) != 0 && now.Enabled &&
+					now.Server == slot.proxy.Server && now.Port == slot.proxy.Port {
+					_, err := m.run(slot.state, service.Name, "off")
+					failures = append(failures, err)
+				}
+				continue
+			}
+			// Preserve a manual switch-off while restoring the address.
+			slot.proxy.Enabled = slot.proxy.Enabled && now.Enabled && service.RestoreOff&(1<<i) == 0
+		}
+		err := m.writeSlot(service.Name, slot.set, slot.state, slot.proxy)
+		if err != nil {
+			if current == nil {
 				return err
 			}
+			failures = append(failures, err)
 		}
-		state := "off"
-		if slot.proxy.Enabled {
-			state = "on"
+	}
+	if current == nil || slices.Equal(current.Bypass, service.Applied.Bypass) {
+		bypass := service.Bypass
+		if len(bypass) == 0 {
+			bypass = []string{"Empty"}
 		}
-		if _, err := m.run(slot.state, service.Name, state); err != nil {
+		_, err := m.run(append([]string{"-setproxybypassdomains", service.Name}, bypass...)...)
+		failures = append(failures, err)
+	}
+	return errors.Join(failures...)
+}
+
+func (m *Manager) writeSlot(name, set, state string, proxy Proxy) error {
+	if proxy.Server != "" && proxy.Port > 0 {
+		if _, err := m.run(set, name, proxy.Server, strconv.Itoa(proxy.Port)); err != nil {
 			return err
 		}
 	}
-	bypass := service.Bypass
-	if len(bypass) == 0 {
-		bypass = []string{"Empty"} // networksetup's keyword for "none"
+	value := "off"
+	if proxy.Enabled {
+		value = "on"
 	}
-	_, err := m.run(append([]string{"-setproxybypassdomains", service.Name}, bypass...)...)
+	_, err := m.run(state, name, value)
 	return err
 }
 
@@ -177,25 +237,43 @@ func (m *Manager) loadBackup() ([]Service, error) {
 	return services, nil
 }
 
-func (m *Manager) saveBackup(services []Service) error {
-	data, err := json.MarshalIndent(services, "", "  ")
+func writeBackup(path string, value any) error {
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(m.backup), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp := m.backup + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	file, err := os.CreateTemp(dir, ".network-backup-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, m.backup)
+	defer os.Remove(file.Name())
+	_, writeErr := file.Write(data)
+	syncErr := file.Sync()
+	if err := errors.Join(writeErr, syncErr, file.Close()); err != nil {
+		return err
+	}
+	if err := os.Rename(file.Name(), path); err != nil {
+		return err
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func split(address string) (string, int, error) {
-	host, port, ok := strings.Cut(address, ":")
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || host == "" {
+		return "", 0, fmt.Errorf("invalid listener address %q", address)
+	}
 	number, err := strconv.Atoi(port)
-	if !ok || err != nil || number <= 0 {
+	if err != nil || number <= 0 || number > 65535 {
 		return "", 0, fmt.Errorf("invalid listener address %q", address)
 	}
 	return host, number, nil
@@ -207,128 +285,188 @@ func split(address string) (string, int, error) {
 func (m *Manager) Enable(target Target) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.enableLocked(target)
+	_, err := m.enableLocked(target)
+	return err
 }
 
-func (m *Manager) enableLocked(target Target) error {
+func (m *Manager) enableLocked(target Target) (bool, error) {
 	httpHost, httpPort, err := split(target.HTTP)
 	if err != nil {
-		return err
+		return false, err
 	}
 	socksHost, socksPort, err := split(target.SOCKS)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(target.Bypass) == 0 {
 		target.Bypass = DefaultBypass
 	}
 	services, err := m.Services()
 	if err != nil {
-		return err
+		return false, err
 	}
-	saved, _ := m.loadBackup()
-	known := map[string]bool{}
+	if len(services) == 0 {
+		return false, errors.New("no enabled network service")
+	}
+	saved, err := m.loadBackup()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("read original proxy settings: %w", err)
+	}
+	if len(saved) > 0 && m.active.Load() == nil {
+		return false, errors.New("restore the previous proxy settings before enabling the system proxy")
+	}
+	known := map[string]Service{}
 	for _, service := range saved {
-		known[service.Name] = true
+		known[service.Name] = service
 	}
+	var added []Service
 	for _, name := range services {
-		if known[name] {
+		applied := Service{Name: name, Bypass: slices.Clone(target.Bypass),
+			Web:    Proxy{Enabled: true, Server: httpHost, Port: httpPort},
+			Secure: Proxy{Enabled: true, Server: httpHost, Port: httpPort},
+			SOCKS:  Proxy{Enabled: true, Server: socksHost, Port: socksPort}}
+		if entry, ok := known[name]; ok {
+			prior := entry.Applied
+			if prior == nil || prior.Web != applied.Web || prior.Secure != applied.Secure ||
+				prior.SOCKS != applied.SOCKS || !slices.Equal(prior.Bypass, applied.Bypass) {
+				return false, errors.New("restore the previous proxy settings before changing the target")
+			}
 			continue
 		}
 		original, err := m.read(name)
 		if err != nil {
-			return err
+			return false, err
 		}
-		saved = append(saved, original)
+		if original.Web.Authenticated || original.Secure.Authenticated || original.SOCKS.Authenticated {
+			return false, fmt.Errorf("cannot safely replace the authenticated proxy on %s", name)
+		}
+		original.Applied = &applied
+		added = append(added, original)
 	}
-	if err := m.saveBackup(saved); err != nil {
-		return fmt.Errorf("save original proxy settings: %w", err)
-	}
-	for _, name := range services {
-		service := Service{Name: name, Bypass: target.Bypass,
-			Web:    Proxy{true, httpHost, httpPort},
-			Secure: Proxy{true, httpHost, httpPort},
-			SOCKS:  Proxy{true, socksHost, socksPort}}
-		if err := m.write(service); err != nil {
-			return err
+	if len(added) > 0 {
+		if err := writeBackup(m.backup, append(saved, added...)); err != nil {
+			return false, fmt.Errorf("save original proxy settings: %w", err)
+		}
+		for _, service := range added {
+			if err := m.write(*service.Applied, nil); err != nil {
+				return false, errors.Join(err, m.rollback(saved, added))
+			}
 		}
 	}
-	m.active = &target
-	return nil
+	m.active.Store(&target)
+	return len(added) > 0, nil
+}
+
+// rollback reverses only the newly added services. Previously owned services
+// stay active if a refresh fails. Keep the full journal if reversal failed.
+func (m *Manager) rollback(saved, added []Service) error {
+	if err := m.restore(append(saved, added...), len(saved)); err != nil {
+		return err
+	}
+	if len(saved) == 0 {
+		return os.Remove(m.backup)
+	}
+	return writeBackup(m.backup, saved)
+}
+
+// restore persists intent before issuing any restore command that could
+// temporarily re-enable a proxy at its original address. That address then
+// remains recognizable if the process exits between the two commands.
+func (m *Manager) restore(saved []Service, from int) error {
+	current, err := m.services(true)
+	if err != nil {
+		return err
+	}
+	states := make(map[string]Service, len(saved)-from)
+	var failures []error
+	dirty := false
+	for i := from; i < len(saved); i++ {
+		service := &saved[i]
+		if service.Applied == nil || !slices.Contains(current, service.Name) {
+			continue
+		}
+		actual, err := m.read(service.Name)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		states[service.Name] = actual
+		before := service.RestoreOff
+		originals := [...]Proxy{service.Web, service.Secure, service.SOCKS}
+		owned := [...]Proxy{service.Applied.Web, service.Applied.Secure, service.Applied.SOCKS}
+		for j, now := range [...]Proxy{actual.Web, actual.Secure, actual.SOCKS} {
+			old, applied := originals[j], owned[j]
+			if !now.Authenticated && now.Server == applied.Server && now.Port == applied.Port &&
+				old.Server != "" && old.Port > 0 && (!old.Enabled || !now.Enabled) {
+				service.RestoreOff |= 1 << j
+			}
+		}
+		dirty = dirty || before != service.RestoreOff
+	}
+	if dirty {
+		if err := writeBackup(m.backup, saved); err != nil {
+			return errors.Join(errors.Join(failures...), err)
+		}
+	}
+	for _, service := range saved[from:] {
+		if !slices.Contains(current, service.Name) {
+			continue
+		}
+		var state *Service
+		if service.Applied != nil {
+			actual, ok := states[service.Name]
+			if !ok {
+				continue
+			}
+			state = &actual
+		}
+		failures = append(failures, m.write(service, state))
+	}
+	return errors.Join(failures...)
 }
 
 // Disable restores the saved settings and removes the backup.
 func (m *Manager) Disable() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.active = nil
 	saved, err := m.loadBackup()
 	if errors.Is(err, os.ErrNotExist) {
+		m.active.Store(nil)
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	current, _ := m.Services()
-	present := map[string]bool{}
-	for _, name := range current {
-		present[name] = true
+	if err := m.restore(saved, 0); err != nil {
+		return err
 	}
-	var failed []string
-	for _, service := range saved {
-		if current != nil && !present[service.Name] {
-			continue // the service was removed meanwhile
-		}
-		if err := m.write(service); err != nil {
-			failed = append(failed, err.Error())
-		}
-	}
-	if len(failed) != 0 {
-		return errors.New(strings.Join(failed, "; "))
-	}
+	m.active.Store(nil)
 	return os.Remove(m.backup)
 }
 
-// Recover undoes a previous run that changed the settings and never put
-// them back (crash, kill -9, power loss). Call it before Enable.
+// Recover undoes a previous run that changed the settings and never put them
+// back. Call it before Enable.
 func (m *Manager) Recover() (bool, error) {
 	_, proxyErr := os.Stat(m.backup)
 	_, dnsErr := os.Stat(m.dnsBackupPath())
-	if proxyErr != nil && dnsErr != nil {
+	if errors.Is(proxyErr, os.ErrNotExist) && errors.Is(dnsErr, os.ErrNotExist) {
 		return false, nil
 	}
-	return true, errors.Join(m.Disable(), m.RestoreDNS())
+	err := errors.Join(m.Disable(), m.RestoreDNS())
+	return err == nil, err
 }
 
 // Enabled reports whether HopWay currently owns the system proxy.
 func (m *Manager) Enabled() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.active != nil
+	return m.active.Load() != nil
 }
 
-// Refresh covers network services that appeared since Enable (a USB
-// Ethernet dongle, a new Wi-Fi adapter). Services the user changed by hand
-// are left alone: HopWay never fights the user over the setting.
+// Refresh adds only new services, leaving settings on existing services alone.
 func (m *Manager) Refresh() (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.active == nil {
-		return false, nil
-	}
-	services, err := m.Services()
-	if err != nil {
-		return false, err
-	}
-	saved, _ := m.loadBackup()
-	known := map[string]bool{}
-	for _, service := range saved {
-		known[service.Name] = true
-	}
-	for _, name := range services {
-		if !known[name] {
-			return true, m.enableLocked(*m.active)
-		}
+	if target := m.active.Load(); target != nil {
+		return m.enableLocked(*target)
 	}
 	return false, nil
 }

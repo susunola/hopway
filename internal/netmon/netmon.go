@@ -42,14 +42,14 @@ func Fingerprint() string {
 	return strings.Join(parts, ",")
 }
 
-// Watch calls notify on each change until ctx ends. fingerprint and clock
-// are injectable for tests.
+// Watch calls notify on each change until ctx ends. fingerprint is injectable for tests.
 func Watch(ctx context.Context, interval time.Duration, fingerprint func() string, notify func(Event)) {
 	if fingerprint == nil {
 		fingerprint = Fingerprint
 	}
 	last := fingerprint()
-	wall, mono := time.Now().Round(0), time.Now()
+	mono := time.Now()
+	wall := mono.Round(0)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -58,15 +58,17 @@ func Watch(ctx context.Context, interval time.Duration, fingerprint func() strin
 			return
 		case <-ticker.C:
 		}
-		nowWall, nowMono := time.Now().Round(0), time.Now()
-		// While asleep the monotonic clock stands still but the wall clock
-		// does not, so a large gap between them means we just woke up.
-		if gap := nowWall.Sub(wall) - nowMono.Sub(mono); gap > 5*time.Second+interval {
+		now := time.Now()
+		nowWall := now.Round(0)
+		current := fingerprint()
+		changed := current != last
+		// Both events trigger the same reset. On wake, consume any
+		// accompanying address change so the engine only resets once.
+		gap := nowWall.Sub(wall) - now.Sub(mono)
+		wall, mono, last = nowWall, now, current
+		if gap > 5*time.Second+interval {
 			notify(Event{Kind: "wake", At: nowWall, Info: "slept about " + gap.Round(time.Second).String()})
-		}
-		wall, mono = nowWall, nowMono
-		if current := fingerprint(); current != last {
-			last = current
+		} else if changed {
 			notify(Event{Kind: "network", At: nowWall})
 		}
 	}

@@ -111,10 +111,12 @@ func TestSubscriptionRefreshAndHotReload(t *testing.T) {
 	}
 
 	// A restart works offline from the cached snapshot.
+	s.Close()
 	again, err := Open(path, filepath.Join(dir, "cache"), backend.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer again.Close()
 	if len(again.Config().Nodes) != 2 {
 		t.Fatalf("cached snapshot not used at start: %+v", again.Config().Nodes)
 	}

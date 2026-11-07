@@ -172,7 +172,11 @@ type Engine struct {
 	livePackets   map[uint64]*trackedPacket
 	recent        []Record
 	ports         map[uint16]bool
+	ctx           context.Context
 	stop          context.CancelFunc
+	closed        bool
+	closeOnce     sync.Once
+	closeErr      error
 
 	lookupProcess    func(client, server netip.AddrPort) (*process.Owner, error)
 	lookupProcessUDP func(client, server netip.AddrPort) (*process.Owner, error)
@@ -259,7 +263,7 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 		engine.dialers[node.Name], _ = engine.instance.Dialer(node.Name)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	engine.stop = cancel
+	engine.ctx, engine.stop = ctx, cancel
 	go engine.MonitorAuto(ctx)
 	if len(engine.autoMembers()) != 0 {
 		go engine.healthLoop(ctx, time.Duration(interval)*time.Second)
@@ -290,28 +294,51 @@ func Validate(config Config, impl backend.Backend) error {
 // DNS answers and pooled sessions belong to the old network, and node
 // latencies must be measured again.
 func (engine *Engine) NetworkChanged() {
+	engine.mu.Lock()
+	if engine.closed {
+		engine.mu.Unlock()
+		return
+	}
 	backend.Resolver.Flush()
 	if engine.instance != nil {
 		engine.instance.ResetConnections()
 	}
-	engine.mu.Lock()
 	for _, h := range engine.health {
 		h.checked = time.Time{} // unknown again until probed
 	}
 	engine.mu.Unlock()
-	if members := engine.autoMembers(); len(members) != 0 && engine.stop != nil {
-		go engine.Probe(context.Background(), members)
+	if members := engine.autoMembers(); len(members) != 0 && engine.ctx != nil {
+		go engine.Probe(engine.ctx, members)
 	}
 }
 
 func (engine *Engine) Close() error {
-	if engine.stop != nil {
-		engine.stop()
-	}
-	if engine.instance != nil {
-		return engine.instance.Close()
-	}
-	return nil
+	engine.closeOnce.Do(func() {
+		engine.mu.Lock()
+		engine.closed = true
+		connections := make([]*tracked, 0, len(engine.live))
+		packets := make([]*trackedPacket, 0, len(engine.livePackets))
+		for _, conn := range engine.live {
+			connections = append(connections, conn)
+		}
+		for _, conn := range engine.livePackets {
+			packets = append(packets, conn)
+		}
+		engine.mu.Unlock()
+		if engine.stop != nil {
+			engine.stop()
+		}
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+		for _, conn := range packets {
+			_ = conn.Close()
+		}
+		if engine.instance != nil {
+			engine.closeErr = engine.instance.Close()
+		}
+	})
+	return engine.closeErr
 }
 
 func (engine *Engine) valid(name string) bool {
@@ -429,6 +456,10 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		return nil, err
 	}
 	engine.mu.Lock()
+	if engine.closed {
+		engine.mu.Unlock()
+		return nil, net.ErrClosed
+	}
 	engine.sequence++
 	record := Record{ID: engine.sequence, Start: time.Now().UnixMilli(), Target: target, Inbound: inbound, State: "active"}
 	policy := engine.policy
@@ -486,6 +517,13 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	}
 	record.setOwner(owner)
 	engine.mu.Lock()
+	if engine.closed {
+		engine.mu.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, net.ErrClosed
+	}
 	defer engine.mu.Unlock()
 	if err != nil {
 		record.State, record.Error = "failed", describe(err)
@@ -539,6 +577,10 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 		return nil, err
 	}
 	engine.mu.Lock()
+	if engine.closed {
+		engine.mu.Unlock()
+		return nil, net.ErrClosed
+	}
 	engine.sequence++
 	record := Record{ID: engine.sequence, Start: time.Now().UnixMilli(), Target: target, Inbound: inbound, State: "active", Network: "udp"}
 	policy := engine.policy
@@ -562,6 +604,8 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 	if len(candidates) > maxAttempts {
 		candidates = candidates[:maxAttempts]
 	}
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
 	var conn net.PacketConn
 	for i, candidate := range candidates {
 		record.Via, record.Route, record.Attempts = candidate.via, candidate.route, i+1
@@ -575,6 +619,13 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 	}
 	record.setOwner(owner)
 	engine.mu.Lock()
+	if engine.closed {
+		engine.mu.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, net.ErrClosed
+	}
 	defer engine.mu.Unlock()
 	if err != nil {
 		record.State, record.Error = "failed", describe(err)

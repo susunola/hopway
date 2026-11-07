@@ -192,10 +192,14 @@ func run(path string, port int, check, managed bool) error {
 		}
 		return err
 	}
+	// Return normally on signals so deferred cleanup can restore the network.
+	signals, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer stopSignals()
 	supervisor, err := app.Open(path, dataDir(path), impl)
 	if err != nil {
 		return err
 	}
+	defer supervisor.Close()
 	config := supervisor.Config()
 	if port != -1 {
 		config.SOCKSPort = port
@@ -232,8 +236,10 @@ func run(path string, port int, check, managed bool) error {
 	if err := supervisor.Start(sysproxy.Target{HTTP: info.HTTP, SOCKS: info.SOCKS}, ports...); err != nil {
 		return err
 	}
-	defer supervisor.Close()
-	serverErrors := make(chan error, 3)
+	if signals.Err() != nil {
+		return nil
+	}
+	serverErrors := make(chan error, 4)
 	go func() { serverErrors <- serveSOCKS(socks, supervisor.Dial, supervisor.DialPacket) }()
 	httpServer := &http.Server{
 		Handler: httpproxy.Handler(supervisor.Dial), ReadHeaderTimeout: 10 * time.Second,
@@ -256,15 +262,12 @@ func run(path string, port int, check, managed bool) error {
 			serverErrors <- nil
 		}()
 	}
-	// SIGINT/SIGTERM return normally so deferred cleanup restores the system
-	// proxy. A SIGKILL cannot be caught; the next start restores it instead.
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	go func() {
-		<-signals
-		serverErrors <- nil
-	}()
-	return <-serverErrors
+	select {
+	case <-signals.Done():
+		return nil
+	case err := <-serverErrors:
+		return err
+	}
 }
 
 func serveSOCKS(listener *net.TCPListener, dial socks5.DialFunc, dialPacket socks5.DialPacketFunc) error {

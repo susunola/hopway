@@ -3,6 +3,8 @@
 package tun
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -106,35 +108,56 @@ func serveRequest(conn *net.UnixConn, allowedUID uint32, create func(Options) (i
 }
 
 // OpenWithService asks the installed service for a device.
-func OpenWithService(socketPath string, ipv6 bool) (int, string, error) {
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: socketPath, Net: "unix"})
+func OpenWithService(ctx context.Context, socketPath string, ipv6 bool) (int, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 	if err != nil {
 		return 0, "", err
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	unixConn := conn.(*net.UnixConn)
 	writeErr := json.NewEncoder(conn).Encode(serviceRequest{Version: ServiceVersion, IPv6: ipv6})
-	fd, data, err := receiveRights(conn) // read the answer even if the write failed
-	if err != nil && writeErr != nil {
-		return 0, "", writeErr
-	}
-	var reply serviceReply
-	if jsonErr := json.Unmarshal(data, &reply); jsonErr != nil {
-		if err == nil {
-			err = errors.New("invalid reply from the TUN service")
-		}
-		return 0, "", err
-	}
-	if reply.Error != "" {
+	fd, data, err := receiveRights(unixConn) // read the answer even if the write failed
+	defer func() {
 		if fd > 0 {
 			closeFD(fd)
 		}
+	}()
+	if ctx.Err() != nil {
+		return 0, "", ctx.Err()
+	}
+	if err != nil {
+		if writeErr != nil {
+			return 0, "", writeErr
+		}
+		return 0, "", err
+	}
+	var reply serviceReply
+	reader := io.MultiReader(bytes.NewReader(data), conn)
+	if err := json.NewDecoder(io.LimitReader(reader, 4096)).Decode(&reply); err != nil {
+		if ctx.Err() != nil {
+			return 0, "", ctx.Err()
+		}
+		return 0, "", fmt.Errorf("invalid reply from the TUN service: %w", err)
+	}
+	if reply.Version != ServiceVersion {
+		return 0, "", errors.New("TUN service version mismatch: reinstall the service")
+	}
+	if reply.Error != "" {
 		return 0, "", errors.New(reply.Error)
 	}
-	if err != nil || fd <= 0 {
+	if fd <= 0 || reply.Name == "" {
 		return 0, "", errors.New("the TUN service sent no device")
 	}
-	return fd, reply.Name, nil
+	if ctx.Err() != nil {
+		return 0, "", ctx.Err()
+	}
+	device := fd
+	fd = 0
+	return device, reply.Name, nil
 }
 
 // ServiceAvailable reports whether the service socket accepts connections.

@@ -268,6 +268,10 @@ func (engine *Engine) ProbeResults(ctx context.Context, names []string, emit fun
 func (engine *Engine) probeNodes(ctx context.Context, names []string, emit func(ProbeResult) error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if engine.ctx != nil {
+		stop := context.AfterFunc(engine.ctx, cancel)
+		defer stop()
+	}
 	var emitMu sync.Mutex
 	var emitErr error
 	if names == nil {
@@ -319,10 +323,12 @@ func (engine *Engine) probeNodes(ctx context.Context, names []string, emit func(
 			}
 		}()
 	}
+schedule:
 	for _, name := range names {
 		select {
 		case work <- name:
 		case <-ctx.Done():
+			break schedule
 		}
 	}
 	close(work)

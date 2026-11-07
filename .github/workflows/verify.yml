@@ -39,3 +39,5 @@ jobs:
           ./build-app.sh "$app"
           codesign --verify --deep --strict "$app"
           test -s "$app/Contents/Resources/HopWay.icns"
+      - name: Exercise reload and shutdown on loopback
+        run: python3 tools/smoke-lifecycle.py "$RUNNER_TEMP/build.noindex/HopWay.app/Contents/Resources/mac-proxy-core"
