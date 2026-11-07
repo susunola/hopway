@@ -31,7 +31,9 @@ struct OverviewDashboard: View {
                 .fixedSize(horizontal: false, vertical: true)
             content(chartHeight: 80)
                 .fixedSize(horizontal: false, vertical: true)
-            ScrollView { content(chartHeight: 80) }
+            content(chartHeight: 46)
+                .fixedSize(horizontal: false, vertical: true)
+            ScrollView { content(chartHeight: 46) }
         }
     }
 
@@ -168,6 +170,8 @@ struct OverviewDashboard: View {
                         Text(selected).fontWeight(.medium).lineLimit(1).help(selected)
                     }
                     routingContext(mode: mode, status: nil)
+                    Spacer(minLength: 6)
+                    Text("启动后可验证").font(.caption).foregroundStyle(.secondary).fixedSize()
                 }
                 .font(.callout)
             } else {
@@ -175,8 +179,10 @@ struct OverviewDashboard: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-            Divider()
-            outletStatus
+            if running {
+                Divider()
+                outletStatus
+            }
         }
         .hopPanel(verticalPadding: 12)
     }
