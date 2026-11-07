@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"mac-proxy/internal/backend"
+	"mac-proxy/internal/lifetime"
 	"mac-proxy/internal/outbound"
 	"mac-proxy/internal/peer"
 	"mac-proxy/internal/process"
@@ -195,11 +196,11 @@ type Engine struct {
 	journal       connectionJournal
 	ports         map[uint16]bool
 	ctx           context.Context
-	stop          context.CancelFunc
+	work          *lifetime.Group
 	networkCtx    context.Context
 	cancelNetwork context.CancelFunc
 	networkEpoch  atomic.Uint64
-	ruleRefreshMu sync.Mutex
+	ruleRefresh   chan struct{}
 	closed        bool
 	closeOnce     sync.Once
 	closeErr      error
@@ -333,16 +334,18 @@ func NewWithResourceBudget(config Config, impl backend.Backend, budget *Resource
 		engine.dialers[node.Name], _ = engine.instance.Dialer(node.Name)
 		engine.dialSlots[node.Name] = budget.dials.retain(endpointKey(node.Server))
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	engine.ctx, engine.stop = ctx, cancel
+	engine.work = lifetime.New()
+	ctx := engine.work.Context()
+	engine.ctx = ctx
 	engine.networkCtx, engine.cancelNetwork = context.WithCancel(ctx)
-	go engine.MonitorAuto(ctx)
+	engine.ruleRefresh = make(chan struct{}, 1)
+	engine.work.Start(ctx, engine.MonitorAuto)
 	if len(engine.autoMembers()) != 0 {
-		go engine.healthLoop(ctx, time.Duration(interval)*time.Second)
+		engine.work.Start(ctx, func(ctx context.Context) { engine.healthLoop(ctx, time.Duration(interval)*time.Second) })
 	}
 	for _, state := range engine.ruleSets {
 		if state.URL != "" {
-			go engine.ruleSetLoop(ctx)
+			engine.work.Start(ctx, engine.ruleSetLoop)
 			break
 		}
 	}
@@ -395,15 +398,15 @@ func (engine *Engine) NetworkChanged() {
 	}
 	engine.mu.Unlock()
 	if members := engine.autoMembers(); len(members) != 0 && engine.ctx != nil {
-		go engine.Probe(engine.ctx, members)
+		engine.work.Start(engine.ctx, func(ctx context.Context) { _ = engine.probeNodes(ctx, members, nil) })
 	}
 }
 
 // BeginDrain stops new dials and background work on a superseded engine.
 // Already established streams continue to use the old engine until closed.
 func (engine *Engine) BeginDrain() {
-	if engine.stop != nil {
-		engine.stop()
+	if engine.work != nil {
+		engine.work.Stop()
 	}
 }
 
@@ -430,6 +433,9 @@ func (engine *Engine) Close() error {
 		}
 		for _, conn := range packets {
 			_ = conn.Close()
+		}
+		if engine.work != nil {
+			engine.work.Wait()
 		}
 		if engine.instance != nil {
 			engine.closeErr = engine.instance.Close()

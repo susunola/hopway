@@ -56,6 +56,8 @@ func main() {
 	commitImport := flag.Bool("commit-import", false, "import from stdin and atomically update the configuration")
 	saveConfig := flag.Bool("save-config", false, "validate and atomically replace the configuration with JSON from stdin")
 	expectedRevision := flag.String("expected-revision", "", "original configuration SHA-256, or missing for a new file")
+	watchStdin := flag.Bool("watch-stdin", false, "internal: cancel a profile command when its parent closes stdin")
+	inputFile := flag.String("input-file", "", "internal: read profile input from a file while stdin tracks the parent")
 	tunHelper := flag.String("tun-helper", "", "internal: create the TUN device as root and hand it to the core over this socket")
 	tunIPv6 := flag.Bool("tun-ipv6", false, "internal: give the helper's TUN device an IPv6 address and route")
 	tunMTU := flag.Uint("tun-mtu", 0, "internal: MTU for the helper's TUN device")
@@ -91,14 +93,18 @@ func main() {
 		return
 	}
 	if *inspect || *probe || *refresh {
-		if err := inspectProfile(*path, *inspect, *probe, *refresh, probeNames, *refreshID); err != nil {
+		ctx, cancel := profileCommandContext(*watchStdin)
+		defer cancel()
+		if err := inspectProfile(ctx, *path, *inspect, *probe, *refresh, probeNames, *refreshID); err != nil {
 			log.SetFlags(0)
 			log.Fatal(err)
 		}
 		return
 	}
 	if *saveConfig || *commitImport {
-		err := writeProfile(*path, *expectedRevision, *commitImport)
+		ctx, cancel := profileCommandContext(*watchStdin && *inputFile != "")
+		defer cancel()
+		err := writeProfile(ctx, *path, *expectedRevision, *inputFile, *commitImport)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			if errors.Is(err, profile.ErrConfigurationChanged) {
@@ -109,7 +115,9 @@ func main() {
 		return
 	}
 	if *importInput || *previewImport {
-		result, err := runImport(*path, *previewImport)
+		ctx, cancel := profileCommandContext(*watchStdin && *inputFile != "")
+		defer cancel()
+		result, err := runImport(ctx, *path, *inputFile, *previewImport)
 		if err == nil {
 			if *previewImport {
 				if result.Notes == nil {
@@ -139,13 +147,22 @@ func main() {
 	}
 }
 
-func writeProfile(path, expected string, importing bool) error {
-	data, err := readProfileInput(os.Stdin)
+func profileCommandContext(watchStdin bool) (context.Context, context.CancelFunc) {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	if watchStdin {
+		go func() {
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			cancel()
+		}()
+	}
+	return ctx, cancel
+}
+
+func writeProfile(ctx context.Context, path, expected, inputFile string, importing bool) error {
+	data, err := readProfileInput(inputFile)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 	output := json.NewEncoder(os.Stdout)
 	if importing {
 		raw := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
@@ -162,7 +179,16 @@ func writeProfile(path, expected string, importing bool) error {
 	return output.Encode(map[string]string{"revision": revision})
 }
 
-func readProfileInput(input io.Reader) ([]byte, error) {
+func readProfileInput(path string) ([]byte, error) {
+	input := os.Stdin
+	if path != "" {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		input = file
+	}
 	data, err := io.ReadAll(io.LimitReader(input, importer.MaxSize+1))
 	if err == nil && len(data) > importer.MaxSize {
 		err = errors.New("输入超过 1 MB")
@@ -173,7 +199,7 @@ func readProfileInput(input io.Reader) ([]byte, error) {
 // runImport converts pasted input. A subscription URL becomes a subscription
 // entry (its nodes are cached and refreshed automatically); anything else is
 // merged into the configuration as before.
-func runImport(path string, preview bool) (importer.Result, error) {
+func runImport(ctx context.Context, path, inputFile string, preview bool) (importer.Result, error) {
 	base, err := loadConfig(path)
 	if errors.Is(err, os.ErrNotExist) {
 		base, err = engine.Default(), nil
@@ -181,7 +207,7 @@ func runImport(path string, preview bool) (importer.Result, error) {
 	if err != nil {
 		return importer.Result{}, err
 	}
-	data, err := readProfileInput(os.Stdin)
+	data, err := readProfileInput(inputFile)
 	if err != nil {
 		return importer.Result{}, err
 	}
@@ -193,11 +219,11 @@ func runImport(path string, preview bool) (importer.Result, error) {
 	}
 	if source != nil {
 		if preview {
-			return profile.PreviewSubscription(context.Background(), base, raw, dataDir(path), impl)
+			return profile.PreviewSubscription(ctx, base, raw, dataDir(path), impl)
 		}
-		return profile.Subscribe(context.Background(), base, raw, dataDir(path), impl)
+		return profile.Subscribe(ctx, base, raw, dataDir(path), impl)
 	}
-	result, err := importer.Import(context.Background(), strings.NewReader(raw), base, impl)
+	result, err := importer.Import(ctx, strings.NewReader(raw), base, impl)
 	result.Config.DataDir = ""
 	return result, err
 }
@@ -246,8 +272,19 @@ func run(path string, port int, check, managed bool) error {
 	// Return normally on signals so deferred cleanup can restore the network.
 	signals, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stopSignals()
-	supervisor, err := app.Open(path, dataDir(path), impl)
+	lifetime, cancel := context.WithCancel(signals)
+	defer cancel()
+	if managed {
+		go func() {
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			cancel()
+		}()
+	}
+	supervisor, err := app.OpenContext(lifetime, path, dataDir(path), impl)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
 		return err
 	}
 	defer supervisor.Close()
@@ -287,7 +324,7 @@ func run(path string, port int, check, managed bool) error {
 	if err := supervisor.Start(sysproxy.Target{HTTP: info.HTTP, SOCKS: info.SOCKS}, ports...); err != nil {
 		return err
 	}
-	if signals.Err() != nil {
+	if lifetime.Err() != nil {
 		return nil
 	}
 	serverErrors := make(chan error, 4)
@@ -303,18 +340,19 @@ func run(path string, port int, check, managed bool) error {
 		server := &http.Server{
 			Handler: controlHandler(supervisor, info.Token), ReadTimeout: 5 * time.Second,
 			WriteTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second, MaxHeaderBytes: 8 << 10,
+			BaseContext: func(net.Listener) context.Context { return supervisor.Context() },
 		}
+		defer func() {
+			supervisor.BeginShutdown()
+			_ = server.Close()
+		}()
 		go func() { serverErrors <- server.Serve(control) }()
 		if err := json.NewEncoder(os.Stdout).Encode(info); err != nil {
 			return err
 		}
-		go func() {
-			io.Copy(io.Discard, os.Stdin)
-			serverErrors <- nil
-		}()
 	}
 	select {
-	case <-signals.Done():
+	case <-lifetime.Done():
 		return nil
 	case err := <-serverErrors:
 		return err
@@ -400,12 +438,7 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	})
 	router.HandleFunc("PUT /policy", func(writer http.ResponseWriter, request *http.Request) {
 		var policy engine.Policy
-		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 64<<10))
-		decoder.DisallowUnknownFields()
-		err := decoder.Decode(&policy)
-		if err == nil && decoder.Decode(new(any)) != io.EOF {
-			err = errors.New("expected one policy object")
-		}
+		err := decodeControlJSON(writer, request, 64<<10, &policy)
 		if err == nil {
 			err = supervisor.SetPolicy(policy)
 		}
@@ -419,9 +452,7 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 		var body struct {
 			Selected string `json:"selected"`
 		}
-		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 4096))
-		decoder.DisallowUnknownFields()
-		err := decoder.Decode(&body)
+		err := decodeControlJSON(writer, request, 4096, &body)
 		if err == nil {
 			err = core().SelectInGroup(request.PathValue("name"), body.Selected)
 		}
@@ -434,46 +465,26 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	// Probing takes seconds, longer than the control API's write timeout, so
 	// it runs in the background and results appear in /status.
 	router.HandleFunc("POST /probe", func(writer http.ResponseWriter, request *http.Request) {
-		go core().Probe(context.Background(), nil)
+		current := core()
+		if err := supervisor.StartControlWork(supervisor.Context(), func(ctx context.Context) { current.Probe(ctx, nil) }); err != nil {
+			controlWorkError(writer, err)
+			return
+		}
 		writer.WriteHeader(http.StatusAccepted)
 	})
 	router.HandleFunc("POST /probe/stream", func(writer http.ResponseWriter, request *http.Request) {
 		var body struct {
 			Names []string `json:"names"`
 		}
-		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 1<<20))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&body); err != nil || len(body.Names) > 4096 {
+		if err := decodeControlJSON(writer, request, 1<<20, &body); err != nil || len(body.Names) > 4096 {
 			http.Error(writer, "invalid probe batch", http.StatusBadRequest)
-			return
-		}
-		controller := http.NewResponseController(writer)
-		writer.Header().Set("Content-Type", "application/x-ndjson")
-		encoder := json.NewEncoder(writer)
-		flush := func(write func() error) error {
-			if err := controller.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
-				return err
-			}
-			if write != nil {
-				if err := write(); err != nil {
-					return err
-				}
-			}
-			if err := controller.Flush(); err != nil {
-				return err
-			}
-			// Measurement may take longer than the control server's normal
-			// write deadline. Limit each actual write independently.
-			return controller.SetWriteDeadline(time.Time{})
-		}
-		if err := flush(nil); err != nil {
 			return
 		}
 		ctx, cancel := context.WithCancel(request.Context())
 		defer cancel()
 		results := make(chan engine.ProbeResult)
 		current := core()
-		go func() {
+		if err := supervisor.StartControlWork(ctx, func(ctx context.Context) {
 			defer close(results)
 			_ = current.ProbeResults(ctx, body.Names, func(result engine.ProbeResult) error {
 				select {
@@ -483,18 +494,26 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 					return ctx.Err()
 				}
 			})
-		}()
+		}); err != nil {
+			controlWorkError(writer, err)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/x-ndjson")
+		encoder := json.NewEncoder(writer)
+		if err := flushControlStream(writer, nil); err != nil {
+			return
+		}
 		heartbeat := time.NewTicker(4 * time.Second)
 		defer heartbeat.Stop()
 		for {
 			select {
 			case result, ok := <-results:
-				if !ok || flush(func() error { return encoder.Encode(result) }) != nil {
+				if !ok || flushControlStream(writer, func() error { return encoder.Encode(result) }) != nil {
 					return
 				}
 			case <-heartbeat.C:
 				// A whole batch may be waiting on shared-outage detection.
-				if flush(func() error { _, err := io.WriteString(writer, "\n"); return err }) != nil {
+				if flushControlStream(writer, func() error { _, err := io.WriteString(writer, "\n"); return err }) != nil {
 					return
 				}
 			case <-ctx.Done():
@@ -503,22 +522,20 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 		}
 	})
 	router.HandleFunc("POST /rulesets/refresh", func(writer http.ResponseWriter, request *http.Request) {
-		go core().RefreshRuleSets(context.Background(), true)
-		writer.WriteHeader(http.StatusAccepted)
+		current := core()
+		serveRefresh(supervisor, writer, request, func(ctx context.Context) engine.RefreshResult { return current.RefreshRuleSets(ctx, true) })
 	})
 	router.HandleFunc("POST /subscriptions/refresh", func(writer http.ResponseWriter, request *http.Request) {
-		go supervisor.RefreshSubscriptions(context.Background(), true)
-		writer.WriteHeader(http.StatusAccepted)
+		serveRefresh(supervisor, writer, request, func(ctx context.Context) engine.RefreshResult { return supervisor.RefreshSubscriptions(ctx, true) })
 	})
 	router.HandleFunc("POST /subscriptions/{id}/refresh", func(writer http.ResponseWriter, request *http.Request) {
 		id := request.PathValue("id")
-		go supervisor.RefreshSubscription(context.Background(), id)
-		writer.WriteHeader(http.StatusAccepted)
+		serveRefresh(supervisor, writer, request, func(ctx context.Context) engine.RefreshResult { return supervisor.RefreshSubscription(ctx, id) })
 	})
 	// Reload applies a saved configuration without restarting: open
 	// connections stay on the previous engine until they finish.
 	router.HandleFunc("POST /reload", func(writer http.ResponseWriter, request *http.Request) {
-		if err := supervisor.ReloadRevision(request.Header.Get("X-HopWay-Revision")); err != nil {
+		if err := supervisor.ReloadRevisionContext(request.Context(), request.Header.Get("X-HopWay-Revision")); err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, app.ErrPortsChanged) || errors.Is(err, profile.ErrConfigurationChanged) {
 				status = http.StatusConflict
@@ -532,15 +549,13 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	// control API's write timeout, so it is applied in the background.
 	router.HandleFunc("PUT /tun", func(writer http.ResponseWriter, request *http.Request) {
 		var body struct {
-			Enabled bool `json:"enabled"`
+			Enabled *bool `json:"enabled"`
 		}
-		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 1024))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&body); err != nil {
-			http.Error(writer, err.Error(), http.StatusBadRequest)
+		if err := decodeControlJSON(writer, request, 1024, &body); err != nil || body.Enabled == nil {
+			http.Error(writer, "expected one enabled flag", http.StatusBadRequest)
 			return
 		}
-		if err := supervisor.StartTUNChange(body.Enabled); err != nil {
+		if err := supervisor.StartTUNChange(*body.Enabled); err != nil {
 			http.Error(writer, err.Error(), http.StatusConflict)
 			return
 		}
@@ -548,15 +563,13 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	})
 	router.HandleFunc("PUT /tun-service", func(writer http.ResponseWriter, request *http.Request) {
 		var body struct {
-			Installed bool `json:"installed"`
+			Installed *bool `json:"installed"`
 		}
-		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 1024))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&body); err != nil {
-			http.Error(writer, err.Error(), http.StatusBadRequest)
+		if err := decodeControlJSON(writer, request, 1024, &body); err != nil || body.Installed == nil {
+			http.Error(writer, "expected one installed flag", http.StatusBadRequest)
 			return
 		}
-		if err := supervisor.StartTUNServiceChange(body.Installed); err != nil {
+		if err := supervisor.StartTUNServiceChange(*body.Installed); err != nil {
 			http.Error(writer, err.Error(), http.StatusConflict)
 			return
 		}
@@ -564,13 +577,14 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	})
 	router.HandleFunc("PUT /system-proxy", func(writer http.ResponseWriter, request *http.Request) {
 		var body struct {
-			Enabled bool `json:"enabled"`
+			Enabled *bool `json:"enabled"`
 		}
-		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 1024))
-		decoder.DisallowUnknownFields()
-		err := decoder.Decode(&body)
+		err := decodeControlJSON(writer, request, 1024, &body)
+		if err == nil && body.Enabled == nil {
+			err = errors.New("expected one enabled flag")
+		}
 		if err == nil {
-			err = supervisor.SetSystemProxy(body.Enabled)
+			err = supervisor.SetSystemProxy(*body.Enabled)
 		}
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
@@ -589,7 +603,82 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	})
 }
 
-func inspectProfile(path string, inspect, probe, refresh bool, names []string, refreshID string) error {
+func decodeControlJSON(writer http.ResponseWriter, request *http.Request, limit int64, value any) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, limit))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return errors.New("expected one JSON object within the size limit")
+	}
+	return request.Context().Err()
+}
+
+func controlWorkError(writer http.ResponseWriter, err error) {
+	if errors.Is(err, app.ErrControlBusy) {
+		http.Error(writer, err.Error(), http.StatusTooManyRequests)
+	} else {
+		http.Error(writer, "proxy is stopping", http.StatusServiceUnavailable)
+	}
+}
+
+// With wait=1 the client owns the request lifetime. Legacy 202 clients still
+// start background refreshes, which are joined when the proxy shuts down.
+func serveRefresh(supervisor *app.Supervisor, writer http.ResponseWriter, request *http.Request, run func(context.Context) engine.RefreshResult) {
+	wait := request.URL.Query().Get("wait") == "1"
+	ctx := supervisor.Context()
+	if wait {
+		ctx = request.Context()
+	}
+	result := make(chan engine.RefreshResult, 1)
+	if err := supervisor.StartControlWork(ctx, func(ctx context.Context) { result <- run(ctx) }); err != nil {
+		controlWorkError(writer, err)
+		return
+	}
+	if !wait {
+		writer.WriteHeader(http.StatusAccepted)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/x-ndjson")
+	if flushControlStream(writer, nil) != nil {
+		return
+	}
+	heartbeat := time.NewTicker(4 * time.Second)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case finished := <-result:
+			_ = flushControlStream(writer, func() error { return json.NewEncoder(writer).Encode(finished) })
+			return
+		case <-heartbeat.C:
+			if flushControlStream(writer, func() error { _, err := io.WriteString(writer, "\n"); return err }) != nil {
+				return
+			}
+		}
+	}
+}
+
+func flushControlStream(writer http.ResponseWriter, write func() error) error {
+	controller := http.NewResponseController(writer)
+	if err := controller.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	if write != nil {
+		if err := write(); err != nil {
+			return err
+		}
+	}
+	if err := controller.Flush(); err != nil {
+		return err
+	}
+	// Bound each actual write, not time spent waiting for a remote service.
+	return controller.SetWriteDeadline(time.Time{})
+}
+
+func inspectProfile(ctx context.Context, path string, inspect, probe, refresh bool, names []string, refreshID string) error {
 	impl := backend.Default()
 	validate := func(config engine.Config) error { return engine.Validate(config, impl) }
 	dir := dataDir(path)
@@ -599,10 +688,13 @@ func inspectProfile(path string, inspect, probe, refresh bool, names []string, r
 	}
 	output := json.NewEncoder(os.Stdout)
 	if refresh {
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 		defer cancel()
 		updated, failed := 0, 0
 		for _, sub := range loaded.User.Subscriptions {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if sub.Paused || (refreshID != "" && sub.Key() != refreshID) {
 				continue
 			}
@@ -612,6 +704,9 @@ func inspectProfile(path string, inspect, probe, refresh bool, names []string, r
 			} else {
 				updated++
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		return output.Encode(map[string]int{"updated": updated, "failed": failed})
 	}
@@ -666,8 +761,6 @@ func inspectProfile(path string, inspect, probe, refresh bool, names []string, r
 			return err
 		}
 		defer core.Close()
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer stop()
 		return core.ProbeResults(ctx, names, func(result engine.ProbeResult) error { return output.Encode(result) })
 	}
 	return nil

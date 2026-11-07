@@ -185,10 +185,15 @@ def occupied_http_port(binary, path):
             temporary.bind(("127.0.0.1", 0))
             socks = temporary.getsockname()
         path.write_text(json.dumps(dict(httpPort=blocker.getsockname()[1], socksPort=socks[1])))
-        result = subprocess.run([binary, "-managed", "-config", str(path)], input=b"",
-                                capture_output=True, timeout=4)
-        message = json.loads(result.stdout)
-        assert result.returncode != 0 and message.get("error", "").startswith("HTTP proxy:"), message
+        with subprocess.Popen([binary, "-managed", "-config", str(path)], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as child:
+            try:
+                assert child.wait(timeout=4) != 0
+                message = json.loads(child.stdout.read())
+                assert message.get("error", "").startswith("HTTP proxy:"), message
+            finally:
+                if child.poll() is None:
+                    child.kill()
         # The SOCKS listener was opened first and must be available again.
         with socket.socket() as released:
             released.bind(socks)

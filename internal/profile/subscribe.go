@@ -69,7 +69,7 @@ func FetchRefresh(ctx context.Context, sub engine.Subscription, dataDir string, 
 	previous, _ := LoadSnapshot(dataDir, sub)
 	snapshot, result, err := fetch(ctx, sub, impl, transport, previous)
 	if err != nil {
-		saveRetry(sub, dataDir, err)
+		saveRetry(ctx, sub, dataDir, err)
 		return nil, err
 	}
 	return &Refresh{Snapshot: snapshot, previous: previous, notModified: result.NotModified}, nil
@@ -92,7 +92,7 @@ func RefreshSnapshot(ctx context.Context, user engine.Config, sub engine.Subscri
 
 // CommitRefresh reports whether the engine-facing content actually changed.
 func CommitRefresh(ctx context.Context, user engine.Config, sub engine.Subscription, refresh *Refresh, path, dataDir string, impl backend.Backend) (bool, error) {
-	release, err := LockWrites(dataDir)
+	release, err := LockWritesContext(ctx, dataDir)
 	if err != nil {
 		return false, err
 	}
@@ -133,7 +133,7 @@ func CommitRefresh(ctx context.Context, user engine.Config, sub engine.Subscript
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if err := saveSnapshot(dataDir, sub, snapshot); err != nil {
+	if err := saveSnapshot(ctx, dataDir, sub, snapshot); err != nil {
 		return false, err
 	}
 	return changed, nil
@@ -221,12 +221,12 @@ func readRetryDeadline(path string) int64 {
 	return seconds
 }
 
-func saveRetry(sub engine.Subscription, dataDir string, err error) {
+func saveRetry(ctx context.Context, sub engine.Subscription, dataDir string, err error) {
 	var response *importer.DownloadError
 	if !errors.As(err, &response) || !response.RetryAfter.After(time.Now()) {
 		return
 	}
-	release, err := LockWrites(dataDir)
+	release, err := LockWritesContext(ctx, dataDir)
 	if err != nil {
 		return
 	}
@@ -235,7 +235,7 @@ func saveRetry(sub engine.Subscription, dataDir string, err error) {
 	until := response.RetryAfter.Add(time.Second - time.Nanosecond).Unix()
 	path := subscriptionCacheStem(dataDir, sub) + ".json.retry"
 	if until > readRetryDeadline(path) {
-		_ = engine.WriteAtomic(path, strconv.AppendInt(nil, until, 10))
+		_ = engine.WriteAtomicChecked(path, strconv.AppendInt(nil, until, 10), ctx.Err)
 	}
 }
 
@@ -247,7 +247,7 @@ func Subscribe(ctx context.Context, user engine.Config, rawURL, dataDir string, 
 	if err != nil {
 		return importer.Result{}, err
 	}
-	release, err := LockWrites(dataDir)
+	release, err := LockWritesContext(ctx, dataDir)
 	if err != nil {
 		return importer.Result{}, err
 	}
@@ -255,7 +255,7 @@ func Subscribe(ctx context.Context, user engine.Config, rawURL, dataDir string, 
 	if err := plan.prepare(dataDir, impl, &user); err != nil {
 		return importer.Result{}, err
 	}
-	if _, err := plan.stage(dataDir); err != nil {
+	if _, err := plan.stage(ctx, dataDir); err != nil {
 		return importer.Result{}, err
 	}
 	return plan.result, nil
@@ -293,10 +293,10 @@ func (plan *subscriptionImport) prepare(dataDir string, impl backend.Backend, ba
 	return err
 }
 
-func (plan *subscriptionImport) stage(dataDir string) (string, error) {
+func (plan *subscriptionImport) stage(ctx context.Context, dataDir string) (string, error) {
 	sub := &plan.result.Config.Subscriptions[plan.index]
 	sub.SnapshotKey = newSnapshotKey()
-	return SnapshotPath(dataDir, *sub), saveSnapshot(dataDir, *sub, plan.snapshot)
+	return SnapshotPath(dataDir, *sub), saveSnapshot(ctx, dataDir, *sub, plan.snapshot)
 }
 
 func fetchSubscription(ctx context.Context, user engine.Config, rawURL, dataDir string, impl backend.Backend, preview bool) (*subscriptionImport, error) {
@@ -337,7 +337,7 @@ func fetchSubscription(ctx context.Context, user engine.Config, rawURL, dataDir 
 	snapshot, result, err := Fetch(ctx, sub, impl, nil)
 	if err != nil {
 		if !preview {
-			saveRetry(sub, dataDir, err)
+			saveRetry(ctx, sub, dataDir, err)
 		}
 		return nil, err
 	}

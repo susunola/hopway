@@ -131,13 +131,16 @@ private struct Dashboard: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 if let message = core.tunProgress ?? core.message {
                     Divider()
-                    Label(message, systemImage: "info.circle")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 26)
-                        .padding(.vertical, 11)
+                    HStack(spacing: 12) {
+                        Label(message, systemImage: "info.circle")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if core.refreshing { Button("取消刷新", action: core.cancelRefresh) }
+                    }
+                    .padding(.horizontal, 26)
+                    .padding(.vertical, 11)
                 }
             }
             .background(Color(nsColor: .controlBackgroundColor))
@@ -392,7 +395,7 @@ private struct Dashboard: View {
                     Text("规则集").font(.headline)
                     Spacer()
                     Button("更新规则集") { core.trigger("rulesets/refresh", done: "正在更新规则集…") }
-                        .disabled(core.phase != .running || core.statusReadFailed)
+                        .disabled(core.phase != .running || core.statusReadFailed || core.refreshing)
                 }
                 ForEach(sets) { item in
                     sourceRow(item.name, detail: "\(item.entries) 条", updated: item.updated, error: item.error)

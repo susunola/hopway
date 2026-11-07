@@ -269,7 +269,7 @@ func (engine *Engine) healthLoop(ctx context.Context, interval time.Duration) {
 
 // Probe measures names (all nodes if empty) concurrently and records results.
 func (engine *Engine) Probe(ctx context.Context, names []string) {
-	_ = engine.probeNodes(ctx, names, nil)
+	_ = engine.ProbeResults(ctx, names, nil)
 }
 
 type ProbeResult struct {
@@ -286,6 +286,14 @@ type ProbeResult struct {
 }
 
 func (engine *Engine) ProbeResults(ctx context.Context, names []string, emit func(ProbeResult) error) error {
+	if engine.work == nil {
+		return net.ErrClosed
+	}
+	ctx, done, ok := engine.work.Enter(ctx)
+	if !ok {
+		return context.Canceled
+	}
+	defer done()
 	return engine.probeNodes(ctx, names, emit)
 }
 

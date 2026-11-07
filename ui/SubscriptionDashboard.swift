@@ -85,7 +85,7 @@ struct SubscriptionDashboard: View {
                     Button(action: core.refreshAllSubscriptions) {
                         Label("刷新全部", systemImage: "arrow.clockwise")
                     }
-                    .disabled(core.saving || !core.subscriptions.contains { !$0.isPaused })
+                    .disabled(core.saving || core.refreshing || !core.subscriptions.contains { !$0.isPaused })
                 }
                 if core.subscriptions.isEmpty {
                     Text("导入订阅后，这里会显示每份套餐的已用和剩余额度。")
@@ -172,7 +172,7 @@ struct SubscriptionDashboard: View {
                     Image(systemName: "arrow.clockwise").font(.caption)
                 }
                 .buttonStyle(.borderless)
-                .disabled(core.saving || subscription.isPaused)
+                .disabled(core.saving || core.refreshing || subscription.isPaused)
                 .help("刷新这份订阅")
                 .accessibilityLabel("刷新 \(subscription.name)")
                 Menu {

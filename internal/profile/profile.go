@@ -4,6 +4,7 @@
 package profile
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -78,15 +79,15 @@ func SaveSnapshot(dataDir string, sub engine.Subscription, snapshot *Snapshot) e
 		return err
 	}
 	defer release()
-	return saveSnapshot(dataDir, sub, snapshot)
+	return saveSnapshot(context.Background(), dataDir, sub, snapshot)
 }
 
-func saveSnapshot(dataDir string, sub engine.Subscription, snapshot *Snapshot) error {
+func saveSnapshot(ctx context.Context, dataDir string, sub engine.Subscription, snapshot *Snapshot) error {
 	data, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
 	}
-	return engine.WriteAtomic(SnapshotPath(dataDir, sub), data)
+	return engine.WriteAtomicChecked(SnapshotPath(dataDir, sub), data, ctx.Err)
 }
 
 // Merge layers subscription snapshots under the user's configuration:
@@ -364,14 +365,21 @@ func lastGoodPath(dataDir string) string { return filepath.Join(dataDir, "last-g
 // file is unreadable or invalid and a last good copy exists, that copy is
 // used instead and the problem is reported as a warning.
 func Load(path, dataDir string, validate func(engine.Config) error) (Loaded, error) {
+	return LoadContext(context.Background(), path, dataDir, validate)
+}
+
+func LoadContext(ctx context.Context, path, dataDir string, validate func(engine.Config) error) (Loaded, error) {
 	if path != "" && dataDir != "" {
-		release, err := LockWrites(dataDir)
+		release, err := LockWritesContext(ctx, dataDir)
 		if err != nil {
 			return Loaded{}, err
 		}
 		defer release()
 	}
 	loaded, err := load(path, dataDir, validate, previousDocument(path, dataDir))
+	if cancelErr := ctx.Err(); cancelErr != nil {
+		return Loaded{}, cancelErr
+	}
 	if err == nil {
 		if err := SaveLastGood(path, dataDir, &loaded); err != nil {
 			loaded.Warnings = append(loaded.Warnings, "无法保存回滚配置")

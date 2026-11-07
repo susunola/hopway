@@ -324,6 +324,7 @@ final class CoreModel: ObservableObject {
     @Published private(set) var verifying = false
     @Published private(set) var verification: String?
     @Published private(set) var saving = false
+    @Published private(set) var refreshing = false
     @Published private(set) var updatingPolicy = false
     @Published private var requestedTUNOperation: String?
     @Published private(set) var trafficHistory: TrafficHistory?
@@ -348,6 +349,7 @@ final class CoreModel: ObservableObject {
     private var probeFailures: [String: Int] = [:]
     private var lastRecoveryAttempt: Date?
     private var probeProcess: Process?
+    private var probeInput: FileHandle?
     private var probeTask: Task<Void, Never>?
     private var probeID: UUID?
     private var process: Process?
@@ -355,6 +357,9 @@ final class CoreModel: ObservableObject {
     private var polling: Task<Void, Never>?
     private var statusRequest: Task<Void, Never>?
     private var statusRequestedAgain = false
+    private var refreshTask: Task<Void, Never>?
+    private var refreshID: UUID?
+    private var terminationObserver: NSObjectProtocol?
     private var watchingConnections = false
     private var connectionCursor: UInt64?
     private var connectionRecords: [UInt64: ProxyStatus.Connection] = [:]
@@ -401,9 +406,24 @@ final class CoreModel: ObservableObject {
                 self?.retryUnavailableNodes()
             }
         }
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.shutDown() }
+        }
     }
 
-    deinit { quotaRefreshTask?.cancel() }
+    deinit {
+        quotaRefreshTask?.cancel()
+        if let terminationObserver { NotificationCenter.default.removeObserver(terminationObserver) }
+    }
+
+    private func shutDown() {
+        quotaRefreshTask?.cancel()
+        if process != nil { stop() }
+        else { cancelProbe(); cancelControlRefresh() }
+        session.invalidateAndCancel()
+    }
 
     var changed: Bool { draft != saved }
 
@@ -554,6 +574,7 @@ final class CoreModel: ObservableObject {
 
     private func stop() {
         cancelProbe()
+        cancelControlRefresh()
         phase = .stopping
         requestedTUNOperation = nil
         polling?.cancel()
@@ -569,6 +590,7 @@ final class CoreModel: ObservableObject {
         polling?.cancel()
         polling = nil
         cancelStatusRequest()
+        cancelControlRefresh()
         try? input?.close()
         input = nil
         process = nil
@@ -892,6 +914,10 @@ final class CoreModel: ObservableObject {
     /// Starts a background request (probe, refresh) and re-reads status shortly after.
     func trigger(_ path: String, done text: String) {
         guard let info = endpoint else { return }
+        if path.hasSuffix("/refresh") {
+            runControlRefresh(path, info: info, text: text)
+            return
+        }
         message = text
         Task {
             do {
@@ -903,6 +929,61 @@ final class CoreModel: ObservableObject {
                 if endpoint?.token == info.token { message = error.localizedDescription }
             }
         }
+    }
+
+    private struct RefreshReceipt: Decodable {
+        let succeeded: Int
+        let failed: Int
+        let canceled: Bool
+    }
+
+    private func runControlRefresh(_ path: String, info: Endpoint, text: String) {
+        guard refreshTask == nil, phase == .running,
+              var url = URLComponents(url: info.control.appendingPathComponent(path), resolvingAgainstBaseURL: false) else { return }
+        url.queryItems = [URLQueryItem(name: "wait", value: "1")]
+        guard let target = url.url else { return }
+        let id = UUID()
+        refreshID = id
+        refreshing = true
+        message = text
+        refreshTask = Task {
+            defer {
+                if refreshID == id { cancelControlRefresh() }
+            }
+            do {
+                var request = URLRequest(url: target)
+                request.httpMethod = "POST"
+                request.timeoutInterval = 20
+                request.setValue("Bearer " + info.token, forHTTPHeaderField: "Authorization")
+                let (bytes, response) = try await session.bytes(for: request)
+                guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+                    throw CoreError(message: "内核未接受刷新请求。")
+                }
+                for try await line in bytes.lines where !line.isEmpty {
+                    let receipt = try JSONDecoder().decode(RefreshReceipt.self, from: Data(line.utf8))
+                    guard refreshID == id, isRunning(info) else { return }
+                    await refresh(info)
+                    guard refreshID == id, isRunning(info) else { return }
+                    message = receipt.canceled ? "刷新已中止。" : "已刷新 \(receipt.succeeded) 项 · \(receipt.failed) 项失败"
+                    return
+                }
+                throw CoreError(message: "刷新连接在返回结果前断开。")
+            } catch {
+                if refreshID == id, isRunning(info) { message = "刷新失败 · " + error.localizedDescription }
+            }
+        }
+    }
+
+    func cancelRefresh() {
+        cancelControlRefresh()
+        message = "刷新已取消。"
+    }
+
+    private func cancelControlRefresh() {
+        refreshID = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+        if refreshing { refreshing = false }
     }
 
     /// "HK 01 · 83 ms" for a member of a group.
@@ -1045,11 +1126,13 @@ final class CoreModel: ObservableObject {
             guard let executable else { return }
             let child = Process()
             child.executableURL = executable
-            child.arguments = ["-probe", "-config", configURL.path]
+            child.arguments = ["-probe", "-watch-stdin", "-config", configURL.path]
             if !all {
                 for name in names { child.arguments?.append(contentsOf: ["-probe-node", name]) }
             }
             let output = Pipe()
+            let lifetime = Pipe()
+            child.standardInput = lifetime
             child.standardOutput = output
             child.standardError = FileHandle.nullDevice
             do {
@@ -1059,6 +1142,7 @@ final class CoreModel: ObservableObject {
                 return
             }
             probeProcess = child
+            probeInput = lifetime.fileHandleForWriting
             offline = (child, output.fileHandleForReading)
         }
         let id = UUID()
@@ -1130,6 +1214,8 @@ final class CoreModel: ObservableObject {
             }
             probeTask = nil
             probeProcess = nil
+            try? probeInput?.close()
+            probeInput = nil
             probeID = nil
             probePending = []
             probeTotal = 0
@@ -1140,6 +1226,8 @@ final class CoreModel: ObservableObject {
         probeID = nil
         probeTask?.cancel()
         probeTask = nil
+        try? probeInput?.close()
+        probeInput = nil
         if let child = probeProcess, child.isRunning { child.terminate() }
         probeProcess = nil
         probePending = []
@@ -1237,6 +1325,12 @@ final class CoreModel: ObservableObject {
         child.executableURL = executable
         child.arguments = [flag, "-config", destination.path]
         if let subscriptionID { child.arguments?.append(contentsOf: ["-subscription-id", subscriptionID]) }
+        let lifetime = flag == "-refresh-subscriptions" ? Pipe() : nil
+        if let lifetime {
+            child.arguments?.append("-watch-stdin")
+            child.standardInput = lifetime
+        }
+        defer { try? lifetime?.fileHandleForWriting.close() }
         child.standardOutput = output
         child.standardError = FileHandle.nullDevice
         try child.run()
@@ -1321,16 +1415,16 @@ final class CoreModel: ObservableObject {
         guard files.createFile(atPath: source.path, contents: Data(raw.utf8), attributes: [.posixPermissions: 0o600]) else {
             throw CoreError(message: "无法暂存配置内容。")
         }
-        let input = try FileHandle(forReadingFrom: source)
-        defer { try? input.close() }
         let output = Pipe()
+        let lifetime = Pipe()
+        defer { try? lifetime.fileHandleForWriting.close() }
         let child = Process()
         child.executableURL = executable
         // Always name the config path, even before the file exists: the core
         // keeps subscription caches next to it.
-        child.arguments = [mode, "-config", destination.path]
+        child.arguments = [mode, "-config", destination.path, "-input-file", source.path, "-watch-stdin"]
         if let expected { child.arguments?.append(contentsOf: ["-expected-revision", expected]) }
-        child.standardInput = input
+        child.standardInput = lifetime
         child.standardOutput = output
         child.standardError = output
         try child.run()

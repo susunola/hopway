@@ -161,7 +161,7 @@ struct NodeDashboard: View {
                 Button(action: core.refreshNodes) {
                     Label("刷新节点", systemImage: "arrow.clockwise")
                 }
-                .disabled(core.saving || core.probeTotal > 0 || (core.configuredNodes.isEmpty && core.subscriptions.isEmpty))
+                .disabled(core.saving || core.refreshing || core.probeTotal > 0 || (core.configuredNodes.isEmpty && core.subscriptions.isEmpty))
                 if core.probeTotal > 0 {
                     Button("停止测速", action: core.cancelProbe)
                 } else {

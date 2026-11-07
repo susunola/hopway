@@ -21,6 +21,7 @@ import (
 
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
+	"mac-proxy/internal/lifetime"
 	"mac-proxy/internal/netmon"
 	"mac-proxy/internal/profile"
 	"mac-proxy/internal/sysproxy"
@@ -77,7 +78,8 @@ type Supervisor struct {
 
 	ledger           *engine.TrafficLedger
 	budget           *engine.ResourceBudget
-	refreshMu        sync.Mutex
+	refreshGate      chan struct{}
+	controlSlots     chan struct{}
 	current          atomic.Pointer[engine.Engine]
 	mu               sync.Mutex // serializes reloads; guards the fields below
 	loaded           profile.Loaded
@@ -88,7 +90,7 @@ type Supervisor struct {
 	started          time.Time
 	generation       uint64
 	ctx              context.Context
-	cancel           context.CancelFunc
+	work             *lifetime.Group
 	networkCtx       context.Context
 	cancelNetwork    context.CancelFunc
 	closing          bool
@@ -118,16 +120,22 @@ var ErrTUNBusy = errors.New("正在处理另一项增强模式操作")
 var TUNSupported = runtime.GOOS == "darwin" || (runtime.GOOS == "linux" && os.Geteuid() == 0)
 
 var ErrProfileInUse = errors.New("HopWay 已在使用此配置")
+var ErrControlBusy = errors.New("已有过多控制请求正在执行")
 
 // Open claims the profile and recovers any abandoned network settings.
 // The caller must close it even if the listeners or Start fail afterward.
 func Open(path, dataDir string, impl backend.Backend) (*Supervisor, error) {
+	return OpenContext(context.Background(), path, dataDir, impl)
+}
+
+func OpenContext(ctx context.Context, path, dataDir string, impl backend.Backend) (*Supervisor, error) {
 	lease, err := acquireLease(dataDir)
 	if err != nil {
 		return nil, err
 	}
 	s := &Supervisor{path: path, dataDir: dataDir, impl: impl, lease: lease,
-		budget: engine.NewResourceBudget(), subErr: map[string]string{}, subMeta: map[string]SubscriptionStatus{}}
+		budget: engine.NewResourceBudget(), subErr: map[string]string{}, subMeta: map[string]SubscriptionStatus{},
+		refreshGate: make(chan struct{}, 1), controlSlots: make(chan struct{}, 8)}
 	s.proxy = sysproxy.New(dataDir, nil)
 	var recoveryErr error
 	if SystemProxySupported {
@@ -138,14 +146,15 @@ func Open(path, dataDir string, impl backend.Backend) (*Supervisor, error) {
 			s.proxyErr = "无法还原上次的系统代理设置：" + recoveryErr.Error()
 		}
 	}
-	loaded, err := profile.Load(path, dataDir, s.validate)
+	loaded, err := profile.LoadContext(ctx, path, dataDir, s.validate)
 	if err != nil {
 		if lease != nil {
 			lease.Close()
 		}
 		return nil, errors.Join(err, recoveryErr)
 	}
-	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.work = lifetime.New()
+	s.ctx = s.work.Context()
 	s.networkCtx, s.cancelNetwork = context.WithCancel(s.ctx)
 	s.loaded = loaded
 	s.loadAutoPolicy()
@@ -195,7 +204,7 @@ func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
 	}
 	s.current.Store(core)
 	if s.ledger != nil {
-		go s.flushTraffic()
+		s.work.Start(s.ctx, s.flushTraffic)
 	}
 	if s.loaded.Merged.SystemProxy {
 		s.SetSystemProxy(true)
@@ -203,8 +212,8 @@ func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
 	if t := s.loaded.Merged.TUN; t != nil && t.Enabled {
 		_ = s.StartTUNChange(true) // may wait for the user to enter a password
 	}
-	go s.subscriptionLoop()
-	go netmon.Watch(s.ctx, 3*time.Second, nil, s.networkChanged)
+	s.work.Start(s.ctx, s.subscriptionLoop)
+	s.work.Start(s.ctx, func(ctx context.Context) { netmon.Watch(ctx, 3*time.Second, nil, s.networkChanged) })
 	return nil
 }
 
@@ -243,7 +252,7 @@ func (s *Supervisor) startTUNOperation(operation string, apply func() error) err
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.tunOperation = ""
-		if err != nil && !s.closing {
+		if err != nil && !s.closing && s.ctx.Err() == nil {
 			s.tunErr = err.Error()
 		}
 	}()
@@ -441,14 +450,38 @@ func (s *Supervisor) isClosing() bool {
 	return s.closing
 }
 
+func (s *Supervisor) Context() context.Context { return s.ctx }
+
+func (s *Supervisor) StartControlWork(ctx context.Context, run func(context.Context)) error {
+	select {
+	case s.controlSlots <- struct{}{}:
+	default:
+		return ErrControlBusy
+	}
+	if !s.work.Start(ctx, func(ctx context.Context) {
+		defer func() { <-s.controlSlots }()
+		run(ctx)
+	}) {
+		<-s.controlSlots
+		return context.Canceled
+	}
+	return nil
+}
+
+func (s *Supervisor) BeginShutdown() {
+	s.work.Stop()
+	s.mu.Lock()
+	s.closing = true
+	core := s.current.Load()
+	s.mu.Unlock()
+	if core != nil {
+		core.BeginDrain()
+	}
+}
+
 func (s *Supervisor) Close() {
 	s.closeOnce.Do(func() {
-		s.mu.Lock()
-		s.closing = true
-		s.mu.Unlock()
-		if s.cancel != nil {
-			s.cancel()
-		}
+		s.BeginShutdown()
 		s.proxyMu.Lock()
 		if SystemProxySupported {
 			if err := s.proxy.Disable(); err != nil {
@@ -464,10 +497,11 @@ func (s *Supervisor) Close() {
 			core.Close()
 		}
 		s.retiring.Wait()
-		s.refreshMu.Lock()
-		s.refreshMu.Unlock()
+		s.work.Wait()
 		if s.ledger != nil {
-			_ = s.ledger.Close()
+			if err := s.ledger.Close(); err != nil {
+				log.Printf("finalize traffic history: %v", err)
+			}
 		}
 		if s.lease != nil {
 			_ = s.lease.Close()
@@ -484,17 +518,24 @@ func (s *Supervisor) Reload() error {
 }
 
 func (s *Supervisor) ReloadRevision(expected string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.reloadLocked(expected)
+	return s.ReloadRevisionContext(s.ctx, expected)
 }
 
-func (s *Supervisor) reloadLocked(expected string) error {
+func (s *Supervisor) ReloadRevisionContext(ctx context.Context, expected string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reloadLocked(ctx, expected)
+}
+
+func (s *Supervisor) reloadLocked(ctx context.Context, expected string) error {
 	if s.closing {
 		return net.ErrClosed
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.path != "" && s.dataDir != "" {
-		release, err := profile.LockWrites(s.dataDir)
+		release, err := profile.LockWritesContext(ctx, s.dataDir)
 		if err != nil {
 			return err
 		}
@@ -523,6 +564,10 @@ func (s *Supervisor) reloadLocked(expected string) error {
 			state.Policy = *s.autoPolicy
 		}
 		core.Restore(state)
+	}
+	if err := ctx.Err(); err != nil {
+		core.Close()
+		return err
 	}
 	if err := profile.SaveLastGood(s.path, s.dataDir, &loaded); err != nil {
 		loaded.Warnings = append(loaded.Warnings, "无法保存回滚配置")
@@ -606,13 +651,16 @@ func (s *Supervisor) Connections(generation uint64, cursor *uint64) ConnectionFe
 
 const subscriptionCheck = 10 * time.Minute
 
-func (s *Supervisor) subscriptionLoop() {
+func (s *Supervisor) subscriptionLoop(ctx context.Context) {
+	timer := time.NewTimer(subscriptionCheck)
+	defer timer.Stop()
 	for {
-		s.RefreshSubscriptions(s.ctx, false)
+		s.RefreshSubscriptions(ctx, false)
+		timer.Reset(subscriptionCheck)
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			return
-		case <-time.After(subscriptionCheck):
+		case <-timer.C:
 		}
 	}
 }
@@ -621,24 +669,30 @@ func (s *Supervisor) subscriptionLoop() {
 // reloads once if any changed. Downloads go through HopWay's own routing, so
 // they work where the subscription host is only reachable via a node. A
 // failed download keeps the previous snapshot.
-func (s *Supervisor) RefreshSubscriptions(ctx context.Context, force bool) {
-	s.refreshSubscriptions(ctx, force, "")
+func (s *Supervisor) RefreshSubscriptions(ctx context.Context, force bool) engine.RefreshResult {
+	return s.refreshSubscriptions(ctx, force, "")
 }
 
-func (s *Supervisor) RefreshSubscription(ctx context.Context, id string) {
-	s.refreshSubscriptions(ctx, true, id)
+func (s *Supervisor) RefreshSubscription(ctx context.Context, id string) engine.RefreshResult {
+	return s.refreshSubscriptions(ctx, true, id)
 }
 
-func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id string) {
-	s.refreshMu.Lock()
-	defer s.refreshMu.Unlock()
-	if ctx.Err() != nil {
-		return
+func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id string) (result engine.RefreshResult) {
+	ctx, done, ok := s.work.Enter(ctx)
+	if !ok {
+		return engine.RefreshResult{Canceled: true}
 	}
+	defer done()
+	select {
+	case <-ctx.Done():
+		return engine.RefreshResult{Canceled: true}
+	case s.refreshGate <- struct{}{}:
+	}
+	defer func() { <-s.refreshGate }()
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
-		return
+		return engine.RefreshResult{Canceled: true}
 	}
 	network := s.networkCtx
 	user := s.loaded.User
@@ -648,6 +702,7 @@ func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id st
 	defer cancel()
 	stop := context.AfterFunc(network, cancel)
 	defer stop()
+	defer func() { result.Canceled = ctx.Err() != nil || network.Err() != nil }()
 	var transport *http.Transport
 	var transportCore *engine.Engine
 	defer func() {
@@ -684,7 +739,7 @@ func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id st
 		s.mu.Lock()
 		// Check the generation and the subscription again under the same
 		// lock that serializes network events and profile changes.
-		if ctx.Err() != nil || s.closing || network != s.networkCtx {
+		if ctx.Err() != nil || network.Err() != nil || s.closing || network != s.networkCtx {
 			s.mu.Unlock()
 			break
 		}
@@ -704,23 +759,26 @@ func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id st
 		}
 		if err != nil {
 			s.subErr[current.Name] = err.Error()
+			result.Failed++
 		} else {
 			snapshot := refresh.Snapshot
 			delete(s.subErr, current.Name)
 			s.subMeta[current.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated, Checked: snapshot.CheckedAt(), Usage: snapshot.Usage}
+			result.Succeeded++
 		}
 		s.mu.Unlock()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.subReloadPending && !s.closing {
-		if err := s.reloadLocked(""); err != nil {
+	if s.subReloadPending && !s.closing && ctx.Err() == nil && network == s.networkCtx {
+		if err := s.reloadLocked(ctx, ""); err != nil {
 			warning := "订阅已更新，但新配置无法应用：" + err.Error()
 			if len(s.loaded.Warnings) == 0 || s.loaded.Warnings[len(s.loaded.Warnings)-1] != warning {
 				s.loaded.Warnings = append(s.loaded.Warnings, warning)
 			}
 		}
 	}
+	return result
 }
 
 func (s *Supervisor) autoPolicyPath() string {
@@ -774,12 +832,12 @@ func (s *Supervisor) SetPolicy(policy engine.Policy) error {
 	return core.SetPolicy(policy)
 }
 
-func (s *Supervisor) flushTraffic() {
+func (s *Supervisor) flushTraffic(ctx context.Context) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			_ = s.ledger.Flush()

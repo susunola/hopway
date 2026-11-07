@@ -6,8 +6,10 @@ package ruleset
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"regexp"
 	"strings"
@@ -239,9 +241,30 @@ func DetectFormat(location string) string {
 
 // Parse compiles data in the given format.
 func Parse(format, behavior string, data []byte) (*Content, error) {
+	return ParseContext(context.Background(), format, behavior, data)
+}
+
+type contextReader struct {
+	ctx context.Context
+	io.Reader
+}
+
+func (reader contextReader) Read(data []byte) (int, error) {
+	if err := reader.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return reader.Reader.Read(data)
+}
+
+// ParseContext compiles a candidate without publishing it. Cancellation
+// aborts reading and discards any partially compiled index.
+func ParseContext(ctx context.Context, format, behavior string, data []byte) (*Content, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	switch format {
 	case FormatSRS:
-		return parseSRS(data)
+		return parseSRS(ctx, contextReader{ctx, bytes.NewReader(data)})
 	case FormatYAML, FormatText, "":
 	default:
 		return nil, fmt.Errorf("unsupported rule-set format %q", format)
@@ -249,52 +272,72 @@ func Parse(format, behavior string, data []byte) (*Content, error) {
 	if behavior == "" {
 		behavior = BehaviorClassical
 	}
-	var lines []string
+	c := newContent()
+	reader := contextReader{ctx, bytes.NewReader(data)}
 	if format == FormatYAML || (format == "" && bytes.Contains(data, []byte("payload:"))) {
 		var doc struct {
 			Payload []string `yaml:"payload"`
 		}
-		if err := yaml.Unmarshal(data, &doc); err != nil {
+		if err := yaml.NewDecoder(reader).Decode(&doc); err != nil && err != io.EOF {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return nil, errors.New("rule-set YAML must contain a payload list")
 		}
-		lines = doc.Payload
+		for _, line := range doc.Payload {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if err := c.addLine(behavior, line); err != nil {
+				return nil, err
+			}
+		}
 	} else {
-		scanner := bufio.NewScanner(bytes.NewReader(data))
+		scanner := bufio.NewScanner(reader)
 		scanner.Buffer(make([]byte, 64<<10), 1<<20)
 		for scanner.Scan() {
-			lines = append(lines, scanner.Text())
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if err := c.addLine(behavior, scanner.Text()); err != nil {
+				return nil, err
+			}
 		}
 		if err := scanner.Err(); err != nil {
 			return nil, err
 		}
 	}
-	c := newContent()
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
-			continue
-		}
-		var err error
-		switch behavior {
-		case BehaviorDomain:
-			line = strings.Trim(line, `'"`)
-			if strings.HasPrefix(line, "+.") || strings.HasPrefix(line, ".") || strings.HasPrefix(line, "*.") {
-				c.addSuffix(line)
-			} else {
-				c.addDomain(line)
-			}
-		case BehaviorIPCIDR:
-			err = c.addCIDR(strings.Trim(line, `'"`))
-		case BehaviorClassical:
-			err = c.addClassical(line)
-		default:
-			return nil, fmt.Errorf("unsupported rule-set behavior %q", behavior)
-		}
-		if err != nil {
-			c.Skipped++
-		}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return c, nil
+}
+
+func (c *Content) addLine(behavior, line string) error {
+	line = strings.TrimSpace(line)
+	if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+		return nil
+	}
+	var err error
+	switch behavior {
+	case BehaviorDomain:
+		line = strings.Trim(line, `'"`)
+		if strings.HasPrefix(line, "+.") || strings.HasPrefix(line, ".") || strings.HasPrefix(line, "*.") {
+			c.addSuffix(line)
+		} else {
+			c.addDomain(line)
+		}
+	case BehaviorIPCIDR:
+		err = c.addCIDR(strings.Trim(line, `'"`))
+	case BehaviorClassical:
+		err = c.addClassical(line)
+	default:
+		return fmt.Errorf("unsupported rule-set behavior %q", behavior)
+	}
+	if err != nil {
+		c.Skipped++
+	}
+	return nil
 }
 
 func (c *Content) addClassical(line string) error {

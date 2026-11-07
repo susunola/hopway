@@ -197,3 +197,49 @@ func TestReimportPublishesNewSnapshotWithoutChangingPrevious(t *testing.T) {
 		t.Fatalf("late refresh accepted after the snapshot generation changed: %v", err)
 	}
 }
+
+func TestReimportRollsBackStagedSnapshotWhenConfigCannotBeReplaced(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission failure requires a non-root user")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "ss://aes-128-gcm:b@127.0.0.1:19002#New")
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	path, cache := filepath.Join(dir, "config.json"), filepath.Join(dir, "cache")
+	config := engine.Default()
+	sub := engine.Subscription{Name: "existing", URL: server.URL}
+	config.Subscriptions = []engine.Subscription{sub}
+	data, _ := json.Marshal(config)
+	ctx, impl := context.Background(), backend.Native{}
+	initial, err := CommitConfig(ctx, path, cache, MissingRevision, data, impl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSnapshot(cache, sub, &Snapshot{Nodes: []outbound.Node{node("Previous")}}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := SnapshotPath(cache, sub)
+	previous, err := os.ReadFile(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(dir, 0o700)
+	if _, err := CommitImport(ctx, path, cache, initial, server.URL, impl); !errors.Is(err, os.ErrPermission) ||
+		!strings.Contains(err.Error(), filepath.Join(dir, ".tmp-")) {
+		t.Fatalf("import should fail when replacing the profile: %v", err)
+	}
+	for filename, want := range map[string][]byte{path: data, snapshot: previous} {
+		if got, err := os.ReadFile(filename); err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("failed import rewrote %s: %v", filepath.Base(filename), err)
+		}
+	}
+	files, err := filepath.Glob(filepath.Join(cache, "subscriptions", "*.json"))
+	if err != nil || len(files) != 1 || files[0] != snapshot {
+		t.Fatalf("staged import file leaked: %v, %v", files, err)
+	}
+}

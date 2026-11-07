@@ -3,8 +3,9 @@
 package ruleset
 
 import (
-	"bytes"
+	"context"
 	"fmt"
+	"io"
 
 	"github.com/sagernet/sing-box/common/srs"
 	C "github.com/sagernet/sing-box/constant"
@@ -13,9 +14,12 @@ import (
 // parseSRS reads a sing-box binary rule set (GeoIP, GeoSite and friends).
 // Only default rules are used; logical rules and port/process fields are
 // counted as skipped.
-func parseSRS(data []byte) (*Content, error) {
-	compat, err := srs.Read(bytes.NewReader(data), false) // keep compact matchers
+func parseSRS(ctx context.Context, reader io.Reader) (*Content, error) {
+	compat, err := srs.Read(reader, false) // keep compact matchers
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("invalid .srs rule set: %w", err)
 	}
 	plain, err := compat.Upgrade()
@@ -24,6 +28,9 @@ func parseSRS(data []byte) (*Content, error) {
 	}
 	c := newContent()
 	for _, rule := range plain.Rules {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if rule.Type != C.RuleTypeDefault && rule.Type != "" {
 			c.Skipped++
 			continue
@@ -51,6 +58,9 @@ func parseSRS(data []byte) (*Content, error) {
 				c.Skipped++
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return c, nil
 }

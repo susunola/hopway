@@ -116,31 +116,51 @@ func (engine *Engine) cachePath(state *ruleSetState) string {
 }
 
 func (engine *Engine) ruleSetLoop(ctx context.Context) {
+	timer := time.NewTimer(ruleSetCheck)
+	defer timer.Stop()
 	for {
 		engine.RefreshRuleSets(ctx, false)
+		timer.Reset(ruleSetCheck)
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(ruleSetCheck):
+		case <-timer.C:
 		}
 	}
 }
 
+type RefreshResult struct {
+	Succeeded int  `json:"succeeded"`
+	Failed    int  `json:"failed"`
+	Canceled  bool `json:"canceled"`
+}
+
 // RefreshRuleSets downloads remote sets that are stale (or all, if force).
-func (engine *Engine) RefreshRuleSets(ctx context.Context, force bool) {
-	engine.ruleRefreshMu.Lock()
-	defer engine.ruleRefreshMu.Unlock()
+func (engine *Engine) RefreshRuleSets(ctx context.Context, force bool) (result RefreshResult) {
+	if engine.work == nil {
+		return RefreshResult{Canceled: true}
+	}
+	ctx, done, ok := engine.work.Enter(ctx)
+	if !ok {
+		return RefreshResult{Canceled: true}
+	}
+	defer done()
+	select {
+	case <-ctx.Done():
+		return RefreshResult{Canceled: true}
+	case engine.ruleRefresh <- struct{}{}:
+	}
+	defer func() { <-engine.ruleRefresh }()
 	engine.mu.Lock()
 	network, epoch := engine.networkCtx, engine.networkEpoch.Load()
 	engine.mu.Unlock()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	if network != nil {
-		stop := context.AfterFunc(network, cancel)
-		defer stop()
-	}
+	stop := context.AfterFunc(network, cancel)
+	defer stop()
+	defer func() { result.Canceled = ctx.Err() != nil || network.Err() != nil }()
 	for _, state := range engine.ruleSets {
-		if ctx.Err() != nil || (network != nil && network.Err() != nil) {
+		if ctx.Err() != nil || network.Err() != nil {
 			return
 		}
 		engine.mu.Lock()
@@ -152,16 +172,20 @@ func (engine *Engine) RefreshRuleSets(ctx context.Context, force bool) {
 		}
 		err := engine.downloadRuleSet(ctx, state, epoch)
 		engine.mu.Lock()
-		if ctx.Err() != nil || engine.closed || engine.networkEpoch.Load() != epoch {
+		if ctx.Err() != nil || network.Err() != nil || engine.closed || engine.networkEpoch.Load() != epoch {
 			engine.mu.Unlock()
 			return
 		}
 		state.err = ""
 		if err != nil {
 			state.err = err.Error() // keep serving the previous copy
+			result.Failed++
+		} else {
+			result.Succeeded++
 		}
 		engine.mu.Unlock()
 	}
+	return result
 }
 
 func (engine *Engine) downloadRuleSet(ctx context.Context, state *ruleSetState, epoch uint64) error {
@@ -194,7 +218,7 @@ func (engine *Engine) downloadRuleSet(ctx context.Context, state *ruleSetState, 
 	if len(data) > maxRuleSetSize {
 		return errors.New("rule set is larger than 32 MB")
 	}
-	content, err := ruleset.Parse(state.format, state.Behavior, data)
+	content, err := ruleset.ParseContext(ctx, state.format, state.Behavior, data)
 	if err != nil {
 		return err
 	}
@@ -217,7 +241,7 @@ func (engine *Engine) downloadRuleSet(ctx context.Context, state *ruleSetState, 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if engine.closed || engine.networkEpoch.Load() != epoch {
+	if engine.closed || engine.ctx.Err() != nil || engine.networkEpoch.Load() != epoch {
 		return context.Canceled
 	}
 	if staged != "" {

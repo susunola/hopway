@@ -77,7 +77,7 @@ func CommitConfig(ctx context.Context, path, dataDir, expected string, data []by
 	if len(data) > importer.MaxSize {
 		return "", errors.New("配置文件上限为 1 MB")
 	}
-	release, err := LockWrites(dataDir)
+	release, err := LockWritesContext(ctx, dataDir)
 	if err != nil {
 		return "", err
 	}
@@ -138,7 +138,7 @@ func CommitImport(ctx context.Context, path, dataDir, expected, raw string, impl
 	if err != nil {
 		return ImportReceipt{}, err
 	}
-	release, err := LockWrites(dataDir)
+	release, err := LockWritesContext(ctx, dataDir)
 	if err != nil {
 		return ImportReceipt{}, err
 	}
@@ -154,7 +154,7 @@ func CommitImport(ctx context.Context, path, dataDir, expected, raw string, impl
 		if err := plan.prepare(dataDir, impl, &base); err != nil {
 			return ImportReceipt{}, err
 		}
-		stagedPath, err = plan.stage(dataDir)
+		stagedPath, err = plan.stage(ctx, dataDir)
 		if err != nil {
 			return ImportReceipt{}, err
 		}

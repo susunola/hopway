@@ -2,8 +2,12 @@
 
 package ruleset
 
-import "errors"
+import (
+	"context"
+	"errors"
+	"io"
+)
 
-func parseSRS([]byte) (*Content, error) {
+func parseSRS(context.Context, io.Reader) (*Content, error) {
 	return nil, errors.New(".srs rule sets need the sing-box build")
 }
