@@ -39,8 +39,8 @@ type Guard func(netip.AddrPort) error
 
 type Instance interface {
 	Dialer(name string) (Dialer, bool)
-	// ResetConnections drops idle pooled and multiplexed sessions, which are
-	// dead after the network changes but would otherwise linger until timeout.
+	// ResetConnections retires the current pool generation. New traffic
+	// cannot reuse sessions created on the previous network.
 	ResetConnections()
 	Close() error
 }

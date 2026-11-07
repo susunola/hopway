@@ -371,6 +371,71 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 		go core().Probe(context.Background(), nil)
 		writer.WriteHeader(http.StatusAccepted)
 	})
+	router.HandleFunc("POST /probe/stream", func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			Names []string `json:"names"`
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 1<<20))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil || len(body.Names) > 4096 {
+			http.Error(writer, "invalid probe batch", http.StatusBadRequest)
+			return
+		}
+		controller := http.NewResponseController(writer)
+		writer.Header().Set("Content-Type", "application/x-ndjson")
+		encoder := json.NewEncoder(writer)
+		flush := func(write func() error) error {
+			if err := controller.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				return err
+			}
+			if write != nil {
+				if err := write(); err != nil {
+					return err
+				}
+			}
+			if err := controller.Flush(); err != nil {
+				return err
+			}
+			// Measurement may take longer than the control server's normal
+			// write deadline. Limit each actual write independently.
+			return controller.SetWriteDeadline(time.Time{})
+		}
+		if err := flush(nil); err != nil {
+			return
+		}
+		ctx, cancel := context.WithCancel(request.Context())
+		defer cancel()
+		results := make(chan engine.ProbeResult)
+		current := core()
+		go func() {
+			defer close(results)
+			_ = current.ProbeResults(ctx, body.Names, func(result engine.ProbeResult) error {
+				select {
+				case results <- result:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+		}()
+		heartbeat := time.NewTicker(4 * time.Second)
+		defer heartbeat.Stop()
+		for {
+			select {
+			case result, ok := <-results:
+				if !ok || flush(func() error { return encoder.Encode(result) }) != nil {
+					return
+				}
+			case <-heartbeat.C:
+				// A whole batch may be waiting on shared-outage detection.
+				if flush(func() error { _, err := io.WriteString(writer, "\n"); return err }) != nil {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
 	router.HandleFunc("POST /rulesets/refresh", func(writer http.ResponseWriter, request *http.Request) {
 		go core().RefreshRuleSets(context.Background(), true)
 		writer.WriteHeader(http.StatusAccepted)

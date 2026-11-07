@@ -275,6 +275,8 @@ final class CoreModel: ObservableObject {
     private var probeFailures: [String: Int] = [:]
     private var lastRecoveryAttempt: Date?
     private var probeProcess: Process?
+    private var probeTask: Task<Void, Never>?
+    private var probeID: UUID?
     private var process: Process?
     private var input: FileHandle?
     private var polling: Task<Void, Never>?
@@ -365,6 +367,7 @@ final class CoreModel: ObservableObject {
             if self.executable == nil { message = "App 内缺少代理内核。" }
             return
         }
+        cancelProbe()
         message = nil
         phase = .starting
         let launchedConfiguration = saved
@@ -430,6 +433,7 @@ final class CoreModel: ObservableObject {
     }
 
     private func stop() {
+        cancelProbe()
         phase = .stopping
         requestedTUNOperation = nil
         polling?.cancel()
@@ -812,7 +816,7 @@ final class CoreModel: ObservableObject {
 
     private func retryUnavailableNodes() {
         let now = Date()
-        guard probeProcess == nil, !saving,
+        guard probeTask == nil, !saving,
               lastRecoveryAttempt.map({ now.timeIntervalSince($0) >= 120 }) ?? true else { return }
         let names = configuredNodes.map(\.name).filter { (probeFailures[$0] ?? 0) > 0 }
         guard !names.isEmpty else { return }
@@ -826,73 +830,109 @@ final class CoreModel: ObservableObject {
     }
 
     private func runProbe(_ names: [String], all: Bool, showSummary: Bool) {
-        guard probeProcess == nil, !saving, !names.isEmpty, let executable else { return }
-        let child = Process()
-        child.executableURL = executable
-        child.arguments = ["-probe", "-config", configURL.path]
-        if !all {
-            for name in names { child.arguments?.append(contentsOf: ["-probe-node", name]) }
+        guard probeTask == nil, !saving, !names.isEmpty else { return }
+        let live = phase == .running ? endpoint : nil
+        guard phase == .stopped || live != nil else { return }
+        var offline: (Process, FileHandle)?
+        if live == nil {
+            guard let executable else { return }
+            let child = Process()
+            child.executableURL = executable
+            child.arguments = ["-probe", "-config", configURL.path]
+            if !all {
+                for name in names { child.arguments?.append(contentsOf: ["-probe-node", name]) }
+            }
+            let output = Pipe()
+            child.standardOutput = output
+            child.standardError = FileHandle.nullDevice
+            do {
+                try child.run()
+            } catch {
+                message = "无法启动测速 · " + error.localizedDescription
+                return
+            }
+            probeProcess = child
+            offline = (child, output.fileHandleForReading)
         }
-        let output = Pipe()
-        child.standardOutput = output
-        child.standardError = FileHandle.nullDevice
-        do {
-            try child.run()
-        } catch {
-            message = "无法启动测速 · " + error.localizedDescription
-            return
-        }
-        probeProcess = child
+        let id = UUID()
+        probeID = id
         probePending = Set(names)
-        probeTotal = names.count
+        probeTotal = probePending.count
         if showSummary { message = nil }
-        Task {
+        probeTask = Task {
             var available = 0
             var inconclusive = 0
             var interrupted = false
+            @MainActor func receive(_ sample: NodeProbeResult) {
+                var result = sample
+                guard probePending.remove(result.name) != nil else { return }
+                if !result.isAvailable, let previous = probeResults[result.name] {
+                    result.lastKnownLatency = previous.isAvailable ? previous.milliseconds : previous.lastKnownLatency
+                }
+                probeResults[result.name] = result
+                if result.isAvailable {
+                    available += 1
+                    probeFailures.removeValue(forKey: result.name)
+                    hiddenNodes.remove(result.name)
+                } else if result.isFailure {
+                    let failures = min(2, (probeFailures[result.name] ?? 0) + 1)
+                    probeFailures[result.name] = failures
+                    if failures == 2 { hiddenNodes.insert(result.name) }
+                } else {
+                    inconclusive += 1
+                }
+            }
             do {
-                for try await var result in Self.probeOutput(child, reader: output.fileHandleForReading) {
-                    guard probeProcess === child else { return }
-                    guard probePending.remove(result.name) != nil else { continue }
-                    if !result.isAvailable, let previous = probeResults[result.name] {
-                        result.lastKnownLatency = previous.isAvailable ? previous.milliseconds : previous.lastKnownLatency
+                if let live {
+                    var request = URLRequest(url: live.control.appendingPathComponent("probe/stream"))
+                    request.httpMethod = "POST"
+                    request.timeoutInterval = 20
+                    request.setValue("Bearer " + live.token, forHTTPHeaderField: "Authorization")
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    request.httpBody = try JSONEncoder().encode(["names": names])
+                    let (bytes, response) = try await session.bytes(for: request)
+                    guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+                        throw CoreError(message: "运行中的内核未接受测速请求。")
                     }
-                    probeResults[result.name] = result
-                    if result.isAvailable {
-                        available += 1
-                        probeFailures.removeValue(forKey: result.name)
-                        hiddenNodes.remove(result.name)
-                    } else if result.isFailure {
-                        let failures = min(2, (probeFailures[result.name] ?? 0) + 1)
-                        probeFailures[result.name] = failures
-                        if failures == 2 { hiddenNodes.insert(result.name) }
-                    } else {
-                        inconclusive += 1
+                    let decoder = JSONDecoder()
+                    for try await line in bytes.lines {
+                        guard probeID == id, endpoint?.token == live.token else { break }
+                        if line.isEmpty { continue }
+                        receive(try decoder.decode(NodeProbeResult.self, from: Data(line.utf8)))
+                    }
+                } else if let (child, reader) = offline {
+                    for try await result in Self.probeOutput(child, reader: reader) {
+                        guard probeID == id else { break }
+                        receive(result)
                     }
                 }
             } catch {
                 interrupted = true
             }
-            if probeProcess === child {
-                let remaining = probePending.count
-                let completed = probeTotal - remaining
-                if showSummary {
-                    if interrupted || remaining > 0 {
-                        message = "测速未完整结束 · 已完成 \(completed)/\(probeTotal)，剩余 \(remaining) 个。"
-                    } else {
-                        let failed = completed - available - inconclusive
-                        let uncertain = inconclusive == 0 ? "" : "，\(inconclusive) 个待复测"
-                        message = "测速完成 · \(completed) 个节点，\(available) 个可用，\(failed) 个失败或超时\(uncertain)。"
-                    }
+            guard probeID == id else { return }
+            let remaining = probePending.count
+            let completed = probeTotal - remaining
+            if showSummary {
+                if interrupted || remaining > 0 {
+                    message = "测速未完整结束 · 已完成 \(completed)/\(probeTotal)，剩余 \(remaining) 个。"
+                } else {
+                    let failed = completed - available - inconclusive
+                    let uncertain = inconclusive == 0 ? "" : "，\(inconclusive) 个待复测"
+                    message = "测速完成 · \(completed) 个节点，\(available) 个可用，\(failed) 个失败或超时\(uncertain)。"
                 }
-                probeProcess = nil
-                probePending = []
-                probeTotal = 0
             }
+            probeTask = nil
+            probeProcess = nil
+            probeID = nil
+            probePending = []
+            probeTotal = 0
         }
     }
 
     func cancelProbe() {
+        probeID = nil
+        probeTask?.cancel()
+        probeTask = nil
         if let child = probeProcess, child.isRunning { child.terminate() }
         probeProcess = nil
         probePending = []

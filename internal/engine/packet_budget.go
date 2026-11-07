@@ -13,9 +13,10 @@ const (
 	packetExitSendLimit = 16
 )
 
-// PacketBudget owns UDP limits for a running proxy, including engines that
+// ResourceBudget owns connection-opening and UDP limits, including engines that
 // are still draining connections after a configuration reload.
-type PacketBudget struct {
+type ResourceBudget struct {
+	dials       endpointBudget
 	mu          sync.Mutex
 	started     time.Time
 	sessions    map[*trackedPacket]struct{}
@@ -31,18 +32,19 @@ type packetOutbound struct {
 	sending chan struct{}
 }
 
-func NewPacketBudget() *PacketBudget {
-	return newPacketBudget(packetSessionLimit, packetOpenLimit)
+func NewResourceBudget() *ResourceBudget {
+	return newResourceBudget(packetSessionLimit, packetOpenLimit)
 }
 
-func newPacketBudget(sessions, opening int) *PacketBudget {
-	return &PacketBudget{
+func newResourceBudget(sessions, opening int) *ResourceBudget {
+	return &ResourceBudget{
+		dials:   endpointBudget{entries: make(map[string]*endpointSlots), probeOpening: make(chan struct{}, probeParallel)},
 		started: time.Now(), maxSessions: sessions, opening: make(chan struct{}, opening),
 		sessions: make(map[*trackedPacket]struct{}), outbounds: make(map[string]*packetOutbound),
 	}
 }
 
-func (b *PacketBudget) retainOutbound(key string) *packetOutbound {
+func (b *ResourceBudget) retainOutbound(key string) *packetOutbound {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	o := b.outbounds[key]
@@ -56,13 +58,13 @@ func (b *PacketBudget) retainOutbound(key string) *packetOutbound {
 	return o
 }
 
-func (b *PacketBudget) releaseOutbound(o *packetOutbound) {
+func (b *ResourceBudget) releaseOutbound(o *packetOutbound) {
 	if o.refs.Add(-1) == 0 {
 		b.pruneOutbound(o)
 	}
 }
 
-func (b *PacketBudget) pruneOutbound(o *packetOutbound) {
+func (b *ResourceBudget) pruneOutbound(o *packetOutbound) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if o.refs.Load() == 0 && len(o.sending) == 0 && b.outbounds[o.key] == o {
@@ -72,7 +74,7 @@ func (b *PacketBudget) pruneOutbound(o *packetOutbound) {
 
 // admit runs only after a socket opens, so failed attempts cannot evict a
 // usable session. The caller closes the evicted socket outside both locks.
-func (b *PacketBudget) admit(c *trackedPacket) (oldest *trackedPacket) {
+func (b *ResourceBudget) admit(c *trackedPacket) (oldest *trackedPacket) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if len(b.sessions) == b.maxSessions {
@@ -91,7 +93,7 @@ func (b *PacketBudget) admit(c *trackedPacket) (oldest *trackedPacket) {
 	return oldest
 }
 
-func (b *PacketBudget) remove(c *trackedPacket) {
+func (b *ResourceBudget) remove(c *trackedPacket) {
 	b.mu.Lock()
 	delete(b.sessions, c)
 	b.mu.Unlock()

@@ -115,7 +115,7 @@ func readTunnelReply(t *testing.T, reader *bufio.Reader, inbound string) {
 }
 
 func TestClientCancellationReleasesStalledTLSHandshakes(t *testing.T) {
-	const count = 18
+	const count = endpointDialLimit
 	for _, impl := range []backend.Backend{backend.Native{}, backend.Default()} {
 		t.Run(impl.Name(), func(t *testing.T) {
 			origin := tcpFixture(t)
@@ -150,6 +150,9 @@ func TestClientCancellationReleasesStalledTLSHandshakes(t *testing.T) {
 			}
 			defer core.Close()
 			socks, http := tcpIngress(t, core.Dial)
+			runtime.GC()
+			var heapBefore, heapHeld, heapAfter runtime.MemStats
+			runtime.ReadMemStats(&heapBefore)
 			baseGoroutines := runtime.NumGoroutine()
 			baseFDs := countOpenDescriptors(t)
 			clients := make([]*net.TCPConn, 0, count)
@@ -191,6 +194,7 @@ func TestClientCancellationReleasesStalledTLSHandshakes(t *testing.T) {
 			}
 			atPeak := runtime.NumGoroutine()
 			fdsAtPeak := countOpenDescriptors(t)
+			runtime.ReadMemStats(&heapHeld)
 			canceled := time.Now()
 			for _, client := range clients {
 				_ = client.Close()
@@ -207,10 +211,10 @@ func TestClientCancellationReleasesStalledTLSHandshakes(t *testing.T) {
 					t.Fatal("canceled handshake did not release its upstream socket")
 				}
 			}
-			for len(core.dialSlots["stall"]) != 0 || runtime.NumGoroutine() > baseGoroutines+3 {
+			for len(core.dialSlots["stall"].opening) != 0 || runtime.NumGoroutine() > baseGoroutines+3 {
 				select {
 				case <-drain.C:
-					t.Fatalf("canceled clients left work behind: slots=%d goroutines=%d/%d", len(core.dialSlots["stall"]), runtime.NumGoroutine(), baseGoroutines)
+					t.Fatalf("canceled clients left work behind: slots=%d goroutines=%d/%d", len(core.dialSlots["stall"].opening), runtime.NumGoroutine(), baseGoroutines)
 				case <-time.After(time.Millisecond):
 				}
 			}
@@ -219,8 +223,11 @@ func TestClientCancellationReleasesStalledTLSHandshakes(t *testing.T) {
 			if baseFDs >= 0 && (fdsAtPeak < baseFDs+count || fdsAfter > baseFDs+3) {
 				t.Fatalf("FD count did not rise and return after cancellation: %d → %d → %d", baseFDs, fdsAtPeak, fdsAfter)
 			}
-			t.Logf("%d handshakes closed in %s, goroutines %d → %d → %d, FDs %d → %d → %d",
-				count, elapsed, baseGoroutines, atPeak, runtime.NumGoroutine(), baseFDs, fdsAtPeak, fdsAfter)
+			runtime.GC()
+			runtime.ReadMemStats(&heapAfter)
+			t.Logf("%d handshakes closed in %s, goroutines %d → %d → %d, FDs %d → %d → %d, sampled HeapAlloc %d → %d → %d bytes",
+				count, elapsed, baseGoroutines, atPeak, runtime.NumGoroutine(), baseFDs, fdsAtPeak, fdsAfter,
+				heapBefore.HeapAlloc, heapHeld.HeapAlloc, heapAfter.HeapAlloc)
 			if core.Status().Nodes[2].Alive != nil || core.Active() != 0 {
 				t.Fatal("client cancellations changed node health or left active connections")
 			}

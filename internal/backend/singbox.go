@@ -57,12 +57,27 @@ func (SingBox) Check(node outbound.Node) error {
 }
 
 type singInstance struct {
+	mu        sync.Mutex
+	active    atomic.Pointer[singGeneration]
+	outbounds []map[string]any
+	nodes     map[string]bool // whether the outbound needs chunked writes
+	guard     Guard
+	closed    bool
+	retryAt   time.Time
+	retryErr  error
+}
+
+type singGeneration struct {
 	box     *box.Box
-	dialers map[string]Dialer
+	dialers map[string]*singDialer
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 func (SingBox) Open(nodes []outbound.Node, guard Guard) (Instance, error) {
-	outbounds := make([]map[string]any, 0, len(nodes))
+	instance := &singInstance{
+		outbounds: make([]map[string]any, 0, len(nodes)), nodes: make(map[string]bool, len(nodes)), guard: guard,
+	}
 	for _, node := range nodes {
 		if err := node.Validate(); err != nil {
 			return nil, nodeError(node.Name, err)
@@ -71,28 +86,114 @@ func (SingBox) Open(nodes []outbound.Node, guard Guard) (Instance, error) {
 		if err != nil {
 			return nil, nodeError(node.Name, err)
 		}
-		outbounds = append(outbounds, converted...)
+		instance.outbounds = append(instance.outbounds, converted...)
+		instance.nodes[node.Name] = node.Type == "anytls"
 	}
-	instance, err := build(outbounds, guard)
+	if _, err := instance.generation(); err != nil {
+		return nil, err
+	}
+	return instance, nil
+}
+
+func (instance *singInstance) generation() (*singGeneration, error) {
+	if active := instance.active.Load(); active != nil {
+		return active, nil
+	}
+	instance.mu.Lock()
+	defer instance.mu.Unlock()
+	if instance.closed {
+		return nil, net.ErrClosed
+	}
+	if active := instance.active.Load(); active != nil {
+		return active, nil
+	}
+	if time.Now().Before(instance.retryAt) {
+		return nil, instance.retryErr
+	}
+	active, err := instance.openGeneration()
+	if err != nil {
+		instance.retryAt, instance.retryErr = time.Now().Add(time.Second), err
+		return nil, err
+	}
+	instance.retryAt, instance.retryErr = time.Time{}, nil
+	instance.active.Store(active)
+	return active, nil
+}
+
+func (instance *singInstance) openGeneration() (*singGeneration, error) {
+	box, err := build(instance.outbounds, instance.guard)
 	if err != nil {
 		return nil, err
 	}
-	if err := instance.Start(); err != nil {
-		instance.Close()
+	if err := box.Start(); err != nil {
+		box.Close()
 		return nil, err
 	}
-	result := &singInstance{box: instance, dialers: make(map[string]Dialer)}
-	for _, node := range nodes {
-		chunked := node.Type == "anytls"
-		out, ok := instance.Outbound().Outbound(node.Name)
+	dialers := make(map[string]*singDialer, len(instance.nodes))
+	for name, chunked := range instance.nodes {
+		out, ok := box.Outbound().Outbound(name)
 		if !ok {
-			instance.Close()
-			return nil, nodeError(node.Name, errors.New("outbound was not created"))
+			box.Close()
+			return nil, nodeError(name, errors.New("outbound was not created"))
 		}
-		packet, _ := instance.Outbound().Outbound(shadowTLSPacketTag(node.Name))
-		result.dialers[node.Name] = &singDialer{out: out, packet: packet, chunked: chunked}
+		packet, _ := box.Outbound().Outbound(shadowTLSPacketTag(name))
+		dialers[name] = &singDialer{out: out, packet: packet, chunked: chunked}
 	}
-	return result, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	return &singGeneration{box: box, dialers: dialers, ctx: ctx, cancel: cancel}, nil
+}
+
+type singNodeDialer struct {
+	instance *singInstance
+	name     string
+}
+
+func (g *singGeneration) dialContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(g.ctx, cancel)
+	if g.ctx.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+func (d singNodeDialer) DialContext(ctx context.Context, target string) (net.Conn, error) {
+	g, err := d.instance.generation()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := g.dialContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	conn, err := g.dialers[d.name].DialContext(ctx, target)
+	if err == nil && g.ctx.Err() != nil {
+		conn.Close()
+		return nil, g.ctx.Err()
+	}
+	return conn, err
+}
+
+func (d singNodeDialer) ListenPacket(ctx context.Context, target string) (net.PacketConn, error) {
+	g, err := d.instance.generation()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := g.dialContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	conn, err := g.dialers[d.name].ListenPacket(ctx, target)
+	if err == nil && g.ctx.Err() != nil {
+		conn.Close()
+		return nil, g.ctx.Err()
+	}
+	return conn, err
 }
 
 type singDialer struct {
@@ -141,13 +242,33 @@ func (d *singDialer) ListenPacket(ctx context.Context, target string) (net.Packe
 }
 
 func (instance *singInstance) Dialer(name string) (Dialer, bool) {
-	dialer, ok := instance.dialers[name]
-	return dialer, ok
+	if _, exists := instance.nodes[name]; !exists {
+		return nil, false
+	}
+	return singNodeDialer{instance: instance, name: name}, true
 }
 
-func (instance *singInstance) Close() error { return instance.box.Close() }
+func (instance *singInstance) Close() error {
+	instance.mu.Lock()
+	defer instance.mu.Unlock()
+	instance.closed = true
+	return instance.discardGeneration()
+}
 
-func (instance *singInstance) ResetConnections() { instance.box.CloseIdleConnections() }
+func (instance *singInstance) ResetConnections() {
+	instance.mu.Lock()
+	defer instance.mu.Unlock()
+	instance.retryAt, instance.retryErr = time.Time{}, nil
+	_ = instance.discardGeneration()
+}
+
+func (instance *singInstance) discardGeneration() error {
+	if active := instance.active.Swap(nil); active != nil {
+		active.cancel()
+		return active.box.Close()
+	}
+	return nil
+}
 
 func build(outbounds []map[string]any, guard Guard) (*box.Box, error) {
 	registry := include.OutboundRegistry()

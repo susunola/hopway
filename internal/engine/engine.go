@@ -164,7 +164,7 @@ type Engine struct {
 	backend       string
 	instance      backend.Instance
 	dialers       map[string]backend.Dialer
-	dialSlots     map[string]chan struct{}
+	dialSlots     map[string]*endpointSlots
 	types         map[string]string
 	servers       map[string]string
 	order         []string
@@ -176,7 +176,7 @@ type Engine struct {
 	sequence      uint64
 	live          map[uint64]*tracked
 	livePackets   map[uint64]*trackedPacket
-	packetBudget  *PacketBudget
+	budget        *ResourceBudget
 	recent        []Record
 	ports         map[uint16]bool
 	ctx           context.Context
@@ -205,11 +205,11 @@ const (
 // New builds an engine; localPorts are HopWay's own listeners, which no
 // connection may be sent back to.
 func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error) {
-	return NewWithPacketBudget(config, impl, nil, localPorts...)
+	return NewWithResourceBudget(config, impl, nil, localPorts...)
 }
 
-// NewWithPacketBudget shares UDP resources with the previous engine on reload.
-func NewWithPacketBudget(config Config, impl backend.Backend, budget *PacketBudget, localPorts ...int) (*Engine, error) {
+// NewWithResourceBudget shares opening and UDP limits across engine reloads.
+func NewWithResourceBudget(config Config, impl backend.Backend, budget *ResourceBudget, localPorts ...int) (*Engine, error) {
 	if config.SOCKSPort < 0 || config.SOCKSPort > 65535 || config.HTTPPort < 0 || config.HTTPPort > 65535 ||
 		(config.SOCKSPort != 0 && config.SOCKSPort == config.HTTPPort) {
 		return nil, errors.New("proxy ports must be distinct or 0 for automatic assignment")
@@ -222,7 +222,7 @@ func NewWithPacketBudget(config Config, impl backend.Backend, budget *PacketBudg
 	engine := &Engine{subscriptions: config.Subscriptions, autoWake: make(chan struct{}, 1), dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL, probeFallback: defaultProbeFallback,
-		dialSlots: make(map[string]chan struct{}), lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
+		dialSlots: make(map[string]*endpointSlots), lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
 	}
 	for _, port := range localPorts {
 		engine.ports[uint16(port)] = true
@@ -292,25 +292,17 @@ func NewWithPacketBudget(config Config, impl backend.Backend, budget *PacketBudg
 		return engine, nil // validation only
 	}
 	if budget == nil {
-		budget = NewPacketBudget()
+		budget = NewResourceBudget()
 	}
-	engine.packetBudget = budget
+	engine.budget = budget
 	engine.backend = impl.Name()
 	engine.instance, err = impl.Open(config.Nodes, engine.guard)
 	if err != nil {
 		return nil, err
 	}
-	slots := make(map[string]chan struct{})
 	for _, node := range config.Nodes {
 		engine.dialers[node.Name], _ = engine.instance.Dialer(node.Name)
-		endpoint := strings.ToLower(node.Server)
-		if endpoint == "" {
-			endpoint = node.Name
-		}
-		if slots[endpoint] == nil {
-			slots[endpoint] = make(chan struct{}, endpointDialLimit)
-		}
-		engine.dialSlots[node.Name] = slots[endpoint]
+		engine.dialSlots[node.Name] = budget.dials.retain(endpointKey(node.Server))
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	engine.ctx, engine.stop = ctx, cancel
@@ -375,6 +367,14 @@ func (engine *Engine) NetworkChanged() {
 	}
 }
 
+// BeginDrain stops new dials and background work on a superseded engine.
+// Already established streams continue to use the old engine until closed.
+func (engine *Engine) BeginDrain() {
+	if engine.stop != nil {
+		engine.stop()
+	}
+}
+
 func (engine *Engine) Close() error {
 	engine.closeOnce.Do(func() {
 		engine.mu.Lock()
@@ -388,9 +388,7 @@ func (engine *Engine) Close() error {
 			packets = append(packets, conn)
 		}
 		engine.mu.Unlock()
-		if engine.stop != nil {
-			engine.stop()
-		}
+		engine.BeginDrain()
 		for _, conn := range connections {
 			_ = conn.Close()
 		}
@@ -399,6 +397,9 @@ func (engine *Engine) Close() error {
 		}
 		if engine.instance != nil {
 			engine.closeErr = engine.instance.Close()
+		}
+		for _, endpoint := range engine.dialSlots {
+			engine.budget.dials.release(endpoint)
 		}
 	})
 	return engine.closeErr
@@ -645,9 +646,12 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 }
 
 func (engine *Engine) dialContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	engine.mu.Lock()
+	network := engine.networkCtx
+	engine.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
-	stop := context.AfterFunc(engine.ctx, cancel)
-	if engine.ctx.Err() != nil {
+	stop := context.AfterFunc(network, cancel)
+	if network.Err() != nil {
 		cancel()
 	}
 	return ctx, func() {
@@ -691,8 +695,8 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 		return nil, err
 	}
 	select {
-	case engine.packetBudget.opening <- struct{}{}:
-		defer func() { <-engine.packetBudget.opening }()
+	case engine.budget.opening <- struct{}{}:
+		defer func() { <-engine.budget.opening }()
 	default:
 		return nil, backend.ErrPacketCongested
 	}
@@ -760,12 +764,12 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 		engine.mu.Unlock()
 		if conn != nil {
 			_ = conn.Close()
-			engine.packetBudget.releaseOutbound(exit)
+			engine.budget.releaseOutbound(exit)
 		}
 		return nil, err
 	}
 	tracked := &trackedPacket{PacketConn: conn, engine: engine, record: record, outbound: exit}
-	evicted := engine.packetBudget.admit(tracked)
+	evicted := engine.budget.admit(tracked)
 	engine.livePackets[record.ID] = tracked
 	engine.mu.Unlock()
 	if evicted != nil {
@@ -781,21 +785,21 @@ func (engine *Engine) openPacket(ctx context.Context, via, target string) (net.P
 	if via == "REJECT" {
 		return nil, nil, outbound.ErrRejected
 	}
-	key := strings.ToLower(engine.servers[via])
-	if key == "" {
-		key = via
+	key := via
+	if endpoint := engine.dialSlots[via]; endpoint != nil {
+		key = endpoint.key
 	}
-	exit := engine.packetBudget.retainOutbound(key)
+	exit := engine.budget.retainOutbound(key)
 	select {
 	case exit.opening <- struct{}{}:
 		defer func() { <-exit.opening }()
 	default:
-		engine.packetBudget.releaseOutbound(exit)
+		engine.budget.releaseOutbound(exit)
 		return nil, nil, backend.ErrPacketCongested
 	}
 	conn, err := engine.dialPacketOnce(ctx, via, target)
 	if err != nil {
-		engine.packetBudget.releaseOutbound(exit)
+		engine.budget.releaseOutbound(exit)
 		return nil, nil, err
 	}
 	return conn, exit, nil
@@ -817,25 +821,9 @@ func (engine *Engine) dialPacketOnce(ctx context.Context, via, target string) (n
 		return nil, err
 	}
 	if slot != nil {
-		defer func() { <-slot }()
+		defer engine.budget.dials.finish(slot)
 	}
 	return dialer.ListenPacket(ctx, target)
-}
-
-var errEndpointBusy = errors.New("proxy endpoint has too many unfinished connections")
-
-// A saturated endpoint fails fast so the next candidate can still dial.
-func (engine *Engine) acquireDialSlot(via string) (chan struct{}, error) {
-	slot := engine.dialSlots[via]
-	if slot == nil {
-		return nil, nil
-	}
-	select {
-	case slot <- struct{}{}:
-		return slot, nil
-	default:
-		return nil, errEndpointBusy
-	}
 }
 
 type trackedPacket struct {
@@ -876,7 +864,7 @@ func (conn *trackedPacket) WriteTo(data []byte, addr net.Addr) (int, error) {
 		defer func() {
 			<-conn.outbound.sending
 			if conn.outbound.refs.Load() == 0 {
-				conn.engine.packetBudget.pruneOutbound(conn.outbound)
+				conn.engine.budget.pruneOutbound(conn.outbound)
 			}
 		}()
 	default:
@@ -897,7 +885,7 @@ func (conn *trackedPacket) WriteTo(data []byte, addr net.Addr) (int, error) {
 }
 
 func (conn *trackedPacket) touch() {
-	conn.lastActive.Store(time.Since(conn.engine.packetBudget.started).Nanoseconds())
+	conn.lastActive.Store(time.Since(conn.engine.budget.started).Nanoseconds())
 }
 
 func (conn *trackedPacket) snapshot() Record {
@@ -911,7 +899,7 @@ func (conn *trackedPacket) Close() error {
 	conn.once.Do(func() {
 		conn.closed.Store(true)
 		err = conn.PacketConn.Close()
-		conn.engine.packetBudget.remove(conn)
+		conn.engine.budget.remove(conn)
 		conn.engine.mu.Lock()
 		defer conn.engine.mu.Unlock()
 		record := conn.snapshot()
@@ -930,7 +918,7 @@ func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *
 		return nil, err
 	}
 	if slot != nil {
-		defer func() { <-slot }()
+		defer engine.budget.dials.finish(slot)
 	}
 	epoch := engine.networkEpoch.Load()
 	ctx, t := trace.With(ctx)

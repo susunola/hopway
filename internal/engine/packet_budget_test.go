@@ -16,10 +16,10 @@ import (
 )
 
 func TestUDPSessionBudgetEvictsLeastRecentAcrossGenerations(t *testing.T) {
-	budget := newPacketBudget(3, 4)
+	budget := newResourceBudget(3, 4)
 	newCore := func() *Engine {
 		t.Helper()
-		core, err := NewWithPacketBudget(Default(), backend.Native{}, budget)
+		core, err := NewWithResourceBudget(Default(), backend.Native{}, budget)
 		if err != nil {
 			t.Fatal(err)
 		}

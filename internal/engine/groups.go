@@ -293,6 +293,9 @@ func (engine *Engine) probeNodes(ctx context.Context, names []string, emit func(
 	if network != nil {
 		stop := context.AfterFunc(network, cancel)
 		defer stop()
+		if network.Err() != nil {
+			cancel()
+		}
 	}
 	if names == nil {
 		for name := range engine.dialers {
@@ -406,6 +409,14 @@ func (engine *Engine) probe(ctx context.Context, name string) ProbeResult {
 		result.finished = start
 		return result
 	}
+	release, err := engine.reserveProbe(ctx, name)
+	if err != nil {
+		result.Failure, result.Inconclusive = err.Error(), true
+		result.finished = time.Now()
+		result.CheckedAt = result.finished.UnixMilli()
+		return result
+	}
+	defer release()
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	primary := ctx
@@ -415,9 +426,10 @@ func (engine *Engine) probe(ctx context.Context, name string) ProbeResult {
 		defer stop()
 	}
 	target := engine.probeURL
+	dialer = engine.limitProbeDial(name, dialer)
 	latency, err := probeTarget(primary, dialer, target)
 	var primaryErr error
-	if err != nil && ctx.Err() == nil && engine.probeFallback != "" {
+	if err != nil && ctx.Err() == nil && engine.probeFallback != "" && !errors.Is(err, errEndpointBusy) {
 		primaryErr = err
 		target = engine.probeFallback
 		latency, err = probeTarget(ctx, dialer, target)
@@ -442,7 +454,7 @@ func (status probeHTTPStatus) Error() string { return fmt.Sprintf("probe returne
 
 func inconclusiveProbe(err error) bool {
 	var status probeHTTPStatus
-	return errors.As(err, &status) || errors.Is(err, syscall.ENETDOWN) || errors.Is(err, syscall.ENETUNREACH)
+	return errors.As(err, &status) || errors.Is(err, errEndpointBusy) || errors.Is(err, syscall.ENETDOWN) || errors.Is(err, syscall.ENETUNREACH)
 }
 
 func probeTarget(ctx context.Context, dialer backend.Dialer, target string) (time.Duration, error) {

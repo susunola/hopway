@@ -157,7 +157,7 @@ func TestCancelLargeProbeBatchReleasesInFlightDials(t *testing.T) {
 	go func() { batch <- core.ProbeResults(ctx, nil, nil) }()
 	ready := time.NewTimer(3 * time.Second)
 	defer ready.Stop()
-	for range probeParallel {
+	for range endpointProbeLimit {
 		select {
 		case <-started:
 		case <-ready.C:
@@ -168,7 +168,7 @@ func TestCancelLargeProbeBatchReleasesInFlightDials(t *testing.T) {
 	cancel()
 	released := time.NewTimer(time.Second)
 	defer released.Stop()
-	for range probeParallel {
+	for range endpointProbeLimit {
 		select {
 		case <-exited:
 		case <-released.C:
@@ -180,7 +180,7 @@ func TestCancelLargeProbeBatchReleasesInFlightDials(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("batch completed with %v, want cancellation", err)
 		}
-		t.Logf("released %d dials and canceled 1,000-node batch in %s", probeParallel, time.Since(stoppedAt))
+		t.Logf("released %d dials and canceled 1,000-node batch in %s", endpointProbeLimit, time.Since(stoppedAt))
 	case <-released.C:
 		t.Fatal("probe batch did not stop after cancellation")
 	}
