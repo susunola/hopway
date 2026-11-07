@@ -1,11 +1,13 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 
+	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
 	"mac-proxy/internal/profile"
 )
@@ -137,31 +139,76 @@ func (s *Supervisor) EnableDesktopRouting(initial *engine.Policy) {
 }
 
 func (s *Supervisor) saveDesktopPolicy(policy engine.Policy) error {
-	saved := &desktopPolicy{Policy: policy}
+	saved := newDesktopPolicy(s.loaded.Merged, policy)
+	if s.path != "" && s.dataDir != "" {
+		if err := saved.write(s.dataDir); err != nil {
+			return err
+		}
+	}
+	s.desktopPolicy = &saved
+	return nil
+}
+
+// SaveDesktopMode changes the next launch's preset while the profile is stopped.
+func SaveDesktopMode(ctx context.Context, path, dir, mode string, impl backend.Backend) error {
+	if path == "" || dir == "" {
+		return errors.New("缺少配置路径")
+	}
+	switch mode {
+	case "fastest", "rule", "direct":
+	default:
+		return errors.New("未知的策略预设")
+	}
+	lease, err := acquireLease(dir)
+	if err != nil {
+		return err
+	}
+	if lease != nil {
+		defer lease.Close()
+	}
+	loaded, err := profile.Check(path, dir, func(config engine.Config) error {
+		return engine.ValidateContext(ctx, config, impl, nil)
+	})
+	if err != nil {
+		return err
+	}
+	policy := DesktopStartupPolicy(loaded, dir)
+	policy.Mode, policy.Auto = mode, nil
+	if mode == "direct" {
+		policy.Selected = "DIRECT"
+	} else if policy.Selected == "" {
+		policy.Selected = loaded.Merged.Selected
+	}
+	return newDesktopPolicy(loaded.Merged, policy).write(dir)
+}
+
+func newDesktopPolicy(config engine.Config, policy engine.Policy) desktopPolicy {
+	saved := desktopPolicy{Policy: policy}
 	saved.ExpectedProbeKey = ""
 	if policy.Mode == "global" || policy.Mode == "rule" || policy.Mode == "fastest" {
 		switch policy.Selected {
 		case "", "DIRECT", "REJECT":
 		default:
 			group := false
-			for _, item := range s.loaded.Merged.Groups {
+			for _, item := range config.Groups {
 				if item.Name == policy.Selected {
 					group = true
 					break
 				}
 			}
-			saved.SelectedID = s.loaded.Merged.OutboundID(policy.Selected, group)
+			saved.SelectedID = config.OutboundID(policy.Selected, group)
 		}
 	}
-	if s.path != "" && s.dataDir != "" {
-		data, err := json.Marshal(saved)
-		if err != nil {
-			return err
-		}
-		if err := engine.WriteAtomic(desktopPolicyPath(s.dataDir), data); err != nil {
-			return errors.New("无法保存出站选择")
-		}
+	return saved
+}
+
+func (saved desktopPolicy) write(dir string) error {
+	data, err := json.Marshal(saved)
+	if err != nil {
+		return err
 	}
-	s.desktopPolicy = saved
+	if err := engine.WriteAtomic(desktopPolicyPath(dir), data); err != nil {
+		return errors.New("无法保存出站选择")
+	}
 	return nil
 }

@@ -287,6 +287,15 @@ struct ProxyStatus: Decodable, Equatable {
     let reloaded: Double?
     let revision: String?
     let profileFallback: Bool?
+
+    var currentOutbound: String? {
+        switch policy.mode {
+        case "auto", "fastest": auto?.node
+        case "global": groups?.first(where: { $0.name == policy.selected })?.now ?? policy.selected
+        case "direct": "DIRECT"
+        default: nil
+        }
+    }
     struct Retirement: Decodable, Equatable {
         let pending: UInt64
         let forced: UInt64
@@ -349,6 +358,30 @@ private struct ProfileWriteConflict: LocalizedError {
 
 @MainActor
 final class CoreModel: ObservableObject {
+    enum RouteVerification {
+        case reachable
+        case failed(String)
+
+        var title: String {
+            switch self {
+            case .reachable: "联网正常"
+            case .failed: "联网失败"
+            }
+        }
+
+        var detail: String {
+            switch self {
+            case .reachable: "当前出站已通过 HTTPS 联网验证"
+            case .failed(let reason): reason
+            }
+        }
+
+        var failed: Bool {
+            if case .failed = self { return true }
+            return false
+        }
+    }
+
     enum Phase: String {
         case stopped = "已停止"
         case starting = "正在启动"
@@ -364,15 +397,15 @@ final class CoreModel: ObservableObject {
     @Published private(set) var configuredProfile: ProfileInspection?
     @Published private(set) var profileReadFailed = false
     private(set) var statusReadAt: Date?
+    private(set) var connectionReadAt: Date?
     @Published private(set) var message: String?
     @Published private(set) var configurationNotice: String?
     @Published private(set) var configurationConflict = false
-    @Published private(set) var appliedPorts: (socks: Int?, http: Int?)?
     @Published private(set) var verifying = false
-    @Published private(set) var verification: String?
+    @Published private(set) var verification: RouteVerification?
     @Published private(set) var saving = false
     @Published private(set) var refreshing = false
-    @Published private(set) var exportingProfile = false
+    @Published private(set) var exportingDiagnostics = false
     @Published private(set) var updatingPolicy = false
     @Published private var requestedTUNOperation: String?
     @Published private(set) var trafficHistory: TrafficHistory?
@@ -386,6 +419,7 @@ final class CoreModel: ObservableObject {
     @Published private(set) var probeTotal = 0
     @Published var draft = ""
     private var announcedRecovery = false
+    private var presentedWarnings: [String] = []
     @Published private(set) var saved = ""
     @Published private(set) var savedRevision = "missing"
 
@@ -565,8 +599,8 @@ final class CoreModel: ObservableObject {
         }
         cancelProbe()
         message = nil
+        presentedWarnings = []
         phase = .starting
-        let launchedConfiguration = saved
         let child = Process()
         child.executableURL = executable
         var arguments = ["-managed", "-desktop-routing", "-config", configURL.path]
@@ -605,7 +639,6 @@ final class CoreModel: ObservableObject {
                 guard process === child, phase == .starting else { return }
                 endpoint = info
                 if policy != nil { reloadConfiguredNodes() }
-                appliedPorts = configuredPorts(in: launchedConfiguration)
                 phase = .running
                 configurationNotice = nil
                 polling = Task {
@@ -655,12 +688,12 @@ final class CoreModel: ObservableObject {
         input = nil
         process = nil
         endpoint = nil
-        appliedPorts = nil
         verification = nil
         verifying = false
         status = nil
         connectionRecords.removeAll()
         connectionCursor = nil
+        connectionReadAt = nil
         connectionReadFailed = false
         clearStatusFailure()
         statusReadAt = nil
@@ -698,12 +731,8 @@ final class CoreModel: ObservableObject {
     /// Applies the saved configuration to the running core without a restart.
     private func applyRunning() async -> String {
         guard let info = endpoint else { return "重启内核后生效。" }
-        let reloadedConfiguration = saved
         do {
             _ = try await call(info, path: "reload", method: "POST", revision: savedRevision)
-            if endpoint?.token == info.token {
-                appliedPorts = configuredPorts(in: reloadedConfiguration)
-            }
             configurationNotice = nil
             await refresh(info)
             return "已生效，无需重启。"
@@ -717,49 +746,168 @@ final class CoreModel: ObservableObject {
         }
     }
 
-    private func configuredPorts(in source: String) -> (socks: Int?, http: Int?)? {
-        guard let config = AdvancedSettingsDraft(source: source) else { return nil }
-        return (Int(config.original.socksPort), Int(config.original.httpPort))
-    }
-
     func verifyConnection() {
-        guard let info = endpoint, !verifying else { return }
+        guard let info = endpoint, let route = status, !statusReadFailed, !verifying else { return }
         verifying = true
         verification = nil
         Task {
-            let result: String
+            let result: RouteVerification
             do {
                 _ = try await call(info, path: "verify", method: "POST")
-                result = "当前路由已通过 HTTPS 联网验证"
+                result = .reachable
             } catch {
-                result = "联网验证失败 · " + error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                result = .failed(error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines))
             }
-            guard endpoint?.token == info.token else { return }
-            verifying = false
-            verification = result
             await refresh(info)
+            guard isRunning(info) else { return }
+            verifying = false
+            guard !statusReadFailed, status?.generation == route.generation, status?.policy == route.policy,
+                  status?.currentOutbound == route.currentOutbound else { return }
+            verification = result
         }
     }
 
-    func exportProfile(cpu: Bool) {
-        guard let info = endpoint, isRunning(info), !exportingProfile else { return }
-        let kind = cpu ? "cpu" : "heap"
+    var accessLabel: String {
+        guard phase == .running else { return "未接管" }
+        guard let status, !statusReadFailed else { return "读取中" }
+        return switch (status.tun?.enabled == true, status.systemProxy?.enabled == true) {
+        case (true, true): "TUN + 系统代理"
+        case (true, false): "TUN"
+        case (false, true): "系统代理"
+        case (false, false): "手动接入"
+        }
+    }
+
+    var reachabilityLabel: String {
+        if phase != .running { return "启动后可验证" }
+        if statusReadFailed { return "状态待确认" }
+        if verifying { return "正在验证…" }
+        return verification?.title ?? "尚未验证"
+    }
+
+    func dismissMessage() {
+        message = nil
+    }
+
+    func exportDiagnostics() {
+        guard !exportingDiagnostics else { return }
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "HopWay-\(kind).pprof"
-        guard panel.runModal() == .OK, let destination = panel.url, isRunning(info) else { return }
-        exportingProfile = true
+        panel.allowedContentTypes = [.zip]
+        panel.nameFieldStringValue = "HopWay-诊断.zip"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        exportingDiagnostics = true
         Task {
-            defer { exportingProfile = false }
+            defer { exportingDiagnostics = false }
             do {
-                var query = [URLQueryItem(name: "kind", value: kind)]
-                if cpu { query.append(URLQueryItem(name: "seconds", value: "3")) }
-                let data = try await call(info, path: "diagnostics/profile", method: "POST", query: query)
-                try data.write(to: destination, options: .atomic)
-                message = "诊断样本已导出。"
+                try await writeDiagnostics(to: destination)
+                message = "已导出诊断文件。"
             } catch {
                 message = "导出诊断失败 · " + error.localizedDescription
             }
         }
+    }
+
+    func writeDiagnostics(to destination: URL) async throws {
+        var report = diagnosticSummary()
+        var files: [String: Data] = [:]
+        if let info = endpoint, isRunning(info) {
+            for kind in ["cpu", "heap"] {
+                let label = kind == "cpu" ? "CPU 样本" : "堆快照"
+                do {
+                    var query = [URLQueryItem(name: "kind", value: kind)]
+                    if kind == "cpu" { query.append(URLQueryItem(name: "seconds", value: "3")) }
+                    guard isRunning(info) else { throw CancellationError() }
+                    files[kind + ".pprof"] = try await call(info, path: "diagnostics/profile", method: "POST", query: query)
+                    report += "\n\(label) · 已采集"
+                } catch {
+                    report += "\n\(label) · 采集失败"
+                }
+            }
+        } else {
+            report += "\n性能样本 · 内核停止"
+        }
+        files["report.txt"] = Data((report + "\n").utf8)
+        let archive = files
+        try await Task.detached {
+            let manager = FileManager.default
+            let temporary = manager.temporaryDirectory.appendingPathComponent("hopway-diagnostics-" + UUID().uuidString)
+            let contents = temporary.appendingPathComponent("HopWay-Diagnostics")
+            try manager.createDirectory(at: temporary, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            defer { try? manager.removeItem(at: temporary) }
+            try manager.createDirectory(at: contents, withIntermediateDirectories: false)
+            for (name, data) in archive { try data.write(to: contents.appendingPathComponent(name)) }
+            let zipped = temporary.appendingPathComponent("diagnostics.zip")
+            let child = Process()
+            child.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            child.arguments = ["-c", "-k", "--norsrc", "--noextattr", "--noacl", "--keepParent", contents.path, zipped.path]
+            child.standardError = FileHandle.nullDevice
+            try child.run()
+            child.waitUntilExit()
+            guard child.terminationStatus == 0 else { throw CoreError(message: "无法打包诊断文件。") }
+            try Data(contentsOf: zipped).write(to: destination, options: .atomic)
+        }.value
+    }
+
+    private func diagnosticSummary() -> String {
+        let profile = configuredProfile
+        let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知"
+        let backend = [profile?.backend, profile?.backendVersion].compactMap { $0 }.joined(separator: " ")
+        let mode = status?.policy.mode ?? profile?.mode
+        let diskVersion = profile?.revision ?? savedRevision
+        var lines = [
+            "HopWay 诊断",
+            "采集时间 · " + Date.now.ISO8601Format(),
+            "App · " + appVersion,
+            "系统 · " + ProcessInfo.processInfo.operatingSystemVersionString,
+            "内核后端 · " + (backend.isEmpty ? "未知" : backend),
+            "内核 · " + phase.rawValue,
+            "接入 · " + accessLabel,
+            "出口可达 · " + reachabilityLabel,
+            "路由模式 · " + (mode.map(Policy.label) ?? "未知"),
+            "磁盘配置版本 · " + String(diskVersion.prefix(12)),
+            "节点 · \(configuredNodes.count) 个",
+            "订阅 · \(subscriptions.count) 份",
+        ]
+        if let status {
+            lines.append("运行配置版本 · " + (status.revision.map { String($0.prefix(12)) } ?? "未知"))
+            lines.append("内核代次 · \(status.generation)")
+            lines.append("活动连接 · \(status.active)")
+            lines.append("配置告警 · \(status.warnings?.count ?? 0) 条")
+            if let applied = status.reloaded {
+                lines.append("配置应用时间 · " + Date(timeIntervalSince1970: applied / 1000).ISO8601Format())
+            }
+            if let resources = status.resources {
+                if let used = resources.connections, let limit = resources.connectionLimit {
+                    lines.append("连接额度 · \(used) / \(limit) · 拒绝 \(resources.connectionsRefused ?? 0)")
+                }
+                lines.append("UDP 会话 · \(resources.udpSessions) / \(resources.udpSessionLimit)")
+                lines.append("UDP 建连 · \(resources.udpOpening) / \(resources.udpOpenLimit)")
+                lines.append("端点拨号并发 · \(resources.endpointDialLimit)")
+                if let idle = resources.udpIdleTimeoutSec { lines.append("UDP 空闲回收 · \(idle) 秒") }
+                if let used = resources.udpQueuedBytes, let limit = resources.udpQueueLimitBytes {
+                    lines.append("UDP 暂存 · \(used) / \(limit) B")
+                }
+            }
+            if let retirement = status.retirement {
+                lines.append("旧内核回收 · 处理中 \(retirement.pending) · 强制关闭 \(retirement.forced) · 清理超时 \(retirement.slow)")
+            }
+            if let tun = status.tun {
+                lines.append("TUN 助手 · " + (tun.service == true ? "已安装" : "未安装"))
+                if let pools = tun.fakeIP {
+                    lines.append("Fake IP IPv4 · \(pools.ipv4.mapped) / \(pools.ipv4.capacity) · 暂缓 \(pools.ipv4.refused)")
+                    if let ipv6 = pools.ipv6 {
+                        lines.append("Fake IP IPv6 · \(ipv6.mapped) / \(ipv6.capacity) · 暂缓 \(ipv6.refused)")
+                    }
+                }
+                if let dns = tun.dns {
+                    lines.append("TUN DNS · 转发时限 \(dns.timeoutMs) 毫秒 · 例外 \(dns.exceptionCount) 条 · 嗅探 \(dns.sniffingEnabled ? "开启" : "关闭")")
+                }
+            }
+            for (name, drops) in (status.udpDrops ?? [:]).sorted(by: { $0.key < $1.key }) {
+                lines.append("UDP \(name) · \(drops.detail)")
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 
     struct RouteDecision: Decodable {
@@ -841,7 +989,8 @@ final class CoreModel: ObservableObject {
             let snapshot = try JSONDecoder().decode(ProxyStatus.self, from: data)
             let before = status?.subscriptions?.map { [$0.updated, $0.usage.map { Double($0.updatedAt) }] }
             if let previous = status,
-               previous.policy != snapshot.policy || previous.auto?.node != snapshot.auto?.node {
+               previous.generation != snapshot.generation || previous.policy != snapshot.policy ||
+                previous.currentOutbound != snapshot.currentOutbound {
                 verification = nil
             }
             statusReadAt = .now
@@ -851,6 +1000,7 @@ final class CoreModel: ObservableObject {
                 cancelConnectionRequest()
                 connectionRecords.removeAll()
                 connectionCursor = nil
+                connectionReadAt = nil
                 connectionReadFailed = false
             }
             if status != snapshot { status = snapshot }
@@ -859,7 +1009,11 @@ final class CoreModel: ObservableObject {
                 reloadConfiguredNodes()
             }
             reloadTraffic()
-            if message == nil, let warnings = status?.warnings, !warnings.isEmpty {
+            let warnings = snapshot.warnings ?? []
+            if warnings.isEmpty {
+                presentedWarnings = []
+            } else if message == nil && warnings != presentedWarnings {
+                presentedWarnings = warnings
                 message = warnings.joined(separator: "；")
             }
             if message == nil, status?.systemProxy?.recovered == true, !announcedRecovery {
@@ -896,6 +1050,7 @@ final class CoreModel: ObservableObject {
             guard isRunning(info), watchingConnections else { return }
             let update = try JSONDecoder().decode(ConnectionUpdate.self, from: data)
             guard update.generation == generation else { return }
+            connectionReadAt = .now
             if connectionReadFailed { connectionReadFailed = false }
             connectionCursor = update.cursor
             if update.full == true || update.records != nil || update.counters != nil || update.removed != nil {
@@ -936,6 +1091,29 @@ final class CoreModel: ObservableObject {
                 await refresh(info)
             } catch {
                 if endpoint?.token == info.token { message = error.localizedDescription }
+            }
+        }
+    }
+
+    func selectRoutingPreset(_ mode: String) {
+        guard !saving, !updatingPolicy else { return }
+        if phase == .running, let status, !statusReadFailed {
+            updatePolicy(Policy(mode: mode, selected: mode == "direct" ? "DIRECT" : status.policy.selected))
+        } else if phase == .stopped, let executable {
+            saving = true
+            message = nil
+            let destination = configURL
+            Task {
+                defer { saving = false }
+                do {
+                    _ = try await Task.detached {
+                        try Self.runProfileCommand("-save-desktop-mode=" + mode, at: destination, executable: executable)
+                    }.value
+                    message = "下次启动使用「" + Policy.label(mode) + "」。"
+                    reloadConfiguredNodes()
+                } catch {
+                    message = "保存策略预设失败 · " + error.localizedDescription
+                }
             }
         }
     }

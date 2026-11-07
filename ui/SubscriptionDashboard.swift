@@ -73,7 +73,7 @@ struct SubscriptionDashboard: View {
         let active = core.subscriptions.filter { !$0.isPaused }.count
         let paused = core.subscriptions.count - active
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
                 HStack {
                     HopPageHeading(
                         title: "订阅",
@@ -81,15 +81,18 @@ struct SubscriptionDashboard: View {
                             "\(core.subscriptions.count) 份订阅 · \(active) 份启用 · \(paused) 份暂停"
                     )
                     Spacer()
-                    Button("导入订阅…", action: importLink).disabled(core.saving)
                     Button(action: core.refreshAllSubscriptions) {
                         Label("刷新全部", systemImage: "arrow.clockwise")
                     }
                     .disabled(core.saving || core.refreshing || !core.subscriptions.contains { !$0.isPaused })
+                    Button("导入订阅…", action: importLink)
+                        .buttonStyle(HopPrimaryButton())
+                        .disabled(core.saving)
                 }
                 if core.subscriptions.isEmpty {
-                    Text("导入订阅后，这里会显示每份套餐的已用和剩余额度。")
-                        .foregroundStyle(.secondary)
+                    ContentUnavailableView("还没有订阅", systemImage: "tray.full",
+                                           description: Text("导入后可以查看剩余流量和到期时间。"))
+                        .frame(maxWidth: .infinity)
                 } else {
                     ForEach(core.subscriptions) { subscription in
                         plan(subscription)
@@ -149,33 +152,27 @@ struct SubscriptionDashboard: View {
         return VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline, spacing: 9) {
                 Text(subscription.name).font(.headline).lineLimit(1)
-                Button {
-                    newName = subscription.name
-                    editing = subscription
-                } label: {
-                    Image(systemName: "pencil")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(HopAppearance.accent)
-                }
-                .buttonStyle(.borderless)
-                .disabled(core.saving)
-                .help("编辑订阅名称")
-                .accessibilityLabel("编辑 \(subscription.name) 的名称")
                 if subscription.isPaused {
                     Text("已暂停").font(.caption).foregroundStyle(.secondary)
                 } else if let nodes = subscription.nodes {
                     Text("\(nodes.count) 个节点").foregroundStyle(.secondary)
                 }
-                Button {
-                    core.refreshSubscription(subscription.id)
-                } label: {
-                    Image(systemName: "arrow.clockwise").font(.caption)
+                Spacer(minLength: 8)
+                if let used {
+                    Text(trafficBytes(used))
+                        .font(.system(.title2, design: .rounded).weight(.semibold).monospacedDigit())
+                        .foregroundStyle(warning ? HopAppearance.warning : Color.primary)
                 }
-                .buttonStyle(.borderless)
-                .disabled(core.saving || core.refreshing || subscription.isPaused)
-                .help("刷新这份订阅")
-                .accessibilityLabel("刷新 \(subscription.name)")
+                if let total {
+                    Text("/ \(trafficBytes(total))").monospacedDigit().foregroundStyle(.secondary)
+                }
                 Menu {
+                    Button("编辑名称…") {
+                        newName = subscription.name
+                        editing = subscription
+                    }
+                    Button("刷新订阅") { core.refreshSubscription(subscription.id) }
+                        .disabled(core.refreshing || subscription.isPaused)
                     Button(subscription.isPaused ? "恢复订阅" : "暂停订阅") {
                         core.pauseSubscription(subscription.id, paused: !subscription.isPaused)
                     }
@@ -187,19 +184,10 @@ struct SubscriptionDashboard: View {
                 .fixedSize()
                 .disabled(core.saving)
                 .accessibilityLabel("\(subscription.name) 的订阅操作")
-                Spacer(minLength: 8)
-                if let used {
-                    Text(trafficBytes(used))
-                        .font(.system(.title2, design: .rounded).weight(.semibold).monospacedDigit())
-                        .foregroundStyle(warning ? Color.orange : Color.primary)
-                }
-                if let total {
-                    Text("/ \(trafficBytes(total))").monospacedDigit().foregroundStyle(.secondary)
-                }
             }
             if let ratio {
                 ProgressView(value: min(1, ratio))
-                    .tint(warning ? .orange : HopAppearance.accent)
+                    .tint(warning ? HopAppearance.warning : HopAppearance.accent)
                     .accessibilityLabel("已用流量占比")
             }
             HStack(spacing: 10) {
@@ -209,7 +197,7 @@ struct SubscriptionDashboard: View {
                         ?? "已用 \(ratio.formatted(.percent.precision(.fractionLength(0))))"
                     if warning {
                         Label("\(remaining) · \(detail)", systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(HopAppearance.warning)
                     } else {
                         Text("\(remaining) · \(detail)")
                     }
@@ -228,7 +216,7 @@ struct SubscriptionDashboard: View {
             if let error = runtime?.error {
                 VStack(alignment: .leading, spacing: 3) {
                     Label(nodeSync > 0 ? "刷新失败 · 使用上次缓存" : "刷新失败", systemImage: "exclamationmark.circle")
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(HopAppearance.warning)
                     Text(error)
                         .lineLimit(2)
                         .foregroundStyle(.secondary)
@@ -237,9 +225,11 @@ struct SubscriptionDashboard: View {
                 }
                 .font(.caption)
             }
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 14) { syncLabels(nodeSync: nodeSync, quotaSync: meter?.updatedAt, checked: runtime?.checked) }
-                VStack(alignment: .leading, spacing: 4) { syncLabels(nodeSync: nodeSync, quotaSync: meter?.updatedAt, checked: runtime?.checked) }
+            DisclosureGroup("同步详情") {
+                VStack(alignment: .leading, spacing: 4) {
+                    syncLabels(nodeSync: nodeSync, quotaSync: meter?.updatedAt, checked: runtime?.checked)
+                }
+                .padding(.top, 4)
             }
             .font(.caption)
             .foregroundStyle(.secondary)

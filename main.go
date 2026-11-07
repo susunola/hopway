@@ -51,6 +51,7 @@ func main() {
 	desktopRouting := flag.Bool("desktop-routing", false, "internal: use the app's saved outbound choice")
 	startupNode := flag.String("startup-node", "", "internal: connect through this node when the app starts")
 	startupProbeKey := flag.String("startup-probe-key", "", "internal: verify the requested node configuration")
+	desktopMode := flag.String("save-desktop-mode", "", "internal: choose a routing preset for the next desktop launch")
 	inspect := flag.Bool("inspect", false, "print the effective configuration's node and subscription summaries")
 	probe := flag.Bool("probe", false, "measure latency through configured nodes")
 	var probeNames []string
@@ -106,6 +107,15 @@ func main() {
 		if err := inspectProfile(ctx, *path, *inspect, *probe, *refresh, probeNames, *refreshID, *desktopRouting); err != nil {
 			log.SetFlags(0)
 			log.Fatal(err)
+		}
+		return
+	}
+	if *desktopMode != "" {
+		ctx, cancel := profileCommandContext(false)
+		defer cancel()
+		if err := app.SaveDesktopMode(ctx, *path, dataDir(*path), *desktopMode, backend.Default()); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
 		return
 	}

@@ -52,19 +52,30 @@ struct AutoRoutingSheet: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Picker("地区", selection: $region) {
-                    Text("请选择地区").tag("")
-                    ForEach(regions, id: \.self) { code in
-                        Text(regionName(code)).tag(code)
+                HStack(alignment: .top, spacing: 12) {
+                    HopLabeledControl(title: "地区") {
+                        HopSelectionMenu(title: "地区", value: region.isEmpty ? "请选择地区" : regionName(region),
+                                         labelWidth: 176, selection: $region) {
+                            Text("请选择地区").tag("")
+                            ForEach(regions, id: \.self) { code in
+                                Text(regionName(code)).tag(code)
+                            }
+                        }
                     }
-                }
-                Picker("首选服务商", selection: $preferred) {
-                    Text("按导入顺序").tag("")
-                    ForEach(availableProviders) { subscription in
-                        Text(subscription.name).tag(subscription.id)
+                    .frame(width: 215)
+                    HopLabeledControl(title: "首选服务商") {
+                        HopSelectionMenu(title: "首选服务商",
+                                         value: availableProviders.first { $0.id == preferred }?.name ?? "按导入顺序",
+                                         labelWidth: 176, selection: $preferred) {
+                            Text("按导入顺序").tag("")
+                            ForEach(availableProviders) { subscription in
+                                Text(subscription.name).tag(subscription.id)
+                            }
+                        }
+                        .disabled(region.isEmpty)
                     }
+                    .frame(width: 215)
                 }
-                .disabled(region.isEmpty)
                 Text("首选服务商不可用时按导入顺序尝试备用。同一服务商内会保持当前节点，直到测速确认需要切换。")
                     .font(.callout)
                     .foregroundStyle(.secondary)

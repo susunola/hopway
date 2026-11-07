@@ -1,19 +1,12 @@
-import AppKit
 import SwiftUI
 
 struct OverviewDashboard: View {
     @ObservedObject var core: CoreModel
     let showNodes: () -> Void
+    let showPolicies: () -> Void
     let showUsage: () -> Void
     let showSubscriptions: () -> Void
     let importLink: () -> Void
-    @State private var showsAuto = false
-    @State private var configuration: ConfigurationSummary?
-
-    private struct ConfigurationSummary: Decodable {
-        let socksPort: Int?
-        let httpPort: Int?
-    }
 
     private enum OutboundChoice: Hashable {
         case fastest, rule, direct, region, node(String)
@@ -40,24 +33,17 @@ struct OverviewDashboard: View {
                 .fixedSize(horizontal: false, vertical: true)
             ScrollView { content(chartHeight: 80) }
         }
-        .onChange(of: core.saved, initial: true) { _, text in
-            configuration = try? JSONDecoder().decode(ConfigurationSummary.self, from: Data(text.utf8))
-        }
-        .sheet(isPresented: $showsAuto) { AutoRoutingSheet(core: core) }
     }
 
     private func content(chartHeight: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("概览")
-                .font(.system(size: 27, weight: .semibold))
-                .accessibilityAddTraits(.isHeader)
-                .padding(.bottom, 2)
+        VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
+            HopPageHeading(title: "概览").padding(.bottom, 2)
             proxyControl
             if core.statusReadFailed {
                 Label(core.statusReadAt.map { "状态读取失败，显示 " + $0.formatted(date: .omitted, time: .standard) + " 的记录" }
                       ?? "暂时无法读取内核状态", systemImage: "exclamationmark.circle")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(HopAppearance.warning)
             }
             routing
             localAccess
@@ -90,7 +76,7 @@ struct OverviewDashboard: View {
             }
             .accessibilityElement(children: .combine)
             Spacer(minLength: 10)
-            controlMetric("接入方式", value: core.status.map(accessMode) ?? (core.phase == .stopped ? "未接管" : "读取中"))
+            controlMetric("接入方式", value: core.accessLabel)
             controlMetric("活动连接", value: core.status.map { $0.active.formatted() } ?? (core.phase == .stopped ? "0" : "—"))
             Button(action: core.toggle) {
                 Label(running || core.phase == .stopping ? "停止代理" : "启动代理", systemImage: "power")
@@ -120,26 +106,15 @@ struct OverviewDashboard: View {
         .accessibilityElement(children: .combine)
     }
 
-    private func accessMode(_ status: ProxyStatus) -> String {
-        switch (status.tun?.enabled == true, status.systemProxy?.enabled == true) {
-        case (true, true): "TUN + 系统代理"
-        case (true, false): "TUN"
-        case (false, true): "系统代理"
-        case (false, false): "手动接入"
-        }
-    }
-
     private var routing: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 10) {
                 Label("路由策略", systemImage: "arrow.triangle.branch").font(.headline)
                 Spacer()
-                if running {
-                    Button("按地区选路…") { showsAuto = true }.disabled(core.updatingPolicy || core.statusReadFailed)
-                }
                 if core.configuredNodes.isEmpty {
                     Button("导入链接…", action: importLink).disabled(core.saving)
                 }
+                overviewLink("策略模板", action: showPolicies)
                 overviewLink("查看节点", action: showNodes)
             }
 
@@ -147,11 +122,11 @@ struct OverviewDashboard: View {
                 policyControls(status)
             } else if !running, let mode = core.configuredProfile?.mode {
                 HStack(spacing: 18) {
-                    LabeledContent("启动出站", value: Policy.label(mode))
-                        .fixedSize()
+                    Text("启动出站").foregroundStyle(.secondary).fixedSize()
                     if mode == "global", let selected = core.configuredProfile?.selected {
-                        Text(selected).lineLimit(1).help(selected)
+                        Text(selected).fontWeight(.medium).lineLimit(1).help(selected)
                     }
+                    routingContext(mode: mode, status: nil)
                 }
                 .font(.callout)
             } else {
@@ -164,9 +139,19 @@ struct OverviewDashboard: View {
     }
 
     private func policyControls(_ status: ProxyStatus) -> some View {
-        HStack(alignment: .center, spacing: 14) {
-            Picker("出站", selection: Binding(
-                get: { OutboundChoice(policy: status.policy) },
+        let choice = OutboundChoice(policy: status.policy)
+        let value: String = switch choice {
+        case .fastest: "自动最快"
+        case .rule: "按规则"
+        case .direct: "直连"
+        case .region: "按地区自动"
+        case .node(let name): name == "REJECT" ? "阻断连接" : name
+        }
+        return HStack(alignment: .center, spacing: 14) {
+            Text("出站").font(.callout).foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            HopSelectionMenu(title: "出站", value: value, labelWidth: 144, selection: Binding(
+                get: { choice },
                 set: { selectOutbound($0, status: status) }
             )) {
                 Text("自动最快").tag(OutboundChoice.fastest)
@@ -188,30 +173,31 @@ struct OverviewDashboard: View {
                     }
                 }
             }
-            .pickerStyle(.menu)
-            .frame(maxWidth: 320)
             .disabled(core.updatingPolicy || core.statusReadFailed)
-            if let auto = status.auto {
-                if let node = auto.node {
-                    let latency = status.nodes.first { $0.name == node }?.latencyMs.map { "\($0) ms" }
-                    let detail = [auto.provider, node, latency].compactMap { $0 }.joined(separator: " · ")
-                    Label(detail, systemImage: "point.3.connected.trianglepath.dotted")
-                        .font(.callout)
-                        .lineLimit(1)
-                        .help(detail)
-                } else {
-                    let detail = if auto.probing {
-                        "正在测速，等待可用节点…"
-                    } else if status.policy.mode == "fastest", auto.candidates == nil {
-                        "没有可测速的代理节点"
-                    } else {
-                        "暂未找到可用节点"
-                    }
-                    Text(detail).font(.callout).foregroundStyle(.secondary)
-                }
-            }
+            routingContext(mode: status.policy.mode, status: status)
             Spacer(minLength: 0)
         }
+    }
+
+    private func routingContext(mode: String, status: ProxyStatus?) -> some View {
+        let detail: String = switch mode {
+        case "fastest":
+            status?.auto?.candidates.map { "\($0) 个候选节点" } ?? "按延迟选可用节点"
+        case "rule":
+            "\(core.configuredProfile?.ruleCount ?? 0) 条配置规则"
+        case "auto":
+            status?.policy.auto?.region ?? "同地区自动切换"
+        case "direct":
+            "新连接直达目标"
+        default:
+            status?.policy.selected == "REJECT" ? "阻断新连接" : "新连接走所选出站"
+        }
+        return HStack(spacing: 9) {
+            Divider().frame(height: 16)
+            Text(Policy.label(mode)).fontWeight(.medium).fixedSize()
+            Text(detail).foregroundStyle(.secondary).lineLimit(1).help(detail)
+        }
+        .font(.callout)
     }
 
     private func selectOutbound(_ option: OutboundChoice, status: ProxyStatus) {
@@ -228,77 +214,77 @@ struct OverviewDashboard: View {
     }
 
     private var localAccess: some View {
-        let socks = configuredAddress(configuration.map { $0.socksPort ?? 1080 })
-        let http = configuredAddress(configuration.map { $0.httpPort ?? 8080 })
-        return VStack(alignment: .leading, spacing: 10) {
+        let status = core.status
+        let outbound = status?.currentOutbound
+        let node = status?.nodes.first { $0.name == outbound && $0.name != "DIRECT" && $0.name != "REJECT" }
+        let health = outletHealth(node)
+        return VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 12) {
-                Label("本机入口", systemImage: "network").font(.headline)
-                if !running {
-                    Text(core.phase == .stopped ? "未监听" : core.phase.rawValue)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                Label("联网状态", systemImage: "network").font(.headline)
                 Spacer()
-                Text(verificationLabel)
+                Text(health.label)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(health.color)
                     .lineLimit(1)
-                    .help(verificationLabel)
+                    .help(core.verification?.detail ?? health.label)
                     .accessibilityAddTraits(.updatesFrequently)
                 Button("验证联网", action: core.verifyConnection)
-                    .disabled(!running || core.verifying)
+                    .disabled(!running || core.verifying || core.statusReadFailed || core.status == nil)
                     .fixedSize()
             }
-            Divider()
-            HStack(spacing: 16) {
-                address("SOCKS5", value: core.endpoint?.socks ?? socks)
-                Divider().frame(height: 25)
-                address("HTTP / CONNECT", value: core.endpoint?.http ?? http)
+            if running, let status {
+                if let node {
+                    let location = NodeLocation(name: node.name)
+                    let name = if let flag = location.flag, !location.title.contains(flag) {
+                        flag + " " + location.title
+                    } else {
+                        location.title
+                    }
+                    let source = subscription(for: node.name)?.name ?? status.auto?.provider
+                    HStack(spacing: 14) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(name).font(.callout.weight(.semibold)).lineLimit(1).help(node.name)
+                            Text(source.map { "订阅 · " + $0 } ?? "本地节点")
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1).help(source ?? "本地节点")
+                        }
+                        Spacer(minLength: 8)
+                        if let latency = node.latencyMs {
+                            Text("\(latency) ms").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                } else {
+                    Text(outletDescription(status))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .hopPanel(verticalPadding: 12)
     }
 
-    private var verificationLabel: String {
-        if !running { return "启动后可验证" }
-        if core.verifying { return "正在验证当前路由…" }
-        return core.verification ?? "当前路由待验证"
-    }
-
-    private func configuredAddress(_ port: Int?) -> String? {
-        guard let port, (1...65535).contains(port) else { return nil }
-        return "127.0.0.1:\(port)"
-    }
-
-    private func address(_ title: String, value: String?) -> some View {
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.caption).foregroundStyle(.secondary)
-                if let value {
-                    Text(value)
-                        .font(.system(.callout, design: .monospaced).weight(.medium))
-                        .lineLimit(1)
-                        .help(value)
-                } else {
-                    Text("启动后显示地址")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            Spacer(minLength: 0)
-            if let value {
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(value, forType: .string)
-                } label: {
-                    Image(systemName: "document.on.document")
-                }
-                .buttonStyle(.borderless)
-                .help(running ? "复制代理地址" : "复制配置地址")
-                .accessibilityLabel("复制\(title)地址")
-            }
+    private func outletHealth(_ node: ProxyStatus.Node?) -> (label: String, color: Color) {
+        if !running || core.statusReadFailed || core.verifying { return (core.reachabilityLabel, .secondary) }
+        if let check = core.verification {
+            return (check.title, check.failed ? HopAppearance.warning : HopAppearance.accent)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        if let healthAt = node?.healthAt, Date.now.timeIntervalSince1970 - healthAt / 1000 > 15 * 60 {
+            return ("等待复测", .secondary)
+        }
+        if node?.alive == true { return ("节点可用", HopAppearance.accent) }
+        if node?.alive == false { return ("节点不可用", HopAppearance.warning) }
+        return (core.reachabilityLabel, .secondary)
+    }
+
+    private func outletDescription(_ status: ProxyStatus) -> String {
+        switch status.currentOutbound {
+        case "DIRECT": return "当前出口 · 直连"
+        case "REJECT": return "当前出口 · 阻断连接"
+        default:
+            if status.policy.mode == "rule" { return "按规则分流，出口随目标而变" }
+            if status.auto?.probing == true { return "正在测速，等待可用节点" }
+            return "暂无可用节点"
+        }
     }
 
     private func traffic(chartHeight: CGFloat) -> some View {
@@ -366,14 +352,17 @@ struct OverviewDashboard: View {
 
     private var subscriptionsOverview: some View {
         let subscriptions = core.subscriptions
-        let active = subscriptions.filter { !$0.isPaused }
-        let visible = (active + subscriptions.filter(\.isPaused)).prefix(3)
+        let enabled = subscriptions.filter { !$0.isPaused }
+        let selected = running && !core.statusReadFailed ? core.status?.currentOutbound.flatMap(subscription(for:)) : nil
+        let visible = ([selected].compactMap { $0 }
+                       + enabled.filter { $0.id != selected?.id }
+                       + subscriptions.filter(\.isPaused)).prefix(3)
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Label("订阅速览", systemImage: "tray.full").font(.headline)
                 if !subscriptions.isEmpty {
-                    Text("\(subscriptions.count) 份 · \(active.count) 份启用")
+                    Text("\(subscriptions.count) 份 · \(enabled.count) 份启用")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
@@ -390,7 +379,7 @@ struct OverviewDashboard: View {
                 HStack(spacing: 14) {
                     ForEach(visible) { subscription in
                         if subscription.id != visible.first?.id { Divider().frame(height: 30) }
-                        subscriptionSummary(subscription)
+                        subscriptionSummary(subscription, inUse: subscription.id == selected?.id)
                     }
                 }
             }
@@ -398,7 +387,12 @@ struct OverviewDashboard: View {
         .hopPanel(verticalPadding: 12)
     }
 
-    private func subscriptionSummary(_ subscription: SubscriptionSummary) -> some View {
+    private func subscription(for node: String) -> SubscriptionSummary? {
+        let matches = core.subscriptions.filter { !$0.isPaused && $0.nodes?.contains(node) == true }
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    private func subscriptionSummary(_ subscription: SubscriptionSummary, inUse: Bool) -> some View {
         let meter = subscription.usage
         let remaining: String
         if let used = meter?.used, let total = meter?.total, total > 0 {
@@ -415,13 +409,22 @@ struct OverviewDashboard: View {
         return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Text(subscription.name).font(.callout.weight(.semibold)).lineLimit(1)
-                if subscription.isPaused {
+                if inUse {
+                    HStack(spacing: 4) {
+                        Circle().fill(HopAppearance.accent).frame(width: 6, height: 6)
+                            .accessibilityHidden(true)
+                        Text("使用中").font(.caption.weight(.medium))
+                    }
+                    .foregroundStyle(HopAppearance.accent)
+                    .fixedSize()
+                } else if subscription.isPaused {
                     Text("已暂停").font(.caption).foregroundStyle(.secondary)
+                        .fixedSize()
                 }
             }
             Text(detail)
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(expired ? Color.orange : .secondary)
+                .foregroundStyle(expired ? HopAppearance.warning : .secondary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.82)
         }

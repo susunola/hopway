@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -158,13 +159,14 @@ struct AdvancedSettingsPanel: View {
                 Label("高级配置", systemImage: "slider.horizontal.3").font(.headline)
                 Spacer()
                 Button("编辑 JSON…", action: editJSON)
+                    .fixedSize()
                     .disabled(core.saving || draft?.changed == true)
             }
             if core.changed {
                 Label("请先保存或还原 JSON 草稿，再编辑高级选项。", systemImage: "doc.badge.clock")
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(HopAppearance.warning)
             } else if let fields = Binding($draft) {
-                Text("留空使用默认值。各分组一起保存，内核调优可在 JSON 中调整。")
+                Text("留空使用默认值。修改会一起保存。")
                     .font(.caption).foregroundStyle(.secondary)
                 Picker("配置分类", selection: $category) {
                     ForEach(Category.allCases, id: \.self) { category in
@@ -177,7 +179,7 @@ struct AdvancedSettingsPanel: View {
                 controls(fields.values)
                     .disabled(core.saving)
                 if let error = fields.wrappedValue.error {
-                    Label(error, systemImage: "exclamationmark.circle").foregroundStyle(.orange)
+                    Label(error, systemImage: "exclamationmark.circle").foregroundStyle(HopAppearance.warning)
                 }
                 Divider()
                 HStack {
@@ -185,10 +187,14 @@ struct AdvancedSettingsPanel: View {
                         Text("有未保存的修改").foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("还原修改") { draft = AdvancedSettingsDraft(source: core.saved) }
-                        .disabled(!fields.wrappedValue.changed || core.saving)
-                    Button(core.saving ? "正在校验…" : "保存高级配置", action: save)
+                    if fields.wrappedValue.changed {
+                        Button("还原修改") { draft = AdvancedSettingsDraft(source: core.saved) }
+                            .fixedSize()
+                            .disabled(core.saving)
+                    }
+                    Button(core.saving ? "正在校验…" : "保存更改", action: save)
                         .buttonStyle(HopPrimaryButton())
+                        .fixedSize()
                         .keyboardShortcut("s", modifiers: .command)
                         .accessibilityIdentifier("advanced-settings-save")
                         .disabled(!fields.wrappedValue.changed || core.saving || core.configurationConflict || fields.wrappedValue.source != core.saved)
@@ -222,9 +228,6 @@ struct AdvancedSettingsPanel: View {
     private func dnsControls(_ values: Binding<AdvancedSettingsDraft.Values>) -> some View {
         VStack(alignment: .leading, spacing: 13) {
             section("TUN 域名解析", icon: "network") {
-                if let active = core.status?.tun?.dns, core.phase == .running, !core.statusReadFailed {
-                    hint("当前生效 · 转发 \(active.timeoutMs) 毫秒 · \(active.exceptionCount) 条例外 · 嗅探\(active.sniffingEnabled ? "已开启" : "已关闭")")
-                }
                 Text("Fake IP 例外").font(.caption).foregroundStyle(.secondary)
                 TextField("Fake IP 例外", text: values.fakeIPExceptions,
                           prompt: Text("每行一个域名后缀，例如 home.example"), axis: .vertical)
@@ -233,14 +236,13 @@ struct AdvancedSettingsPanel: View {
                     .autocorrectionDisabled()
                     .lineLimit(2...5)
                     .accessibilityIdentifier("advanced-settings-fake-ip-exceptions")
-                hint("每行一个域名后缀，最多 128 条。匹配的域名及子域名交给系统 DNS 解析。")
+                hint("每行一个域名后缀，最多 128 条。匹配后使用系统 DNS。")
             }
             Divider()
             section("TUN 连接嗅探", icon: "waveform.path") {
                 Toggle("从 TLS SNI 和 HTTP Host 识别目标域名", isOn: values.sniffing)
                     .accessibilityIdentifier("advanced-settings-sniffing")
-                hint("适用于直接连接 IP 的 TCP 流量。关闭后按原始 IP 匹配，Fake IP 映射照常还原域名。连接详情会标出目标来源。")
-                hint("此组配置在下次开启增强模式时应用。")
+                hint("关闭后，直接连 IP 的 TCP 流量按原始地址分流。重新开启 TUN 后生效。")
             }
         }
     }
@@ -250,7 +252,7 @@ struct AdvancedSettingsPanel: View {
             field("测速地址", text: values.probeURL, prompt: "随订阅或使用默认地址")
             field("自动选路复测间隔（秒）", text: values.autoRouteInterval, prompt: "60")
                 .frame(maxWidth: 260)
-            hint("自定义测速地址用于检查节点连通性。自动选路复测间隔适用于按地区和服务商选路，范围 15–3600 秒。")
+            hint("自动选路复测间隔为 15–3600 秒。")
         }
     }
 
@@ -274,20 +276,52 @@ struct AdvancedSettingsPanel: View {
             section("本机监听", icon: "network") {
                 fieldRow {
                     field("SOCKS5 端口", text: values.socksPort, prompt: "1080")
+                        .frame(width: 160)
                     field("HTTP 端口", text: values.httpPort, prompt: "8080")
+                        .frame(width: 160)
                 }
                 hint("填 0 自动分配端口。重启代理后生效。")
+                if let endpoint = core.endpoint, core.phase == .running, !core.statusReadFailed {
+                    DisclosureGroup("手动接入地址") {
+                        fieldRow {
+                            copyAddress("SOCKS5", address: endpoint.socks)
+                            copyAddress("HTTP", address: endpoint.http)
+                        }
+                        .padding(.top, 6)
+                    }
+                }
             }
             Divider()
             section("启动与 TUN", icon: "bolt.shield") {
                 fieldRow {
                     Toggle("启动时接管系统代理", isOn: values.systemProxy)
+                        .fixedSize()
                     Toggle("启动时开启 TUN", isOn: values.tunEnabled)
+                        .fixedSize()
+                    Toggle("TUN 接管 IPv6", isOn: values.ipv6)
+                        .fixedSize()
                 }
-                Toggle("TUN 接管 IPv6", isOn: values.ipv6)
-                hint("IPv6 设置在下次开启增强模式时应用。")
+                hint("IPv6 设置在下次开启 TUN 时生效。")
             }
         }
+    }
+
+    private func copyAddress(_ title: String, address: String) -> some View {
+        HStack(spacing: 8) {
+            Text(title).foregroundStyle(.secondary)
+            Text(address).font(.system(.callout, design: .monospaced))
+                .lineLimit(1)
+                .help(address)
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(address, forType: .string)
+            } label: {
+                Image(systemName: "document.on.document")
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("复制\(title)地址")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func section<Content: View>(_ title: String, icon: String, @ViewBuilder content: () -> Content) -> some View {
@@ -307,8 +341,7 @@ struct AdvancedSettingsPanel: View {
     }
 
     private func field(_ title: String, text: Binding<String>, prompt: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.caption).foregroundStyle(.secondary)
+        HopLabeledControl(title: title) {
             TextField(title, text: text, prompt: Text(prompt))
                 .labelsHidden()
                 .accessibilityLabel(title)

@@ -10,18 +10,60 @@ enum HopAppearance {
     })
     static let mint = Color(red: 0.49, green: 0.97, blue: 0.82)
     static let navy = Color(red: 0.04, green: 0.10, blue: 0.16)
+    static let warning = Color(nsColor: NSColor(name: nil) { appearance in
+        if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
+            return NSColor(srgbRed: 0.97, green: 0.71, blue: 0.35, alpha: 1)
+        }
+        return NSColor(srgbRed: 0.58, green: 0.32, blue: 0.06, alpha: 1)
+    })
+    static let pageSpacing: CGFloat = 14
 }
 
 struct HopPageHeading: View {
     let title: String
-    let detail: String
+    var detail: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title).font(.system(size: 27, weight: .semibold))
                 .accessibilityAddTraits(.isHeader)
-            Text(detail).font(.callout).foregroundStyle(.secondary)
+            if let detail { Text(detail).font(.callout).foregroundStyle(.secondary) }
         }
+    }
+}
+
+struct HopLabeledControl<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            content
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+struct HopSelectionMenu<Value: Hashable, Options: View>: View {
+    let title: String
+    let value: String
+    let labelWidth: CGFloat
+    @Binding var selection: Value
+    @ViewBuilder var options: Options
+
+    var body: some View {
+        Menu {
+            Picker(title, selection: $selection) { options }
+                .pickerStyle(.inline)
+                .labelsHidden()
+        } label: {
+            Text(value).lineLimit(1).frame(width: labelWidth, alignment: .leading)
+        }
+        .accessibilityLabel(title)
+        .accessibilityValue(value)
+        .help(value)
     }
 }
 
@@ -39,7 +81,7 @@ struct HopSearchField: View {
                     Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("清除筛选")
+                .accessibilityLabel("清除搜索")
             }
         }
         .font(.callout)

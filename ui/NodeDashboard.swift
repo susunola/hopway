@@ -55,6 +55,7 @@ struct NodeDashboard: View {
     @State private var selectedNode: String?
     @State private var sortByLatency = false
     @State private var showUnavailable = false
+    @State private var showsFilters = false
 
     @State private var providerID: String?
     @State private var stateFilter = StateFilter.all
@@ -145,29 +146,31 @@ struct NodeDashboard: View {
     var body: some View {
         let providers = providers
         let rows = rows(providers: providers)
-        let currentName = core.status.flatMap { status in
-            status.auto == nil ? status.policy.selected : status.auto?.node
-        }
+        let currentName = core.status?.currentOutbound
         let current = core.status?.nodes.first(where: { $0.name == currentName })?.probeIdentity
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
             HStack(alignment: .center) {
                 HopPageHeading(title: "节点", detail: rows.count == core.configuredNodes.count
                                ? "\(rows.count) 个节点" : "显示 \(rows.count) / \(core.configuredNodes.count) 个节点")
                 Spacer()
                 Menu {
-                    Button("输入链接…", action: importLink)
+                    if !core.configuredNodes.isEmpty { Button("导入节点…", action: importLink) }
                     Button("从剪贴板导入", action: core.importClipboard)
+                    Button("刷新节点", action: core.refreshNodes)
+                        .disabled(core.refreshing || core.probeTotal > 0 || (core.configuredNodes.isEmpty && core.subscriptions.isEmpty))
                 } label: {
-                    Label("导入节点", systemImage: "square.and.arrow.down")
+                    Image(systemName: "ellipsis.circle")
                 }
+                .menuStyle(.borderlessButton)
                 .fixedSize()
+                .accessibilityLabel("其他节点操作")
                 .disabled(core.saving)
-                Button(action: core.refreshNodes) {
-                    Label("刷新节点", systemImage: "arrow.clockwise")
-                }
-                .disabled(core.saving || core.refreshing || core.probeTotal > 0 || (core.configuredNodes.isEmpty && core.subscriptions.isEmpty))
-                if core.probeTotal > 0 {
-                    Button("停止测速", action: core.cancelProbe)
+                if core.configuredNodes.isEmpty {
+                    Button("导入节点…", action: importLink)
+                        .buttonStyle(HopPrimaryButton())
+                        .disabled(core.saving)
+                } else if core.probeTotal > 0 {
+                    Button("停止测速", action: core.cancelProbe).buttonStyle(HopPrimaryButton())
                 } else {
                     Button {
                         sortByLatency = true
@@ -176,36 +179,43 @@ struct NodeDashboard: View {
                         Label("一键测速", systemImage: "gauge.with.dots.needle.67percent")
                     }
                     .buttonStyle(HopPrimaryButton())
-                    .disabled(core.configuredNodes.isEmpty || core.saving)
+                    .disabled(core.saving)
                 }
             }
             if !core.configuredNodes.isEmpty {
-                HStack {
+                HStack(spacing: 10) {
                     HopSearchField(placeholder: "搜索节点、协议或订阅", text: $filter)
-                        .frame(minWidth: 140, idealWidth: 210, maxWidth: 245)
+                        .frame(minWidth: 140, idealWidth: 230, maxWidth: 300)
                     if !providers.isEmpty {
-                        Picker("订阅来源", selection: $providerID) {
+                        HopSelectionMenu(title: "订阅来源",
+                                         value: providers.first { $0.id == providerID }?.name ?? "全部订阅",
+                                         labelWidth: 90, selection: $providerID) {
                             Text("全部订阅").tag(String?.none)
                             ForEach(providers) { provider in
                                 Text(provider.name).tag(Optional(provider.id))
                             }
                         }
-                        .labelsHidden()
-                        .accessibilityLabel("订阅来源")
-                        .frame(maxWidth: 145)
                     }
-                    Picker("节点状态", selection: $stateFilter) {
-                        ForEach(StateFilter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    Button {
+                        showsFilters.toggle()
+                    } label: {
+                        Label(stateFilter != .all || showUnavailable ? "筛选中" : "筛选", systemImage: "line.3.horizontal.decrease")
                     }
-                    .labelsHidden()
                     .fixedSize()
-                    Spacer()
-                    if !core.hiddenNodes.isEmpty {
-                        Toggle("显示暂不可用（\(core.hiddenNodes.count)）", isOn: $showUnavailable)
-                            .toggleStyle(.checkbox)
+                    .popover(isPresented: $showsFilters, arrowEdge: .bottom) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Picker("节点状态", selection: $stateFilter) {
+                                ForEach(StateFilter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                            }
+                            Toggle("按延迟排序", isOn: $sortByLatency)
+                            if !core.hiddenNodes.isEmpty {
+                                Toggle("显示暂不可用（\(core.hiddenNodes.count)）", isOn: $showUnavailable)
+                            }
+                        }
+                        .padding(16)
+                        .frame(minWidth: 205)
                     }
-                    Toggle("按延迟排序", isOn: $sortByLatency)
-                        .toggleStyle(.checkbox)
+                    Spacer()
                 }
             }
             if core.probeTotal > 0 {
@@ -215,13 +225,16 @@ struct NodeDashboard: View {
                     total: Double(core.probeTotal)
                 )
             }
-            if core.configuredNodes.isEmpty {
+            if core.configuredProfile == nil && !core.profileReadFailed {
+                ProgressView("正在读取节点…").frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if core.profileReadFailed && core.configuredNodes.isEmpty {
+                ContentUnavailableView("无法读取节点", systemImage: "exclamationmark.circle",
+                                       description: Text("可以在设置中检查已保存的配置。"))
+            } else if core.configuredNodes.isEmpty {
                 ContentUnavailableView {
                     Label("还没有节点", systemImage: "point.3.connected.trianglepath.dotted")
                 } description: {
                     Text("导入订阅后，节点和测速状态会显示在这里。")
-                } actions: {
-                    Button("导入链接…", action: importLink).disabled(core.saving)
                 }
             } else if rows.isEmpty {
                 ContentUnavailableView(
@@ -255,47 +268,60 @@ struct NodeDashboard: View {
                                     .accessibilityLabel("当前选定出站")
                             }
                         }
-                    }.width(min: 155, ideal: 265)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(TapGesture(count: 2).onEnded { core.connectToNode(node.name) })
+                        .accessibilityAction(named: Text("连接此节点")) { core.connectToNode(node.name) }
+                    }.width(min: 155, ideal: 212)
                     TableColumn("协议") {
                         Text($0.node.type.uppercased())
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
-                    }.width(min: 70, ideal: 84)
+                            .lineLimit(1)
+                            .help($0.node.type.uppercased())
+                    }.width(71)
                     TableColumn("订阅") { row in
                         Text(row.provider ?? "本地").lineLimit(1)
                             .foregroundStyle(.secondary)
                             .help(row.provider ?? "本地节点")
-                    }.width(min: 58, ideal: 105)
-                    TableColumn("状态") { row in statusCell(row) }.width(min: 72, ideal: 86)
+                    }.width(92)
+                    TableColumn("状态") { row in statusCell(row) }.width(82)
                     TableColumn("延迟") { row in
                         if row.rank == 0, let milliseconds = row.result?.milliseconds {
                             Text("\(milliseconds) ms").monospacedDigit()
                         } else {
                             Text("—").foregroundStyle(.secondary)
                         }
-                    }.width(min: 64, ideal: 78)
+                    }.width(61)
                     TableColumn("操作") { row in
                         Button("测速") {
                             sortByLatency = true
                             core.testNodes(row.node.name)
                         }
                         .buttonStyle(.borderless)
+                        .accessibilityLabel("测速 \(row.node.name)")
                         .disabled(core.probeTotal > 0 || core.saving)
-                    }.width(62)
+                    }.width(54)
                 }
+                .alternatingRowBackgrounds(rows.count < 8 ? .disabled : .enabled)
+                .frame(maxHeight: rows.count < 8 ? CGFloat(37 + 24 * rows.count) : .infinity)
                 .contextMenu(forSelectionType: String.self) { selection in
                     if selection.count == 1, let id = selection.first, let node = rows.first(where: { $0.id == id })?.node {
                         Button("连接此节点") { core.connectToNode(node.name) }
                             .disabled(!core.canConnectToNode)
                     }
-                } primaryAction: { selection in
-                    if selection.count == 1, let id = selection.first, let node = rows.first(where: { $0.id == id })?.node {
-                        core.connectToNode(node.name)
-                    }
                 }
-                Text("双击节点即可连接。将鼠标移到状态上可查看测试来源、时间和失败原因。")
+                .onKeyPress(.return) {
+                    guard core.canConnectToNode, let node = rows.first(where: { $0.id == selectedNode })?.node else {
+                        return .ignored
+                    }
+                    core.connectToNode(node.name)
+                    return .handled
+                }
+                Text("双击节点名称即可连接。悬停状态可查看测速详情。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if rows.count < 8 { Spacer(minLength: 0) }
             }
         }
         .onChange(of: providers.map(\.id)) { _, ids in
@@ -312,7 +338,7 @@ struct NodeDashboard: View {
                     let historical = result.isHistorical(at: timeline.date)
                     let symbol = result.isAvailable ? "checkmark.circle.fill" : result.isFailure ? "exclamationmark.circle" : "questionmark.circle"
                     Label(historical ? "历史结果" : result.status, systemImage: historical ? "clock.arrow.circlepath" : symbol)
-                        .foregroundStyle(historical ? .secondary : result.isAvailable ? HopAppearance.accent : result.isFailure ? .orange : .secondary)
+                        .foregroundStyle(historical ? .secondary : result.isAvailable ? HopAppearance.accent : result.isFailure ? HopAppearance.warning : .secondary)
                         .help(result.explanation(at: timeline.date))
                 }
             } else {

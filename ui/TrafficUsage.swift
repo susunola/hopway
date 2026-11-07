@@ -50,7 +50,8 @@ struct TrafficRate: Equatable {
     let download: Double
 
     static func label(_ bytesPerSecond: Double) -> String {
-        trafficBytes(UInt64(min(bytesPerSecond.rounded(), Double(Int64.max)))) + "/s"
+        let bytes = UInt64(min(bytesPerSecond.rounded(), Double(Int64.max)))
+        return bytes == 0 ? "0 KB/s" : trafficBytes(bytes) + "/s"
     }
 }
 
@@ -59,9 +60,9 @@ struct TrafficDashboard: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
                 HopPageHeading(title: "用量", detail: "监测本机经过 HopWay 的流量")
-                liveMonitor.hopPanel()
+                liveMonitor.hopPanel(verticalPadding: 10)
                 LocalTrafficView(history: core.trafficHistory, subscriptions: core.subscriptions)
                     .hopPanel()
             }
@@ -72,30 +73,27 @@ struct TrafficDashboard: View {
     private var liveMonitor: some View {
         let running = core.phase == .running
         let rate = running ? core.liveTraffic : nil
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Label("实时流量", systemImage: "waveform.path").font(.headline)
+        return HStack(spacing: 18) {
+            Label("实时流量", systemImage: "waveform.path").font(.headline)
+            if let rate {
                 Spacer()
-                Text(rate != nil ? "监测中" : running ? "等待采样" : core.phase.rawValue)
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(rate != nil ? HopAppearance.accent : Color.secondary)
-            }
-            HStack(spacing: 28) {
-                liveMetric("下载速率", rate?.download)
-                liveMetric("上传速率", rate?.upload)
+                liveMetric("下载", rate.download)
+                liveMetric("上传", rate.upload)
+            } else {
                 Spacer()
+                Text(running ? "等待流量数据" : core.phase.rawValue)
+                    .font(.callout).foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func liveMetric(_ title: String, _ rate: Double?) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+    private func liveMetric(_ title: String, _ rate: Double) -> some View {
+        HStack(spacing: 6) {
             Text(title).font(.caption).foregroundStyle(.secondary)
-            Text(rate.map(TrafficRate.label) ?? "—")
-                .font(.system(.title2, design: .rounded).weight(.semibold).monospacedDigit())
+            Text(TrafficRate.label(rate)).font(.callout.weight(.semibold).monospacedDigit())
         }
-        .frame(maxWidth: 148, alignment: .leading)
+        .frame(width: 132, alignment: .leading)
     }
 }
 
@@ -200,8 +198,8 @@ struct LocalTrafficView: View {
                 .labelsHidden()
                 .frame(width: 205)
             }
-            HStack(spacing: 12) {
-                Picker("来源", selection: $source) {
+            HStack(alignment: .bottom, spacing: 12) {
+                historyFilter("来源", value: sourceLabel, selection: $source) {
                     Text("全部出站").tag(Source.all)
                     Text("仅直连").tag(Source.direct)
                     Text("仅代理节点").tag(Source.proxy)
@@ -209,23 +207,30 @@ struct LocalTrafficView: View {
                         Text(subscription.name).tag(Source.subscription(subscription.id))
                     }
                 }
-                .frame(maxWidth: 205)
-                Picker("节点", selection: $node) {
+                historyFilter("节点", value: node.map { $0 == "DIRECT" ? "直连" : NodeLocation(name: $0).title } ?? "全部节点",
+                              selection: $node) {
                     Text("全部节点").tag(String?.none)
                     ForEach(data.eligibleNodes, id: \.self) { name in
-                        Text(name == "DIRECT" ? "DIRECT（直连）" : NodeLocation(name: name).title)
+                        Text(name == "DIRECT" ? "直连" : NodeLocation(name: name).title)
                             .tag(Optional(name))
                     }
                 }
-                .frame(maxWidth: 235)
                 .disabled(data.eligibleNodes.isEmpty)
+                if source != .all || node != nil {
+                    Button("清除筛选") {
+                        source = .all
+                        node = nil
+                    }
+                    .fixedSize()
+                }
             }
-            HStack(spacing: 28) {
+            .font(.callout)
+            Divider()
+            HStack(spacing: 16) {
                 metric("合计", data.total.total)
                 metric("下载", data.total.download)
                 metric("上传", data.total.upload)
                 metric("日均", data.total.total / UInt64(max(data.days.count, 1)))
-                Spacer()
             }
             if data.total.total > 0 {
                 TrafficTrendChart(days: data.days, height: 138)
@@ -249,38 +254,69 @@ struct LocalTrafficView: View {
         }
     }
 
+    private var sourceLabel: String {
+        switch source {
+        case .all: "全部出站"
+        case .direct: "仅直连"
+        case .proxy: "仅代理节点"
+        case .subscription(let id): subscriptions.first { $0.id == id }?.name ?? "订阅"
+        }
+    }
+
+    private func historyFilter<Value: Hashable, Options: View>(
+        _ title: String, value: String, selection: Binding<Value>, @ViewBuilder options: () -> Options
+    ) -> some View {
+        HopLabeledControl(title: title) {
+            HopSelectionMenu(title: title, value: value, labelWidth: 132, selection: selection, options: options)
+        }
+        .frame(width: 170, alignment: .leading)
+    }
+
     private func metric(_ title: String, _ count: UInt64) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title).font(.caption).foregroundStyle(.secondary)
             Text(trafficBytes(count)).font(.system(.title2, design: .rounded).weight(.semibold).monospacedDigit())
+                .lineLimit(1).minimumScaleFactor(0.85)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func breakdown(_ nodes: [Node], total: UInt64) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("按节点").font(.callout.weight(.semibold)).foregroundStyle(.secondary)
-            ForEach(nodes) { node in
-                let ratio = Double(node.count.total) / Double(total)
-                HStack(spacing: 12) {
-                    Text(node.name == "DIRECT" ? "DIRECT" : NodeLocation(name: node.name).title)
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .help(node.name)
-                    Text(node.provider)
-                        .lineLimit(1)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 98, alignment: .leading)
-                    ProgressView(value: ratio)
-                        .tint(node.name == "DIRECT" ? .gray : HopAppearance.accent)
-                        .frame(maxWidth: 135)
-                        .accessibilityHidden(true)
-                    Text(trafficBytes(node.count.total)).monospacedDigit().frame(width: 87, alignment: .trailing)
-                    Text(ratio.formatted(.percent.precision(.fractionLength(0))))
-                        .monospacedDigit().foregroundStyle(.secondary).frame(width: 42, alignment: .trailing)
+            ForEach(nodes.prefix(5)) { usageRow($0, total: total) }
+            if nodes.count > 5 {
+                DisclosureGroup("还有 \(nodes.count - 5) 个节点") {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(nodes.dropFirst(5)) { usageRow($0, total: total) }
+                    }
+                    .padding(.top, 6)
                 }
                 .font(.callout)
             }
         }
+    }
+
+    private func usageRow(_ node: Node, total: UInt64) -> some View {
+        let ratio = Double(node.count.total) / Double(total)
+        return HStack(spacing: 12) {
+            Text(node.name == "DIRECT" ? "直连" : NodeLocation(name: node.name).title)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(node.name)
+            Text(node.provider)
+                .lineLimit(1)
+                .foregroundStyle(.secondary)
+                .frame(width: 98, alignment: .leading)
+            ProgressView(value: ratio)
+                .tint(node.name == "DIRECT" ? .gray : HopAppearance.accent)
+                .frame(maxWidth: 135)
+                .accessibilityHidden(true)
+            Text(trafficBytes(node.count.total)).monospacedDigit().frame(width: 87, alignment: .trailing)
+            Text(ratio.formatted(.percent.precision(.fractionLength(0))))
+                .monospacedDigit().foregroundStyle(.secondary).frame(width: 42, alignment: .trailing)
+        }
+        .font(.callout)
     }
 }
 

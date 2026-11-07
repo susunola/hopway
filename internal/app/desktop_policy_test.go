@@ -254,3 +254,31 @@ func TestDesktopPolicyPreservesExplicitConfigAndStableSelection(t *testing.T) {
 		t.Fatalf("missing saved node selected a different proxy: %s", selected)
 	}
 }
+
+func TestSaveDesktopPresetChangesOnlyNextStartupPolicy(t *testing.T) {
+	dir := t.TempDir()
+	path, cache := filepath.Join(dir, "config.json"), filepath.Join(dir, "cache")
+	config := engine.Default()
+	config.Rules = []engine.Rule{{Type: engine.RuleDomain, Value: "local.test", Via: "DIRECT"}}
+	document, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, document, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"fastest", "direct", "rule"} {
+		if err := SaveDesktopMode(context.Background(), path, cache, mode, backend.Native{}); err != nil {
+			t.Fatal(err)
+		}
+		if got := DesktopStartupPolicy(profile.Loaded{User: config, Merged: config}, cache); got.Mode != mode {
+			t.Fatalf("saved mode %q, want %q", got.Mode, mode)
+		}
+	}
+	if err := SaveDesktopMode(context.Background(), path, cache, "auto", backend.Native{}); err == nil {
+		t.Fatal("accepted regional routing without a region")
+	}
+	if saved, err := os.ReadFile(path); err != nil || !bytes.Equal(saved, document) {
+		t.Fatalf("the preset changed the user configuration: %v", err)
+	}
+}
