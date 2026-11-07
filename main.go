@@ -52,6 +52,9 @@ func main() {
 	refresh := flag.Bool("refresh-subscriptions", false, "refresh saved subscriptions without starting the proxy")
 	previewImport := flag.Bool("preview-import", false, "preview a subscription or profile from stdin without writing it")
 	importInput := flag.Bool("import", false, "read a subscription URL or profile from stdin and print converted JSON")
+	commitImport := flag.Bool("commit-import", false, "import from stdin and atomically update the configuration")
+	saveConfig := flag.Bool("save-config", false, "validate and atomically replace the configuration with JSON from stdin")
+	expectedRevision := flag.String("expected-revision", "", "original configuration SHA-256, or missing for a new file")
 	tunHelper := flag.String("tun-helper", "", "internal: create the TUN device as root and hand it to the core over this socket")
 	tunIPv6 := flag.Bool("tun-ipv6", false, "internal: give the helper's TUN device an IPv6 address and route")
 	tunMTU := flag.Uint("tun-mtu", 0, "internal: MTU for the helper's TUN device")
@@ -93,10 +96,24 @@ func main() {
 		}
 		return
 	}
+	if *saveConfig || *commitImport {
+		err := writeProfile(*path, *expectedRevision, *commitImport)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			if errors.Is(err, profile.ErrConfigurationChanged) {
+				os.Exit(3)
+			}
+			os.Exit(1)
+		}
+		return
+	}
 	if *importInput || *previewImport {
 		result, err := runImport(*path, *previewImport)
 		if err == nil {
 			if *previewImport {
+				if result.Notes == nil {
+					result.Notes = []string{}
+				}
 				err = json.NewEncoder(os.Stdout).Encode(struct {
 					Added   int      `json:"added"`
 					Skipped int      `json:"skipped"`
@@ -121,6 +138,37 @@ func main() {
 	}
 }
 
+func writeProfile(path, expected string, importing bool) error {
+	data, err := readProfileInput(os.Stdin)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	output := json.NewEncoder(os.Stdout)
+	if importing {
+		raw := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
+		result, err := profile.CommitImport(ctx, path, dataDir(path), expected, raw, backend.Default())
+		if err != nil {
+			return err
+		}
+		return output.Encode(result)
+	}
+	revision, err := profile.CommitConfig(ctx, path, dataDir(path), expected, data, backend.Default())
+	if err != nil {
+		return err
+	}
+	return output.Encode(map[string]string{"revision": revision})
+}
+
+func readProfileInput(input io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(input, importer.MaxSize+1))
+	if err == nil && len(data) > importer.MaxSize {
+		err = errors.New("输入超过 1 MB")
+	}
+	return data, err
+}
+
 // runImport converts pasted input. A subscription URL becomes a subscription
 // entry (its nodes are cached and refreshed automatically); anything else is
 // merged into the configuration as before.
@@ -132,12 +180,9 @@ func runImport(path string, preview bool) (importer.Result, error) {
 	if err != nil {
 		return importer.Result{}, err
 	}
-	data, err := io.ReadAll(io.LimitReader(os.Stdin, importer.MaxSize+1))
+	data, err := readProfileInput(os.Stdin)
 	if err != nil {
 		return importer.Result{}, err
-	}
-	if len(data) > importer.MaxSize {
-		return importer.Result{}, errors.New("导入内容过大")
 	}
 	raw := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
 	impl := backend.Default()
@@ -452,9 +497,9 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	// Reload applies a saved configuration without restarting: open
 	// connections stay on the previous engine until they finish.
 	router.HandleFunc("POST /reload", func(writer http.ResponseWriter, request *http.Request) {
-		if err := supervisor.Reload(); err != nil {
+		if err := supervisor.ReloadRevision(request.Header.Get("X-HopWay-Revision")); err != nil {
 			status := http.StatusBadRequest
-			if errors.Is(err, app.ErrPortsChanged) {
+			if errors.Is(err, app.ErrPortsChanged) || errors.Is(err, profile.ErrConfigurationChanged) {
 				status = http.StatusConflict
 			}
 			http.Error(writer, err.Error(), status)
@@ -540,7 +585,7 @@ func inspectProfile(path string, inspect, probe, refresh bool, names []string, r
 			if sub.Paused || (refreshID != "" && sub.Key() != refreshID) {
 				continue
 			}
-			_, err := profile.RefreshSnapshot(ctx, loaded.User, sub, dir, impl, nil)
+			_, err := profile.RefreshSnapshot(ctx, loaded.User, sub, path, dir, impl, nil)
 			if err != nil {
 				failed++
 			} else {
@@ -565,11 +610,12 @@ func inspectProfile(path string, inspect, probe, refresh bool, names []string, r
 			SystemProxy    bool                  `json:"systemProxy"`
 			TUNEnabled     bool                  `json:"tunEnabled"`
 			SnapshotAt     map[string]int64      `json:"snapshotAt,omitempty"`
+			Revision       string                `json:"revision"`
 		}
 		config := loaded.Merged
 		result := summary{
 			Subs: config.Subscriptions, Groups: config.Groups, RuleCount: len(config.Rules),
-			Mode: config.Mode, Selected: config.Selected, Backend: impl.Name(), SnapshotAt: loaded.SnapshotUpdated,
+			Mode: config.Mode, Selected: config.Selected, Backend: impl.Name(), SnapshotAt: loaded.SnapshotUpdated, Revision: loaded.Revision,
 			SOCKSPort: config.SOCKSPort, HTTPPort: config.HTTPPort,
 			SystemProxy: config.SystemProxy, TUNEnabled: config.TUN != nil && config.TUN.Enabled,
 		}

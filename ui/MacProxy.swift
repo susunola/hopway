@@ -85,6 +85,7 @@ private struct Dashboard: View {
     @State private var importError: String?
     @State private var previewing = false
     @State private var showsConfigurationEditor = false
+    @State private var confirmsDiskVersion = false
     @State private var advancedDraft: AdvancedSettingsDraft?
 
     var body: some View {
@@ -522,7 +523,15 @@ private struct Dashboard: View {
         let profile = core.configuredProfile
         let backend = [profile?.backend, profile?.backendVersion].compactMap { $0 }.joined(separator: " ")
         return VStack(alignment: .leading, spacing: 9) {
-            Label("监听与内核", systemImage: "cpu").font(.headline)
+            HStack {
+                Label("监听与内核", systemImage: "cpu").font(.headline)
+                Spacer()
+                Button("读取磁盘版本") {
+                    if core.changed { showsConfigurationEditor = true }
+                    else { core.readDiskConfiguration() }
+                }
+                .disabled(core.saving)
+            }
             if let profile {
                 HStack(spacing: 18) {
                     LabeledContent("SOCKS5", value: portLabel(profile.socksPort, running: core.endpoint?.socks, applied: core.appliedPorts?.socks))
@@ -530,6 +539,14 @@ private struct Dashboard: View {
                 }
                 .monospacedDigit()
                 if !backend.isEmpty { LabeledContent("内核后端", value: backend) }
+                if let revision = profile.revision {
+                    LabeledContent("磁盘配置版本") { revisionLabel(revision) }
+                }
+                if let revision = core.status?.revision, core.phase == .running {
+                    LabeledContent(core.status?.profileFallback == true ? "运行版本 · 已回退" : "运行配置版本") {
+                        revisionLabel(revision)
+                    }
+                }
                 if let applied = core.status?.reloaded {
                     LabeledContent("配置应用时间", value: Date(timeIntervalSince1970: applied / 1000)
                         .formatted(date: .abbreviated, time: .shortened))
@@ -544,10 +561,28 @@ private struct Dashboard: View {
                 Label("读取已保存的配置失败", systemImage: "exclamationmark.circle")
                     .foregroundStyle(.orange)
             }
+            if core.configurationConflict {
+                Label("磁盘配置已有新版本，请读取并核对后再保存。", systemImage: "arrow.trianglehead.clockwise.rotate.90")
+                    .foregroundStyle(.orange)
+            }
         }
         .font(.callout)
         .frame(maxWidth: .infinity, alignment: .leading)
         .hopPanel()
+    }
+
+    private func revisionLabel(_ revision: String) -> some View {
+        Text(revision == "missing" ? "默认配置" : String(revision.prefix(12)))
+            .font(.system(.callout, design: .monospaced))
+            .help(revision == "missing" ? "内核默认配置" : revision)
+    }
+
+    private func requestDiskVersion() {
+        if core.changed {
+            confirmsDiskVersion = true
+        } else {
+            core.readDiskConfiguration()
+        }
     }
 
     private func portLabel(_ configured: Int?, running: String?, applied: Int?) -> String {
@@ -572,6 +607,9 @@ private struct Dashboard: View {
             }
             HStack {
                 Button("打开 JSON", action: core.importDraft).disabled(core.saving)
+                if core.configurationConflict || core.changed {
+                    Button("读取磁盘版本", action: requestDiskVersion).disabled(core.saving)
+                }
                 Menu("插入节点模板") {
                     ForEach(["socks5", "http", "https", "trojan", "shadowsocks", "anytls", "vless", "vmess"], id: \.self) { type in
                         Button(type) { core.insertTemplate(type) }
@@ -581,7 +619,7 @@ private struct Dashboard: View {
                 Button("还原草稿") { core.draft = core.saved }.disabled(core.saving || !core.changed)
                 Button(core.saving ? "正在校验…" : "校验并保存", action: core.save)
                     .buttonStyle(HopPrimaryButton())
-                    .disabled(core.saving || !core.changed)
+                    .disabled(core.saving || !core.changed || core.configurationConflict)
             }
             TextEditor(text: $core.draft)
                 .disabled(core.saving)
@@ -598,5 +636,15 @@ private struct Dashboard: View {
         }
         .padding(20)
         .frame(width: 650, height: 395)
+        .confirmationDialog("读取磁盘配置", isPresented: $confirmsDiskVersion, titleVisibility: .visible) {
+            Button("复制草稿并读取") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(core.draft, forType: .string)
+                core.readDiskConfiguration()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("可以先复制当前草稿，再读取并比较磁盘版本。")
+        }
     }
 }

@@ -197,7 +197,7 @@ struct AdvancedSettingsPanel: View {
                     Button(core.saving ? "正在校验…" : "保存高级配置", action: save)
                         .buttonStyle(HopPrimaryButton())
                         .keyboardShortcut("s", modifiers: .command)
-                        .disabled(!fields.wrappedValue.changed || core.saving || fields.wrappedValue.source != core.saved)
+                        .disabled(!fields.wrappedValue.changed || core.saving || core.configurationConflict || fields.wrappedValue.source != core.saved)
                 }
             } else {
                 Text("无法读取已保存的配置。可以打开 JSON 编辑器修复。").foregroundStyle(.secondary)

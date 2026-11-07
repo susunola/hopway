@@ -57,12 +57,14 @@ type TUNStatus struct {
 
 type Status struct {
 	engine.Status
-	SystemProxy   SystemProxyStatus    `json:"systemProxy"`
-	TUN           TUNStatus            `json:"tun"`
-	Network       []netmon.Event       `json:"network,omitempty"` // recent changes, newest last
-	Warnings      []string             `json:"warnings,omitempty"`
-	Subscriptions []SubscriptionStatus `json:"subscriptions,omitempty"`
-	Reloaded      int64                `json:"reloaded,omitempty"` // unix ms of the running configuration
+	SystemProxy     SystemProxyStatus    `json:"systemProxy"`
+	TUN             TUNStatus            `json:"tun"`
+	Network         []netmon.Event       `json:"network,omitempty"` // recent changes, newest last
+	Warnings        []string             `json:"warnings,omitempty"`
+	Subscriptions   []SubscriptionStatus `json:"subscriptions,omitempty"`
+	Reloaded        int64                `json:"reloaded,omitempty"` // unix ms of the running configuration
+	Revision        string               `json:"revision,omitempty"`
+	ProfileFallback bool                 `json:"profileFallback,omitempty"`
 }
 
 type Supervisor struct {
@@ -156,6 +158,7 @@ var SystemProxySupported = runtime.GOOS == "darwin"
 
 // readSnapshotMeta caches snapshot sizes so Status never touches the disk.
 func (s *Supervisor) readSnapshotMeta() {
+	s.subMeta = make(map[string]SubscriptionStatus, len(s.loaded.User.Subscriptions))
 	for _, sub := range s.loaded.User.Subscriptions {
 		if snapshot, err := profile.LoadSnapshot(s.dataDir, sub); err == nil {
 			s.subMeta[sub.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated, Checked: snapshot.CheckedAt(), Usage: snapshot.Usage}
@@ -476,18 +479,32 @@ var ErrPortsChanged = errors.New("监听端口已修改")
 // Reload re-reads the profile and swaps in a new engine. New connections use
 // it at once; open ones finish on the old engine.
 func (s *Supervisor) Reload() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.reloadLocked()
+	return s.ReloadRevision("")
 }
 
-func (s *Supervisor) reloadLocked() error {
+func (s *Supervisor) ReloadRevision(expected string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reloadLocked(expected)
+}
+
+func (s *Supervisor) reloadLocked(expected string) error {
 	if s.closing {
 		return net.ErrClosed
+	}
+	if s.path != "" && s.dataDir != "" {
+		release, err := profile.LockWrites(s.dataDir)
+		if err != nil {
+			return err
+		}
+		defer release()
 	}
 	loaded, err := profile.Check(s.path, s.dataDir, s.validate)
 	if err != nil {
 		return err
+	}
+	if expected != "" && expected != loaded.Revision {
+		return profile.ErrConfigurationChanged
 	}
 	old := s.current.Load()
 	running := s.loaded.Merged
@@ -506,14 +523,14 @@ func (s *Supervisor) reloadLocked() error {
 		}
 		core.Restore(state)
 	}
+	if err := profile.SaveLastGood(s.path, s.dataDir, &loaded); err != nil {
+		loaded.Warnings = append(loaded.Warnings, "无法保存回滚配置")
+	}
 	s.loaded = loaded
 	s.readSnapshotMeta()
 	s.subReloadPending = false
 	s.started = time.Now()
 	s.current.Store(core)
-	if err := profile.SaveLastGood(s.path, s.dataDir, loaded.User); err != nil {
-		s.loaded.Warnings = append(s.loaded.Warnings, "无法保存回滚配置")
-	}
 	if old != nil {
 		old.BeginDrain()
 		s.retiring.Add(1)
@@ -543,9 +560,9 @@ func retire(ctx context.Context, old *engine.Engine) {
 }
 
 func (s *Supervisor) Status() Status {
-	status := Status{Status: s.current.Load().Status()}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	core := s.current.Load()
+	status := Status{Revision: s.loaded.Revision, ProfileFallback: s.loaded.Fallback}
 	status.Warnings = s.loaded.Warnings
 	status.SystemProxy = SystemProxyStatus{Supported: SystemProxySupported, Enabled: s.proxy.Enabled(),
 		Error: s.proxyErr, Recovered: s.recovered}
@@ -561,6 +578,10 @@ func (s *Supervisor) Status() Status {
 		entry := s.subMeta[sub.URL]
 		entry.Name, entry.ID, entry.Alias, entry.Error = sub.Name, sub.Key(), sub.Alias, s.subErr[sub.Name]
 		status.Subscriptions = append(status.Subscriptions, entry)
+	}
+	s.mu.Unlock()
+	if core != nil {
+		status.Status = core.Status()
 	}
 	return status
 }
@@ -649,15 +670,19 @@ func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id st
 			s.mu.Unlock()
 			break
 		}
-		current, exists := s.currentSubscription(sub)
+		current, exists := profile.ActiveSubscription(s.loaded.User, sub)
 		if !exists {
 			s.mu.Unlock()
 			continue
 		}
 		if err == nil {
 			var changed bool
-			changed, err = profile.CommitRefresh(s.loaded.User, current, refresh, s.dataDir, s.impl)
+			changed, err = profile.CommitRefresh(ctx, s.loaded.User, current, refresh, s.path, s.dataDir, s.impl)
 			s.subReloadPending = s.subReloadPending || changed
+		}
+		if errors.Is(err, profile.ErrRefreshSourceChanged) {
+			s.mu.Unlock()
+			continue
 		}
 		if err != nil {
 			s.subErr[current.Name] = err.Error()
@@ -671,24 +696,13 @@ func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.subReloadPending && !s.closing {
-		if err := s.reloadLocked(); err != nil {
+		if err := s.reloadLocked(""); err != nil {
 			warning := "订阅已更新，但新配置无法应用：" + err.Error()
 			if len(s.loaded.Warnings) == 0 || s.loaded.Warnings[len(s.loaded.Warnings)-1] != warning {
 				s.loaded.Warnings = append(s.loaded.Warnings, warning)
 			}
 		}
 	}
-}
-
-// currentSubscription is called with mu held. A rename does not invalidate
-// the download, but replacing or pausing the source does.
-func (s *Supervisor) currentSubscription(previous engine.Subscription) (engine.Subscription, bool) {
-	for _, current := range s.loaded.User.Subscriptions {
-		if !current.Paused && current.Key() == previous.Key() && current.URL == previous.URL && current.Agent == previous.Agent {
-			return current, true
-		}
-	}
-	return engine.Subscription{}, false
 }
 
 func (s *Supervisor) autoPolicyPath() string {

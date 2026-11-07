@@ -188,7 +188,7 @@ func TestSubscriptionRefreshSharesConnectionAndPreservesUnchangedEngine(t *testi
 		burst.Go(func() { s.RefreshSubscription(context.Background(), a.Key()) })
 	}
 	burst.Wait()
-	if _, err := profile.RefreshSnapshot(context.Background(), cfg, a, cache, backend.Native{}, nil); err == nil {
+	if _, err := profile.RefreshSnapshot(context.Background(), cfg, a, "", cache, backend.Native{}, nil); err == nil {
 		t.Fatal("offline refresh did not observe the saved Retry-After")
 	}
 	kept, _ := os.ReadFile(profile.SnapshotPath(cache, a))

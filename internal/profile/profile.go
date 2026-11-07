@@ -39,9 +39,25 @@ func (snapshot *Snapshot) CheckedAt() int64 {
 	return max(snapshot.Checked, snapshot.Updated)
 }
 
-func SnapshotPath(dataDir string, sub engine.Subscription) string {
+func subscriptionCacheStem(dataDir string, sub engine.Subscription) string {
 	sum := sha256.Sum256([]byte(sub.URL))
-	return filepath.Join(dataDir, "subscriptions", hex.EncodeToString(sum[:8])+".json")
+	return filepath.Join(dataDir, "subscriptions", hex.EncodeToString(sum[:8]))
+}
+
+func SnapshotPath(dataDir string, sub engine.Subscription) string {
+	stem := subscriptionCacheStem(dataDir, sub)
+	if sub.SnapshotKey != "" && validSnapshotKey(sub.SnapshotKey) {
+		stem += "-" + sub.SnapshotKey
+	}
+	return stem + ".json"
+}
+
+func validSnapshotKey(key string) bool {
+	if len(key) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(key)
+	return err == nil
 }
 
 func LoadSnapshot(dataDir string, sub engine.Subscription) (*Snapshot, error) {
@@ -57,7 +73,7 @@ func LoadSnapshot(dataDir string, sub engine.Subscription) (*Snapshot, error) {
 }
 
 func SaveSnapshot(dataDir string, sub engine.Subscription, snapshot *Snapshot) error {
-	release, err := lockSnapshots(dataDir)
+	release, err := LockWrites(dataDir)
 	if err != nil {
 		return err
 	}
@@ -294,6 +310,8 @@ type Loaded struct {
 	// SnapshotUpdated is keyed by subscription ID and uses Unix milliseconds.
 	SnapshotUpdated map[string]int64
 	Fallback        bool // the user's file was broken; the last good copy is in use
+	Revision        string
+	document        []byte
 }
 
 func lastGoodPath(dataDir string) string { return filepath.Join(dataDir, "last-good.json") }
@@ -302,9 +320,19 @@ func lastGoodPath(dataDir string) string { return filepath.Join(dataDir, "last-g
 // file is unreadable or invalid and a last good copy exists, that copy is
 // used instead and the problem is reported as a warning.
 func Load(path, dataDir string, validate func(engine.Config) error) (Loaded, error) {
+	if path != "" && dataDir != "" {
+		release, err := LockWrites(dataDir)
+		if err != nil {
+			return Loaded{}, err
+		}
+		defer release()
+	}
 	loaded, err := load(path, dataDir, validate)
 	if err == nil {
-		SaveLastGood(path, dataDir, loaded.User)
+		if err := SaveLastGood(path, dataDir, &loaded); err != nil {
+			loaded.Warnings = append(loaded.Warnings, "无法保存回滚配置")
+		}
+		loaded.document = nil
 		return loaded, nil
 	}
 	if dataDir == "" {
@@ -315,18 +343,23 @@ func Load(path, dataDir string, validate func(engine.Config) error) (Loaded, err
 		return Loaded{}, err
 	}
 	fallback.Fallback = true
+	fallback.document = nil
 	fallback.Warnings = append([]string{"配置文件无效，正在使用上一次可用的配置：" + err.Error()}, fallback.Warnings...)
 	return fallback, nil
 }
 
 // SaveLastGood records the validated configuration used by the caller.
-func SaveLastGood(path, dataDir string, config engine.Config) error {
+func SaveLastGood(path, dataDir string, loaded *Loaded) error {
+	data := loaded.document
+	loaded.document = nil
 	if path == "" || dataDir == "" {
 		return nil
 	}
-	data, err := json.Marshal(config)
-	if err != nil {
-		return err
+	if data == nil {
+		var err error
+		if data, err = json.Marshal(loaded.User); err != nil {
+			return err
+		}
 	}
 	return engine.WriteAtomic(lastGoodPath(dataDir), data)
 }
@@ -337,20 +370,24 @@ func Check(path, dataDir string, validate func(engine.Config) error) (Loaded, er
 }
 
 func load(path, dataDir string, validate func(engine.Config) error) (Loaded, error) {
-	user := engine.Default()
-	if path != "" {
-		file, err := os.Open(path)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return Loaded{}, err
-		}
-		if err == nil {
-			user, err = engine.Decode(file)
-			file.Close()
-			if err != nil {
-				return Loaded{}, err
-			}
-		}
+	document, err := ReadDocument(path)
+	if err != nil {
+		return Loaded{}, err
 	}
+	if path == lastGoodPath(dataDir) && document.Bytes == nil {
+		return Loaded{}, os.ErrNotExist
+	}
+	user, err := document.Config()
+	if err != nil {
+		return Loaded{}, err
+	}
+	loaded, err := validateConfig(user, dataDir, validate, "", nil)
+	loaded.Revision, loaded.document = document.Revision, document.Bytes
+	return loaded, err
+}
+
+// validateConfig may use a staged snapshot that is still invisible to readers.
+func validateConfig(user engine.Config, dataDir string, validate func(engine.Config) error, stagedName string, staged *Snapshot) (Loaded, error) {
 	user.DataDir = dataDir
 	if n := user.SubscriptionRefreshMin; n != 0 && (n < 10 || n > 10080) {
 		return Loaded{}, errors.New("subscriptionRefreshMin must be between 10 and 10080")
@@ -362,7 +399,11 @@ func load(path, dataDir string, validate func(engine.Config) error) (Loaded, err
 	updated := map[string]int64{}
 	var warnings []string
 	for _, sub := range user.Subscriptions {
-		snapshot, err := LoadSnapshot(dataDir, sub)
+		snapshot := staged
+		var err error
+		if staged == nil || sub.Name != stagedName {
+			snapshot, err = LoadSnapshot(dataDir, sub)
+		}
 		if err != nil {
 			if !sub.Paused {
 				warnings = append(warnings, fmt.Sprintf("订阅「%s」还没有下载过", sub.Name))
@@ -392,6 +433,9 @@ func validateSubscriptions(subs []engine.Subscription) error {
 		}
 		if sub.Interval != 0 && sub.Interval < 600 {
 			return fmt.Errorf("subscription %q interval must be at least 600 seconds", sub.Name)
+		}
+		if sub.SnapshotKey != "" && !validSnapshotKey(sub.SnapshotKey) {
+			return fmt.Errorf("subscription %q snapshot key is invalid", sub.Name)
 		}
 	}
 	return nil

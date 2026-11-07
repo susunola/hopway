@@ -10,7 +10,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func lockSnapshots(dataDir string) (func(), error) {
+// LockWrites serializes changes to the profile and its subscription snapshots.
+func LockWrites(dataDir string) (func(), error) {
 	dir := filepath.Join(dataDir, "subscriptions")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err

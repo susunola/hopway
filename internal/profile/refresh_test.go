@@ -30,7 +30,7 @@ func TestConditionalRefreshCannotReplaceConcurrentImport(t *testing.T) {
 	sub := engine.Subscription{Name: "fixture", URL: server.URL}
 	cfg, dir, impl := engine.Default(), t.TempDir(), backend.Native{}
 	cfg.Subscriptions = []engine.Subscription{sub}
-	first, err := RefreshSnapshot(context.Background(), cfg, sub, dir, impl, nil)
+	first, err := RefreshSnapshot(context.Background(), cfg, sub, "", dir, impl, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestConditionalRefreshCannotReplaceConcurrentImport(t *testing.T) {
 	if err := SaveSnapshot(dir, sub, replacement); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := CommitRefresh(cfg, sub, queued, dir, impl); err == nil {
+	if _, err := CommitRefresh(context.Background(), cfg, sub, queued, "", dir, impl); err == nil {
 		t.Fatal("late 304 accepted after a concurrent import")
 	}
 	after, err := LoadSnapshot(dir, sub)
@@ -78,7 +78,7 @@ func TestTruncatedCompressedRefreshKeepsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = RefreshSnapshot(context.Background(), cfg, sub, dir, backend.Native{}, nil)
+	_, err = RefreshSnapshot(context.Background(), cfg, sub, "", dir, backend.Native{}, nil)
 	if err == nil || !strings.Contains(err.Error(), "不完整或损坏") {
 		t.Fatalf("truncated response was not diagnosed: %v", err)
 	}

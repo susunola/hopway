@@ -2,6 +2,7 @@
 """Exercise a HopWay core using only disposable profiles and loopback traffic."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import http.client
 import json
 from pathlib import Path
@@ -66,11 +67,14 @@ def socks_handshake(conn, port):
         assert len(reader.read(length)) == length
 
 
-def control_request(ready, method, path):
+def control_request(ready, method, path, revision=None):
     url = urlsplit(ready["control"])
     connection = http.client.HTTPConnection(url.hostname, url.port, timeout=3)
     try:
-        connection.request(method, path, headers={"Authorization": "Bearer " + ready["token"]})
+        headers = {"Authorization": "Bearer " + ready["token"]}
+        if revision is not None:
+            headers["X-HopWay-Revision"] = revision
+        connection.request(method, path, headers=headers)
         response = connection.getresponse()
         return response.status, response.read()
     finally:
@@ -104,6 +108,16 @@ def parallel_tunnels(ready, port):
         list(workers.map(exchange, range(16)))
 
 
+def wait_ready(process):
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        if not selector.select(5):
+            raise RuntimeError("core did not report readiness")
+    ready = json.loads(process.stdout.readline())
+    assert "control" in ready, ready.get("error")
+    return ready
+
+
 def run(binary, path, port, cycle):
     config = dict(socksPort=0, httpPort=0, systemProxy=False, mode="rule",
                   selected="DIRECT", rules=[{"type": "match", "via": "DIRECT"}])
@@ -111,11 +125,7 @@ def run(binary, path, port, cycle):
     with subprocess.Popen([binary, "-managed", "-config", str(path)], stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
         try:
-            with selectors.DefaultSelector() as selector:
-                selector.register(process.stdout, selectors.EVENT_READ)
-                if not selector.select(5):
-                    raise RuntimeError("core did not report readiness")
-            ready = json.loads(process.stdout.readline())
+            ready = wait_ready(process)
             if cycle < 2:
                 check_session_traffic(ready, 0)
             if cycle == 0:
@@ -184,6 +194,73 @@ def occupied_http_port(binary, path):
             released.bind(socks)
 
 
+def check_profile_transactions(binary, path, port):
+    def save(config, expected):
+        data = json.dumps(config, indent=2).encode()
+        receipt = subprocess.run([binary, "-save-config", "-config", str(path),
+                                  "-expected-revision", expected],
+                                 input=data, capture_output=True, check=True, timeout=5)
+        revision = json.loads(receipt.stdout)["revision"]
+        assert path.read_bytes() == data and revision == hashlib.sha256(data).hexdigest()
+        return revision
+
+    def revision(ready):
+        status, body = control_request(ready, "GET", "/status")
+        assert status == 200, (status, body)
+        return json.loads(body)["revision"]
+
+    config = dict(socksPort=0, httpPort=0, mode="rule", selected="DIRECT",
+                  rules=[{"type": "match", "via": "DIRECT"}])
+    first = save(config, "missing")
+    command = [binary, "-managed", "-config", str(path)]
+    target = f"127.0.0.1:{port}"
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as process:
+        try:
+            ready = wait_ready(process)
+            assert revision(ready) == first
+            with dial(ready["http"]) as established:
+                http_handshake(established, target)
+                config["rules"][0]["via"] = "REJECT"
+                stale = save(config, first)
+                config["rules"][0]["via"] = "DIRECT"
+                config["maxDialAttempts"] = 2
+                current = save(config, stale)
+                with ThreadPoolExecutor(max_workers=2) as workers:
+                    old_request = workers.submit(control_request, ready, "POST", "/reload", stale)
+                    new_request = workers.submit(control_request, ready, "POST", "/reload", current)
+                    assert old_request.result()[0] == 409
+                    assert new_request.result()[0] == 204
+                assert revision(ready) == current
+                send_echo(established)
+                with dial(ready["http"]) as new:
+                    http_handshake(new, target)
+                    send_echo(new)
+
+                config["rules"][0]["via"] = "REJECT"
+                saved_before_kill = save(config, current)
+                process.kill()
+                assert process.wait(timeout=5) == -signal.SIGKILL
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as process:
+        try:
+            ready = wait_ready(process)
+            assert revision(ready) == saved_before_kill
+            with dial(ready["http"]) as blocked:
+                blocked.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+                with blocked.makefile("rb") as reader:
+                    assert reader.readline().startswith(b"HTTP/1.1 403 ")
+            process.stdin.close()
+            assert process.wait(timeout=5) == 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("core", type=Path)
@@ -199,11 +276,13 @@ def main():
             occupied_http_port(binary, path)
             durations = [run(binary, path, server.server_address[1], cycle)
                          for cycle in range(args.cycles)]
+            check_profile_transactions(binary, Path(work) / "transaction.json", server.server_address[1])
         finally:
             server.shutdown()
     print(f"{args.cycles}/{args.cycles} cycles passed: HTTP CONNECT, SOCKS5, reload with open tunnels, "
           f"SIGTERM/stdin EOF, listener and tunnel closure. "
           f"Port conflict, profile exclusion, 16 parallel tunnels, and session traffic accounting passed. Max shutdown: {max(durations) * 1000:.1f} ms.")
+    print("Revision-checked rapid reloads and restart after SIGKILL immediately following a save passed.")
 
 
 if __name__ == "__main__":

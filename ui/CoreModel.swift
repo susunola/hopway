@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -238,6 +239,8 @@ struct ProxyStatus: Decodable {
     let sessionTraffic: TrafficHistory.Count?
     let udpDrops: [String: UDPDropCounts]?
     let reloaded: Double?
+    let revision: String?
+    let profileFallback: Bool?
 }
 
 struct ProfileInspection: Decodable {
@@ -263,11 +266,16 @@ struct ProfileInspection: Decodable {
     let systemProxy: Bool?
     let tunEnabled: Bool?
     let snapshotAt: [String: Double]?
+    let revision: String?
 }
 
 struct CoreError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
+}
+
+private struct ProfileWriteConflict: LocalizedError {
+    var errorDescription: String? { "磁盘配置已有新版本，请核对后再保存。" }
 }
 
 @MainActor
@@ -288,6 +296,7 @@ final class CoreModel: ObservableObject {
     private(set) var statusReadAt: Date?
     @Published private(set) var message: String?
     @Published private(set) var configurationNotice: String?
+    @Published private(set) var configurationConflict = false
     @Published private(set) var appliedPorts: (socks: Int?, http: Int?)?
     @Published private(set) var verifying = false
     @Published private(set) var verification: String?
@@ -306,6 +315,7 @@ final class CoreModel: ObservableObject {
     @Published var draft = ""
     private var announcedRecovery = false
     @Published private(set) var saved = ""
+    @Published private(set) var savedRevision = "missing"
 
     private var inspectionID: UUID?
     private var statusFailureMessage: String?
@@ -344,9 +354,9 @@ final class CoreModel: ObservableObject {
                 .appendingPathComponent("Mac Proxy").appendingPathComponent("config.json")
         }
         do {
-            saved = try String(contentsOf: configURL, encoding: .utf8)
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            saved = Self.defaultConfiguration
+            let document = try Self.readDiskConfiguration(configURL)
+            saved = document.text
+            savedRevision = document.revision
         } catch {
             message = error.localizedDescription
         }
@@ -367,7 +377,7 @@ final class CoreModel: ObservableObject {
 
     var changed: Bool { draft != saved }
 
-    static let defaultConfiguration = """
+    nonisolated static let defaultConfiguration = """
     {
       "socksPort": 1080,
       "httpPort": 8080,
@@ -379,6 +389,46 @@ final class CoreModel: ObservableObject {
       ]
     }
     """
+
+    private func acceptSavedConfiguration(_ text: String, revision: String) {
+        savedRevision = revision
+        saved = text
+        draft = text
+        configurationConflict = false
+        reloadConfiguredNodes()
+    }
+
+    func readDiskConfiguration() {
+        guard !saving else { return }
+        do {
+            let document = try Self.readDiskConfiguration(configURL)
+            acceptSavedConfiguration(document.text, revision: document.revision)
+            message = "已读取磁盘配置。"
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    nonisolated private static func readDiskConfiguration(_ path: URL) throws -> (text: String, revision: String) {
+        do {
+            let data = try Data(contentsOf: path)
+            guard let text = String(data: data, encoding: .utf8) else {
+                throw CoreError(message: "配置文件须使用 UTF-8 编码。")
+            }
+            let revision = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            return (text, revision)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return (defaultConfiguration, "missing")
+        }
+    }
+
+    private func writeFailed(_ error: Error, prefix: String = "") {
+        if error is ProfileWriteConflict {
+            configurationConflict = true
+            reloadConfiguredNodes()
+        }
+        message = prefix + error.localizedDescription
+    }
 
     func toggle() {
         switch phase {
@@ -503,12 +553,14 @@ final class CoreModel: ObservableObject {
         phase = .stopped
     }
 
-    private func call(_ info: Endpoint, path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
+    private func call(_ info: Endpoint, path: String, method: String = "GET", body: Data? = nil,
+                      revision: String? = nil) async throws -> Data {
         var request = URLRequest(url: info.control.appendingPathComponent(path))
         if path == "verify" { request.timeoutInterval = 8 }
         request.httpMethod = method
         request.httpBody = body
         request.setValue("Bearer " + info.token, forHTTPHeaderField: "Authorization")
+        if let revision { request.setValue(revision, forHTTPHeaderField: "X-HopWay-Revision") }
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -522,7 +574,7 @@ final class CoreModel: ObservableObject {
         guard let info = endpoint else { return "重启内核后生效。" }
         let reloadedConfiguration = saved
         do {
-            _ = try await call(info, path: "reload", method: "POST")
+            _ = try await call(info, path: "reload", method: "POST", revision: savedRevision)
             if endpoint?.token == info.token {
                 appliedPorts = configuredPorts(in: reloadedConfiguration)
             }
@@ -803,20 +855,19 @@ final class CoreModel: ObservableObject {
         }
         let text = String(decoding: json, as: UTF8.self)
         let destination = configURL
+        let expected = savedRevision
         saving = true
         Task {
             defer { saving = false }
             do {
-                try await Task.detached {
-                    try Self.validateAndSave(text, to: destination, with: executable)
+                let revision = try await Task.detached {
+                    try Self.validateAndSave(text, to: destination, expected: expected, with: executable)
                 }.value
-                draft = text
-                saved = text
-                reloadConfiguredNodes()
+                acceptSavedConfiguration(text, revision: revision)
                 let applied = phase == .running ? " " + (await applyRunning()) : ""
                 message = success + applied
             } catch {
-                message = "无法保存订阅 · " + error.localizedDescription
+                writeFailed(error, prefix: "无法保存订阅 · ")
             }
         }
     }
@@ -1098,23 +1149,24 @@ final class CoreModel: ObservableObject {
         saving = true
         message = "正在识别并导入…"
         let destination = configURL
+        let expected = savedRevision
         Task {
             defer { saving = false }
             do {
-                let (text, summary) = try await Task.detached {
-                    try Self.convertAndSave(raw, to: destination, with: executable)
+                let receipt = try await Task.detached {
+                    let data = try Self.runProfileInput(raw, mode: "-commit-import", at: destination, expected: expected, with: executable)
+                    return try JSONDecoder().decode(ImportReceipt.self, from: data)
                 }.value
-                draft = text
-                saved = text
-                reloadConfiguredNodes()
+                acceptSavedConfiguration(receipt.text, revision: receipt.revision)
                 importCount += 1
                 var next = "启动后可在概览切换出站。"
                 if phase == .running {
                     next = await applyRunning()
                 }
-                message = summary + " " + next
+                let summary = ["已导入 \(receipt.added) 个节点，跳过 \(receipt.skipped) 个。"] + (receipt.notes ?? [])
+                message = (summary + [next]).joined(separator: " ")
             } catch {
-                message = "导入失败 · " + error.localizedDescription
+                writeFailed(error, prefix: "导入失败 · ")
             }
         }
     }
@@ -1125,42 +1177,35 @@ final class CoreModel: ObservableObject {
         let notes: [String]
     }
 
+    private struct ImportReceipt: Decodable {
+        let text: String
+        let revision: String
+        let added: Int
+        let skipped: Int
+        let notes: [String]?
+    }
+
     func previewImport(_ raw: String) async throws -> ImportPreview {
         guard let executable, !changed else {
             throw CoreError(message: "请先保存配置草稿，再预览导入。")
         }
         let destination = configURL
         let data = try await Task.detached {
-            try Self.convert(raw, from: destination, with: executable, preview: true)
+            try Self.runProfileInput(raw, mode: "-preview-import", at: destination, with: executable)
         }.value
         return try JSONDecoder().decode(ImportPreview.self, from: data)
     }
 
-    nonisolated private static func convertAndSave(_ raw: String, to destination: URL, with executable: URL) throws -> (String, String) {
-        let data = try convert(raw, from: destination, with: executable, preview: false)
-        guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let config = result["config"] as? [String: Any],
-              let added = result["added"] as? Int,
-              let skipped = result["skipped"] as? Int,
-              let notes = result["notes"] as? [String] else {
-            throw CoreError(message: "内核返回的导入结果无效。")
-        }
-        let json = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-        let text = String(decoding: json, as: UTF8.self)
-        try validateAndSave(text, to: destination, with: executable)
-        let summary = ["已导入 \(added) 个节点，跳过 \(skipped) 个。"] + notes
-        return (text, summary.joined(separator: " "))
-    }
-
-    nonisolated private static func convert(_ raw: String, from destination: URL, with executable: URL, preview: Bool) throws -> Data {
-        guard raw.utf8.count <= 1_048_576 else { throw CoreError(message: "导入内容上限为 1 MB。") }
+    nonisolated private static func runProfileInput(_ raw: String, mode: String, at destination: URL,
+                                                     expected: String? = nil, with executable: URL) throws -> Data {
+        guard raw.utf8.count <= 1_048_576 else { throw CoreError(message: "输入上限为 1 MB。") }
         let files = FileManager.default
         let directory = files.temporaryDirectory.appendingPathComponent("hopway-" + UUID().uuidString)
         try files.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? files.removeItem(at: directory) }
         let source = directory.appendingPathComponent("input")
         guard files.createFile(atPath: source.path, contents: Data(raw.utf8), attributes: [.posixPermissions: 0o600]) else {
-            throw CoreError(message: "无法暂存导入内容。")
+            throw CoreError(message: "无法暂存配置内容。")
         }
         let input = try FileHandle(forReadingFrom: source)
         defer { try? input.close() }
@@ -1169,16 +1214,18 @@ final class CoreModel: ObservableObject {
         child.executableURL = executable
         // Always name the config path, even before the file exists: the core
         // keeps subscription caches next to it.
-        child.arguments = [preview ? "-preview-import" : "-import", "-config", destination.path]
+        child.arguments = [mode, "-config", destination.path]
+        if let expected { child.arguments?.append(contentsOf: ["-expected-revision", expected]) }
         child.standardInput = input
         child.standardOutput = output
         child.standardError = output
         try child.run()
         let data = output.fileHandleForReading.readDataToEndOfFile()
         child.waitUntilExit()
+        if child.terminationStatus == 3 { throw ProfileWriteConflict() }
         guard child.terminationStatus == 0 else {
             let explanation = String(decoding: data.prefix(2048), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            throw CoreError(message: explanation.isEmpty ? "内核无法完成导入。" : explanation)
+            throw CoreError(message: explanation.isEmpty ? "内核无法处理配置。" : explanation)
         }
         return data
     }
@@ -1242,13 +1289,14 @@ final class CoreModel: ObservableObject {
         saving = true
         message = nil
         let destination = configURL
+        let expected = savedRevision
         Task {
             defer { saving = false }
             do {
-                try await Task.detached { try Self.validateAndSave(candidate, to: destination, with: executable) }.value
-                saved = candidate
-                draft = candidate
-                reloadConfiguredNodes()
+                let revision = try await Task.detached {
+                    try Self.validateAndSave(candidate, to: destination, expected: expected, with: executable)
+                }.value
+                acceptSavedConfiguration(candidate, revision: revision)
                 if phase == .running {
                     if needsRestart {
                         message = "配置已保存。重启代理后应用新的监听端口和本次改动。"
@@ -1264,34 +1312,16 @@ final class CoreModel: ObservableObject {
                     message = "配置已保存。"
                 }
             } catch {
-                message = error.localizedDescription
+                writeFailed(error)
             }
         }
     }
 
-    nonisolated private static func validateAndSave(_ text: String, to destination: URL, with executable: URL) throws {
-        let files = FileManager.default
-        let directory = destination.deletingLastPathComponent()
-        try files.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let stage = directory.appendingPathComponent(".draft-" + UUID().uuidString)
-        defer { try? files.removeItem(at: stage) }
-        guard text.utf8.count <= 1_048_576 else { throw CoreError(message: "配置文件上限为 1 MB。") }
-        guard files.createFile(atPath: stage.path, contents: Data(text.utf8), attributes: [.posixPermissions: 0o600]) else {
-            throw CoreError(message: "无法创建配置草稿。")
-        }
-        let child = Process()
-        child.executableURL = executable
-        child.arguments = ["-check", "-config", stage.path]
-        let output = Pipe()
-        child.standardError = output
-        try child.run()
-        let diagnostics = output.fileHandleForReading.readDataToEndOfFile()
-        child.waitUntilExit()
-        guard child.terminationStatus == 0 else {
-            throw CoreError(message: "配置校验失败 · " + String(decoding: diagnostics.prefix(1024), as: UTF8.self))
-        }
-        if rename(stage.path, destination.path) != 0 {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
+    nonisolated private static func validateAndSave(_ text: String, to destination: URL,
+                                                    expected: String, with executable: URL) throws -> String {
+        let data = try runProfileInput(text, mode: "-save-config", at: destination, expected: expected, with: executable)
+        let receipt = try JSONDecoder().decode([String: String].self, from: data)
+        guard let revision = receipt["revision"] else { throw CoreError(message: "无法读取保存后的配置版本。") }
+        return revision
     }
 }

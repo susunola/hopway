@@ -232,11 +232,21 @@ func (engine *Engine) downloadRuleSet(ctx context.Context, state *ruleSetState, 
 
 // WriteAtomic replaces path so a crash never leaves a half-written file.
 func WriteAtomic(path string, data []byte) error {
+	return WriteAtomicChecked(path, data, nil)
+}
+
+// WriteAtomicChecked runs check after staging, immediately before replacement.
+func WriteAtomicChecked(path string, data []byte, check func() error) error {
 	staged, err := stageWrite(path, data)
 	if err != nil {
 		return err
 	}
 	defer os.Remove(staged)
+	if check != nil {
+		if err := check(); err != nil {
+			return err
+		}
+	}
 	return os.Rename(staged, path)
 }
 

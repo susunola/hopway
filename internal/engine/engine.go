@@ -62,6 +62,7 @@ type TUNConfig struct {
 type Subscription struct {
 	Name         string             `json:"name"`
 	ID           string             `json:"id,omitempty"`
+	SnapshotKey  string             `json:"snapshotKey,omitempty"`
 	Alias        string             `json:"alias,omitempty"`
 	Paused       bool               `json:"paused,omitempty"`
 	Agent        string             `json:"agent,omitempty"`

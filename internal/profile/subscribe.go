@@ -76,7 +76,7 @@ func FetchRefresh(ctx context.Context, sub engine.Subscription, dataDir string, 
 }
 
 // RefreshSnapshot downloads and validates before replacing a cached snapshot.
-func RefreshSnapshot(ctx context.Context, user engine.Config, sub engine.Subscription, dataDir string, impl backend.Backend, transport http.RoundTripper) (*Snapshot, error) {
+func RefreshSnapshot(ctx context.Context, user engine.Config, sub engine.Subscription, path, dataDir string, impl backend.Backend, transport http.RoundTripper) (*Snapshot, error) {
 	refresh, err := FetchRefresh(ctx, sub, dataDir, impl, transport)
 	if err != nil {
 		return nil, err
@@ -84,19 +84,36 @@ func RefreshSnapshot(ctx context.Context, user engine.Config, sub engine.Subscri
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if _, err := CommitRefresh(user, sub, refresh, dataDir, impl); err != nil {
+	if _, err := CommitRefresh(ctx, user, sub, refresh, path, dataDir, impl); err != nil {
 		return nil, err
 	}
 	return refresh.Snapshot, nil
 }
 
 // CommitRefresh reports whether the engine-facing content actually changed.
-func CommitRefresh(user engine.Config, sub engine.Subscription, refresh *Refresh, dataDir string, impl backend.Backend) (bool, error) {
-	release, err := lockSnapshots(dataDir)
+func CommitRefresh(ctx context.Context, user engine.Config, sub engine.Subscription, refresh *Refresh, path, dataDir string, impl backend.Backend) (bool, error) {
+	release, err := LockWrites(dataDir)
 	if err != nil {
 		return false, err
 	}
 	defer release()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if path != "" {
+		doc, err := ReadDocument(path)
+		if err != nil {
+			return false, err
+		}
+		user, err = doc.Config()
+		if err != nil {
+			return false, err
+		}
+		var ok bool
+		if sub, ok = ActiveSubscription(user, sub); !ok {
+			return false, ErrRefreshSourceChanged
+		}
+	}
 	current, _ := LoadSnapshot(dataDir, sub)
 	if !reflect.DeepEqual(current, refresh.previous) {
 		return false, errors.New("订阅缓存已由其他操作更新，请重新检查")
@@ -113,10 +130,25 @@ func CommitRefresh(user engine.Config, sub engine.Subscription, refresh *Refresh
 			updateUsage(sub, snapshot, current)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if err := saveSnapshot(dataDir, sub, snapshot); err != nil {
 		return false, err
 	}
 	return changed, nil
+}
+
+var ErrRefreshSourceChanged = errors.New("订阅已修改、暂停或移除")
+
+func ActiveSubscription(user engine.Config, previous engine.Subscription) (engine.Subscription, bool) {
+	for _, sub := range user.Subscriptions {
+		if !sub.Paused && sub.Key() == previous.Key() && sub.URL == previous.URL &&
+			sub.Agent == previous.Agent && sub.SnapshotKey == previous.SnapshotKey {
+			return sub, true
+		}
+	}
+	return engine.Subscription{}, false
 }
 
 func sameRouting(a, b *Snapshot) bool {
@@ -176,7 +208,7 @@ func prepareSnapshot(user engine.Config, sub engine.Subscription, snapshot *Snap
 }
 
 func checkRetry(sub engine.Subscription, dataDir string) error {
-	until := time.Unix(readRetryDeadline(SnapshotPath(dataDir, sub)+".retry"), 0)
+	until := time.Unix(readRetryDeadline(subscriptionCacheStem(dataDir, sub)+".json.retry"), 0)
 	if until.After(time.Now()) {
 		return fmt.Errorf("订阅暂缓刷新，可在 %s 后重试", until.Local().Format("01-02 15:04:05"))
 	}
@@ -194,14 +226,14 @@ func saveRetry(sub engine.Subscription, dataDir string, err error) {
 	if !errors.As(err, &response) || !response.RetryAfter.After(time.Now()) {
 		return
 	}
-	release, err := lockSnapshots(dataDir)
+	release, err := LockWrites(dataDir)
 	if err != nil {
 		return
 	}
 	defer release()
 	// Round up so the next process cannot retry just before the hint.
 	until := response.RetryAfter.Add(time.Second - time.Nanosecond).Unix()
-	path := SnapshotPath(dataDir, sub) + ".retry"
+	path := subscriptionCacheStem(dataDir, sub) + ".json.retry"
 	if until > readRetryDeadline(path) {
 		_ = engine.WriteAtomic(path, strconv.AppendInt(nil, until, 10))
 	}
@@ -211,17 +243,66 @@ func saveRetry(sub engine.Subscription, dataDir string, err error) {
 // The returned result's Config is the user configuration to save; the nodes
 // live in the snapshot, not in the file, so later refreshes never rewrite it.
 func Subscribe(ctx context.Context, user engine.Config, rawURL, dataDir string, impl backend.Backend) (importer.Result, error) {
-	return subscribe(ctx, user, rawURL, dataDir, impl, false)
+	plan, err := fetchSubscription(ctx, user, rawURL, dataDir, impl, false)
+	if err != nil {
+		return importer.Result{}, err
+	}
+	release, err := LockWrites(dataDir)
+	if err != nil {
+		return importer.Result{}, err
+	}
+	defer release()
+	if err := plan.prepare(dataDir, impl); err != nil {
+		return importer.Result{}, err
+	}
+	if _, err := plan.stage(dataDir); err != nil {
+		return importer.Result{}, err
+	}
+	return plan.result, nil
 }
 
 func PreviewSubscription(ctx context.Context, user engine.Config, rawURL, dataDir string, impl backend.Backend) (importer.Result, error) {
-	return subscribe(ctx, user, rawURL, dataDir, impl, true)
+	plan, err := fetchSubscription(ctx, user, rawURL, dataDir, impl, true)
+	if err != nil {
+		return importer.Result{}, err
+	}
+	if err := plan.prepare(dataDir, impl); err != nil {
+		return importer.Result{}, err
+	}
+	return plan.result, nil
 }
 
-func subscribe(ctx context.Context, user engine.Config, rawURL, dataDir string, impl backend.Backend, preview bool) (importer.Result, error) {
+type subscriptionImport struct {
+	result   importer.Result
+	index    int
+	snapshot *Snapshot
+	previous *Snapshot
+	preview  bool
+}
+
+func (plan *subscriptionImport) prepare(dataDir string, impl backend.Backend) error {
+	user := plan.result.Config
+	sub := user.Subscriptions[plan.index]
+	previous, _ := LoadSnapshot(dataDir, sub)
+	if !plan.preview && !reflect.DeepEqual(plan.previous, previous) {
+		return errors.New("订阅缓存已由其他操作更新，请重新导入")
+	}
+	updateUsage(sub, plan.snapshot, previous)
+	validate := func(config engine.Config) error { return engine.Validate(config, impl) }
+	_, err := validateConfig(user, dataDir, validate, sub.Name, plan.snapshot)
+	return err
+}
+
+func (plan *subscriptionImport) stage(dataDir string) (string, error) {
+	sub := &plan.result.Config.Subscriptions[plan.index]
+	sub.SnapshotKey = newSnapshotKey()
+	return SnapshotPath(dataDir, *sub), saveSnapshot(dataDir, *sub, plan.snapshot)
+}
+
+func fetchSubscription(ctx context.Context, user engine.Config, rawURL, dataDir string, impl backend.Backend, preview bool) (*subscriptionImport, error) {
 	parsed, agent, label, err := importer.SubscriptionLink(rawURL)
 	if err != nil || parsed == nil {
-		return importer.Result{}, fmt.Errorf("订阅地址无效")
+		return nil, fmt.Errorf("订阅地址无效")
 	}
 	rawURL = parsed.String()
 	sub := engine.Subscription{Name: parsed.Hostname(), URL: rawURL, Agent: agent,
@@ -250,43 +331,33 @@ func subscribe(ctx context.Context, user engine.Config, rawURL, dataDir string, 
 		}
 	}
 	if err := checkRetry(sub, dataDir); err != nil {
-		return importer.Result{}, err
+		return nil, err
 	}
+	previous, _ := LoadSnapshot(dataDir, sub)
 	snapshot, result, err := Fetch(ctx, sub, impl, nil)
 	if err != nil {
-		saveRetry(sub, dataDir, err)
-		return importer.Result{}, err
+		if !preview {
+			saveRetry(sub, dataDir, err)
+		}
+		return nil, err
 	}
+	user.Subscriptions = append([]engine.Subscription(nil), user.Subscriptions...)
+	added := index < 0
 	if index < 0 {
+		index = len(user.Subscriptions)
 		user.Subscriptions = append(user.Subscriptions, sub)
 	} else {
-		user.Subscriptions = append([]engine.Subscription(nil), user.Subscriptions...)
 		user.Subscriptions[index] = sub
-	}
-	if !preview {
-		release, err := lockSnapshots(dataDir)
-		if err != nil {
-			return importer.Result{}, err
-		}
-		defer release()
-	}
-	if err := prepareSnapshot(user, sub, snapshot, dataDir, impl); err != nil {
-		return importer.Result{}, err
-	}
-	if !preview {
-		if err := saveSnapshot(dataDir, sub, snapshot); err != nil {
-			return importer.Result{}, err
-		}
 	}
 	user.DataDir = ""
 	result.Config = user
 	verb := "已添加订阅"
-	if index >= 0 {
+	if !added {
 		verb = "已更新订阅"
 	}
 	if preview {
 		verb = "将添加订阅"
-		if index >= 0 {
+		if !added {
 			verb = "将更新订阅"
 		}
 	}
@@ -294,7 +365,7 @@ func subscribe(ctx context.Context, user engine.Config, rawURL, dataDir string, 
 		result.Notes[i] = strings.Replace(note, "替换原有分组和规则", "排在你自己的规则之后生效", 1)
 	}
 	result.Notes = append([]string{fmt.Sprintf("%s「%s」，之后每 %g 分钟自动检查", verb, sub.Name, RefreshInterval(user, sub).Minutes())}, result.Notes...)
-	return result, nil
+	return &subscriptionImport{result: result, index: index, snapshot: snapshot, previous: previous, preview: preview}, nil
 }
 
 func RefreshInterval(config engine.Config, sub engine.Subscription) time.Duration {
