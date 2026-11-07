@@ -154,8 +154,12 @@ func (state *autoState) bestNode(group int, recovering bool) string {
 }
 
 func (state *autoState) apply(results []ProbeResult) {
-	defer func() { state.orderedCandidates = state.candidates() }()
+	measured := false
 	for _, result := range results {
+		if result.Inconclusive {
+			continue
+		}
+		measured = true
 		node := state.health[result.Name]
 		if result.Failure == "" {
 			if node.latency == 0 {
@@ -169,6 +173,10 @@ func (state *autoState) apply(results []ProbeResult) {
 		}
 		state.health[result.Name] = node
 	}
+	if !measured {
+		return
+	}
+	defer func() { state.orderedCandidates = state.candidates() }()
 	activeHealthy := state.activeNode != "" && !state.unavailable[state.activeGroup] && state.health[state.activeNode].viable()
 	for group := range state.config.Groups {
 		if activeHealthy && group > state.activeGroup {

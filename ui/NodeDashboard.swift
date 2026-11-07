@@ -4,10 +4,18 @@ struct NodeProbeResult: Decodable {
     let name: String
     let milliseconds: Int?
     let failure: String?
+    var inconclusive: Bool?
+    var target: String?
+    var checkedAt: Double?
+    var lastKnownLatency: Int?
     var receivedAt = Date.now
     var fromRuntime = false
 
-    private enum CodingKeys: String, CodingKey { case name, milliseconds, failure }
+    private enum CodingKeys: String, CodingKey { case name, milliseconds, failure, inconclusive, target, checkedAt }
+
+    var isAvailable: Bool { failure == nil && inconclusive != true }
+    var isFailure: Bool { failure != nil && inconclusive != true }
+    var observedAt: Date { checkedAt.map { Date(timeIntervalSince1970: $0 / 1000) } ?? receivedAt }
 
     private var timedOut: Bool {
         guard let failure = failure?.lowercased() else { return false }
@@ -15,14 +23,23 @@ struct NodeProbeResult: Decodable {
     }
 
     var status: String {
-        if failure == nil { return "可用" }
+        if inconclusive == true { return "待复测" }
+        if isAvailable { return "可用" }
         return timedOut ? "超时" : "失败"
     }
 
-    var explanation: String {
+    func isHistorical(at date: Date) -> Bool {
+        date.timeIntervalSince(observedAt) >= 15 * 60
+    }
+
+    func explanation(at date: Date) -> String {
         let source = fromRuntime ? "内核健康记录" : "手动测速"
-        let time = receivedAt.formatted(date: .omitted, time: .shortened)
-        return "\(source) · \(time)\n" + (failure ?? (fromRuntime ? "节点当前可用" : "节点已通过 HTTPS 测试"))
+        let time = observedAt.formatted(date: .abbreviated, time: .shortened)
+        let context = [source, time, target].compactMap { $0 }.joined(separator: " · ")
+        let detail = failure ?? (isAvailable ? "节点可用" : "本次结果不足以判断节点是否可用")
+        let previous = lastKnownLatency.map { "上次可用延迟 \($0) ms" }
+        let age = isHistorical(at: date) ? "此记录已超过 15 分钟" : nil
+        return [context, detail, previous, age].compactMap { $0 }.joined(separator: "\n")
     }
 }
 
@@ -41,6 +58,7 @@ struct NodeDashboard: View {
         case all = "全部状态"
         case available = "可用"
         case failed = "失败或超时"
+        case inconclusive = "待复测"
         case untested = "未测试"
 
         func includes(pending: Bool, result: NodeProbeResult?) -> Bool {
@@ -48,8 +66,9 @@ struct NodeDashboard: View {
             guard !pending else { return false }
             switch self {
             case .all: return true
-            case .available: return result != nil && result?.failure == nil
-            case .failed: return result?.failure != nil
+            case .available: return result?.isAvailable == true
+            case .failed: return result?.isFailure == true
+            case .inconclusive: return result?.inconclusive == true
             case .untested: return result == nil
             }
         }
@@ -65,7 +84,7 @@ struct NodeDashboard: View {
         var rank: Int {
             if pending { return 1 }
             if result == nil { return 2 }
-            return result?.failure == nil ? 0 : 3
+            return result?.isAvailable == true ? 0 : 3
         }
     }
 
@@ -105,7 +124,7 @@ struct NodeDashboard: View {
         let manual = core.probeResults[name]
         guard let runtime, let alive = runtime.alive, let observed = runtime.healthAt else { return manual }
         let time = Date(timeIntervalSince1970: observed / 1000)
-        if let manual, manual.receivedAt >= time { return manual }
+        if let manual, manual.observedAt >= time { return manual }
         return NodeProbeResult(
             name: name,
             milliseconds: runtime.latencyMs,
@@ -285,9 +304,13 @@ struct NodeDashboard: View {
             if row.pending {
                 Label("测试中", systemImage: "clock").foregroundStyle(.secondary)
             } else if let result = row.result {
-                Label(result.status, systemImage: result.failure == nil ? "checkmark.circle.fill" : "exclamationmark.circle")
-                    .foregroundStyle(result.failure == nil ? HopAppearance.accent : .orange)
-                    .help(result.explanation)
+                TimelineView(.periodic(from: .now, by: 60)) { timeline in
+                    let historical = result.isHistorical(at: timeline.date)
+                    let symbol = result.isAvailable ? "checkmark.circle.fill" : result.isFailure ? "exclamationmark.circle" : "questionmark.circle"
+                    Label(historical ? "历史结果" : result.status, systemImage: historical ? "clock.arrow.circlepath" : symbol)
+                        .foregroundStyle(historical ? .secondary : result.isAvailable ? HopAppearance.accent : result.isFailure ? .orange : .secondary)
+                        .help(result.explanation(at: timeline.date))
+                }
             } else {
                 Text("未测试").foregroundStyle(.secondary)
             }

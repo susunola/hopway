@@ -170,6 +170,7 @@ type Engine struct {
 	health        map[string]*nodeHealth
 	rules         *matcher
 	probeURL      string
+	probeFallback string
 	sequence      uint64
 	live          map[uint64]*tracked
 	livePackets   map[uint64]*trackedPacket
@@ -207,7 +208,7 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 	}
 	engine := &Engine{subscriptions: config.Subscriptions, autoWake: make(chan struct{}, 1), dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
-		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL,
+		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL, probeFallback: defaultProbeFallback,
 		dialSlots: make(map[string]chan struct{}), lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
 	}
 	for _, port := range localPorts {
@@ -244,10 +245,22 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 	interval := defaultProbeInterval
 	if config.Health != nil {
 		if config.Health.URL != "" {
-			if !strings.HasPrefix(config.Health.URL, "http://") && !strings.HasPrefix(config.Health.URL, "https://") {
-				return nil, errors.New("health URL must be http or https")
+			if err := validateProbeURL(config.Health.URL); err != nil {
+				return nil, err
 			}
 			engine.probeURL = config.Health.URL
+			if config.Health.URL != defaultProbeURL {
+				engine.probeFallback = "" // Custom targets require an explicit fallback.
+			}
+		}
+		if config.Health.FallbackURL != "" {
+			if err := validateProbeURL(config.Health.FallbackURL); err != nil {
+				return nil, err
+			}
+			engine.probeFallback = config.Health.FallbackURL
+		}
+		if engine.probeFallback == engine.probeURL {
+			engine.probeFallback = ""
 		}
 		if config.Health.Interval != 0 {
 			if config.Health.Interval < 30 {

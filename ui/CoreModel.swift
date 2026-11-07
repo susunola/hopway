@@ -798,20 +798,26 @@ final class CoreModel: ObservableObject {
         if showSummary { message = nil }
         Task {
             var available = 0
+            var inconclusive = 0
             var interrupted = false
             do {
-                for try await result in Self.probeOutput(child, reader: output.fileHandleForReading) {
+                for try await var result in Self.probeOutput(child, reader: output.fileHandleForReading) {
                     guard probeProcess === child else { return }
                     guard probePending.remove(result.name) != nil else { continue }
+                    if !result.isAvailable, let previous = probeResults[result.name] {
+                        result.lastKnownLatency = previous.isAvailable ? previous.milliseconds : previous.lastKnownLatency
+                    }
                     probeResults[result.name] = result
-                    if result.failure == nil {
+                    if result.isAvailable {
                         available += 1
                         probeFailures.removeValue(forKey: result.name)
                         hiddenNodes.remove(result.name)
-                    } else {
+                    } else if result.isFailure {
                         let failures = min(2, (probeFailures[result.name] ?? 0) + 1)
                         probeFailures[result.name] = failures
                         if failures == 2 { hiddenNodes.insert(result.name) }
+                    } else {
+                        inconclusive += 1
                     }
                 }
             } catch {
@@ -824,7 +830,9 @@ final class CoreModel: ObservableObject {
                     if interrupted || remaining > 0 {
                         message = "测速未完整结束 · 已完成 \(completed)/\(probeTotal)，剩余 \(remaining) 个。"
                     } else {
-                        message = "测速完成 · \(completed) 个节点，\(available) 个可用，\(completed - available) 个失败或超时。"
+                        let failed = completed - available - inconclusive
+                        let uncertain = inconclusive == 0 ? "" : "，\(inconclusive) 个待复测"
+                        message = "测速完成 · \(completed) 个节点，\(available) 个可用，\(failed) 个失败或超时\(uncertain)。"
                     }
                 }
                 probeProcess = nil

@@ -10,7 +10,10 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
+
+	"mac-proxy/internal/backend"
 )
 
 // Group types.
@@ -30,17 +33,27 @@ type Group struct {
 
 // Health configures latency probing for url-test and fallback groups.
 type Health struct {
-	URL      string `json:"url,omitempty"`
-	Interval int    `json:"intervalSec,omitempty"`
+	URL         string `json:"url,omitempty"`
+	FallbackURL string `json:"fallbackUrl,omitempty"`
+	Interval    int    `json:"intervalSec,omitempty"`
 }
 
 const (
 	defaultProbeURL      = "https://www.gstatic.com/generate_204"
+	defaultProbeFallback = "https://www.cloudflare.com/cdn-cgi/trace"
 	defaultProbeInterval = 300
 	defaultTolerance     = 50
 	probeTimeout         = 6 * time.Second
 	probeParallel        = 8
 )
+
+func validateProbeURL(target string) error {
+	parsed, err := url.Parse(target)
+	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return errors.New("health target must be an HTTP or HTTPS URL with a host")
+	}
+	return nil
+}
 
 type nodeHealth struct {
 	latency   time.Duration
@@ -259,6 +272,11 @@ type ProbeResult struct {
 	Name         string `json:"name"`
 	Milliseconds int64  `json:"milliseconds,omitempty"`
 	Failure      string `json:"failure,omitempty"`
+	Inconclusive bool   `json:"inconclusive,omitempty"`
+	Target       string `json:"target,omitempty"`
+	CheckedAt    int64  `json:"checkedAt,omitempty"`
+	started      time.Time
+	finished     time.Time
 }
 
 func (engine *Engine) ProbeResults(ctx context.Context, names []string, emit func(ProbeResult) error) error {
@@ -276,68 +294,77 @@ func (engine *Engine) probeNodes(ctx context.Context, names []string, emit func(
 		stop := context.AfterFunc(network, cancel)
 		defer stop()
 	}
-	var emitMu sync.Mutex
-	var emitErr error
 	if names == nil {
 		for name := range engine.dialers {
 			names = append(names, name)
 		}
 	}
+	workers := min(probeParallel, len(names))
 	work := make(chan string)
+	results := make(chan ProbeResult, workers)
 	var wait sync.WaitGroup
-	for range min(probeParallel, len(names)) {
+	for range workers {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
 			for name := range work {
-				started := time.Now()
-				latency, err := engine.probe(ctx, name)
-				engine.mu.Lock()
-				previous := engine.health[name]
-				h := &nodeHealth{latency: latency, alive: err == nil, checked: time.Now()}
-				if previous != nil {
-					h.succeeded = previous.succeeded
-				}
-				if err != nil {
-					h.err = err.Error()
-					// A probe that fails (the probe URL may be blocked) does
-					// not outweigh real traffic that worked meanwhile.
-					if h.succeeded.After(started) {
-						h.alive, h.latency, h.err = true, previous.latency, ""
-					}
-				}
-				current := ctx.Err() == nil && engine.networkEpoch.Load() == epoch
-				if current {
-					engine.health[name] = h
-				}
-				engine.mu.Unlock()
-				if emit != nil && current {
-					result := ProbeResult{Name: name, Failure: h.err}
-					if h.alive {
-						result.Milliseconds = max(h.latency.Milliseconds(), 1)
-					}
-					emitMu.Lock()
-					if emitErr == nil {
-						emitErr = emit(result)
-						if emitErr != nil {
-							cancel()
-						}
-					}
-					emitMu.Unlock()
+				result := engine.probe(ctx, name)
+				select {
+				case results <- result:
+				case <-ctx.Done():
+					return
 				}
 			}
 		}()
 	}
-schedule:
-	for _, name := range names {
-		select {
-		case work <- name:
-		case <-ctx.Done():
-			break schedule
+	go func() {
+		defer close(work)
+		for _, name := range names {
+			select {
+			case work <- name:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		wait.Wait()
+		close(results)
+	}()
+
+	var emitErr error
+	deliver := func(result ProbeResult) {
+		if !engine.saveProbe(ctx, epoch, &result) {
+			return
+		}
+		if emit != nil {
+			if emitErr = emit(result); emitErr != nil {
+				cancel()
+			}
 		}
 	}
-	close(work)
-	wait.Wait()
+	var failures []ProbeResult
+	passed := false
+	for result := range results {
+		// Until at least one node reaches a target, a group of dial
+		// failures may be a network outage. Publish successes immediately.
+		if len(names) > 1 && !passed && result.Failure != "" && !result.Inconclusive {
+			failures = append(failures, result)
+			continue
+		}
+		deliver(result)
+		if !passed && result.Failure == "" {
+			passed = true
+			for _, failed := range failures {
+				deliver(failed)
+			}
+			failures = nil
+		}
+	}
+	for _, failed := range failures {
+		failed.Inconclusive = true
+		deliver(failed)
+	}
 	if emitErr != nil {
 		return emitErr
 	}
@@ -347,13 +374,82 @@ schedule:
 	return ctx.Err()
 }
 
-func (engine *Engine) probe(ctx context.Context, name string) (time.Duration, error) {
+func (engine *Engine) saveProbe(ctx context.Context, epoch uint64, result *ProbeResult) bool {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if ctx.Err() != nil || engine.networkEpoch.Load() != epoch {
+		return false
+	}
+	previous := engine.health[result.Name]
+	checked := result.finished
+	if previous != nil && (previous.checked.After(checked) ||
+		(result.Failure != "" && previous.succeeded.After(result.started))) {
+		result.Inconclusive = true
+	}
+	if !result.Inconclusive {
+		h := &nodeHealth{latency: time.Duration(result.Milliseconds) * time.Millisecond,
+			alive: result.Failure == "", err: result.Failure, checked: checked}
+		if previous != nil {
+			h.succeeded = previous.succeeded
+		}
+		engine.health[result.Name] = h
+	}
+	return true
+}
+
+func (engine *Engine) probe(ctx context.Context, name string) ProbeResult {
+	start := time.Now()
+	result := ProbeResult{Name: name, started: start}
 	dialer := engine.dialers[name]
 	if dialer == nil {
-		return 0, errors.New("unknown node")
+		result.Failure, result.CheckedAt = "unknown node", start.UnixMilli()
+		result.finished = start
+		return result
 	}
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	primary := ctx
+	if engine.probeFallback != "" {
+		var stop context.CancelFunc
+		primary, stop = context.WithTimeout(ctx, 4*time.Second)
+		defer stop()
+	}
+	target := engine.probeURL
+	latency, err := probeTarget(primary, dialer, target)
+	var primaryErr error
+	if err != nil && ctx.Err() == nil && engine.probeFallback != "" {
+		primaryErr = err
+		target = engine.probeFallback
+		latency, err = probeTarget(ctx, dialer, target)
+	}
+	if parsed, parseErr := url.Parse(target); parseErr == nil {
+		result.Target = parsed.Hostname()
+	}
+	result.finished = time.Now()
+	result.CheckedAt = result.finished.UnixMilli()
+	if err == nil {
+		result.Milliseconds = max(latency.Milliseconds(), 1)
+		return result
+	}
+	result.Failure = err.Error()
+	result.Inconclusive = inconclusiveProbe(err) || inconclusiveProbe(primaryErr)
+	return result
+}
+
+type probeHTTPStatus int
+
+func (status probeHTTPStatus) Error() string { return fmt.Sprintf("probe returned HTTP %d", status) }
+
+func inconclusiveProbe(err error) bool {
+	var status probeHTTPStatus
+	return errors.As(err, &status) || errors.Is(err, syscall.ENETDOWN) || errors.Is(err, syscall.ENETUNREACH)
+}
+
+func probeTarget(ctx context.Context, dialer backend.Dialer, target string) (time.Duration, error) {
 	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
+		// Each transport handles one probe. Bind its dial to the request
+		// because the HTTP transport can otherwise keep the dial alive.
+		DialContext: func(_ context.Context, _, address string) (net.Conn, error) {
 			return dialer.DialContext(ctx, address)
 		},
 		DisableKeepAlives: true, TLSHandshakeTimeout: probeTimeout, ResponseHeaderTimeout: probeTimeout,
@@ -361,7 +457,7 @@ func (engine *Engine) probe(ctx context.Context, name string) (time.Duration, er
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: probeTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, engine.probeURL, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -375,8 +471,8 @@ func (engine *Engine) probe(ctx context.Context, name string) (time.Duration, er
 		return 0, err
 	}
 	response.Body.Close()
-	if response.StatusCode >= 500 {
-		return 0, fmt.Errorf("probe returned HTTP %d", response.StatusCode)
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return 0, probeHTTPStatus(response.StatusCode)
 	}
 	return time.Since(start), nil
 }
