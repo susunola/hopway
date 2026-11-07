@@ -15,6 +15,7 @@ struct Policy: Codable, Equatable {
     var mode: String
     var selected: String
     var auto: AutoRoutingConfig? = nil
+    var expectedProbeKey: String? = nil
 
     static func label(_ mode: String) -> String {
         switch mode {
@@ -61,6 +62,7 @@ struct ProxyStatus: Decodable, Equatable {
     struct Node: Decodable, Equatable, Identifiable {
         let name: String
         let type: String
+        let probeKey: String?
         let latencyMs: Int?
         let alive: Bool?
         let error: String?
@@ -69,6 +71,7 @@ struct ProxyStatus: Decodable, Equatable {
         let failureCode: String?
         let probeTarget: String?
         var id: String { name }
+        var probeIdentity: String { probeKey ?? "legacy:" + name }
 
         var label: String {
             var parts = [name, type == "group" ? "策略组" : type]
@@ -519,13 +522,20 @@ final class CoreModel: ObservableObject {
     }
 
     func connectToNode(_ name: String) {
-        guard canConnectToNode, configuredNodes.contains(where: { $0.name == name }) else { return }
-        let policy = Policy(mode: "global", selected: name)
+        guard canConnectToNode, let node = configuredNodes.first(where: { $0.name == name }) else { return }
         if phase == .stopped {
-            start(policy: policy)
+            start(policy: Policy(mode: "global", selected: name, expectedProbeKey: node.probeKey))
         } else {
-            updatePolicy(policy)
+            selectNode(node, mode: "global")
         }
+    }
+
+    func selectNode(_ node: ProxyStatus.Node, mode: String) {
+        guard let current = status?.nodes.first(where: { $0.probeIdentity == node.probeIdentity }) else {
+            message = "节点配置已变化，请刷新后重试。"
+            return
+        }
+        updatePolicy(Policy(mode: mode, selected: current.name, expectedProbeKey: current.probeKey))
     }
 
     private func start(policy: Policy? = nil) {
@@ -812,7 +822,8 @@ final class CoreModel: ObservableObject {
             }
             statusReadAt = .now
             clearStatusFailure()
-            if status?.generation != snapshot.generation {
+            let generationChanged = status?.generation != snapshot.generation
+            if generationChanged {
                 cancelConnectionRequest()
                 connectionRecords.removeAll()
                 connectionCursor = nil
@@ -820,7 +831,7 @@ final class CoreModel: ObservableObject {
             }
             if status != snapshot { status = snapshot }
             updateTrafficRate(snapshot.sessionTraffic)
-            if before != snapshot.subscriptions?.map({ [$0.updated, $0.usage.map { Double($0.updatedAt) }] }) {
+            if generationChanged || before != snapshot.subscriptions?.map({ [$0.updated, $0.usage.map { Double($0.updatedAt) }] }) {
                 reloadConfiguredNodes()
             }
             reloadTraffic()
@@ -1178,7 +1189,7 @@ final class CoreModel: ObservableObject {
         let now = Date()
         guard probeTask == nil, !saving,
               lastRecoveryAttempt.map({ now.timeIntervalSince($0) >= 120 }) ?? true else { return }
-        let names = configuredNodes.map(\.name).filter { (probeFailures[$0] ?? 0) > 0 }
+        let names = configuredNodes.filter { (probeFailures[$0.probeIdentity] ?? 0) > 0 }.map(\.name)
         guard !names.isEmpty else { return }
         lastRecoveryAttempt = now
         runProbe(names, all: false, showSummary: false)
@@ -1217,9 +1228,12 @@ final class CoreModel: ObservableObject {
             probeInput = lifetime.fileHandleForWriting
             offline = (child, output.fileHandleForReading)
         }
+        let requested = Set(names)
+        let keys = Dictionary(uniqueKeysWithValues: configuredNodes.filter { requested.contains($0.name) }
+            .map { ($0.name, $0.probeIdentity) })
         let id = UUID()
         probeID = id
-        probePending = Set(names)
+        probePending = Set(keys.values)
         probeTotal = probePending.count
         if showSummary { message = nil }
         probeTask = Task {
@@ -1228,19 +1242,20 @@ final class CoreModel: ObservableObject {
             var interrupted = false
             @MainActor func receive(_ sample: NodeProbeResult) {
                 var result = sample
-                guard probePending.remove(result.name) != nil else { return }
-                if !result.isAvailable, let previous = probeResults[result.name] {
+                let key = result.probeKey ?? "legacy:" + result.name
+                guard keys[result.name] == key, probePending.remove(key) != nil else { return }
+                if !result.isAvailable, let previous = probeResults[key] {
                     result.lastKnownLatency = previous.isAvailable ? previous.milliseconds : previous.lastKnownLatency
                 }
-                probeResults[result.name] = result
+                probeResults[key] = result
                 if result.isAvailable {
                     available += 1
-                    probeFailures.removeValue(forKey: result.name)
-                    hiddenNodes.remove(result.name)
+                    probeFailures.removeValue(forKey: key)
+                    hiddenNodes.remove(key)
                 } else if result.isFailure {
-                    let failures = min(2, (probeFailures[result.name] ?? 0) + 1)
-                    probeFailures[result.name] = failures
-                    if failures == 2 { hiddenNodes.insert(result.name) }
+                    let failures = min(2, (probeFailures[key] ?? 0) + 1)
+                    probeFailures[key] = failures
+                    if failures == 2 { hiddenNodes.insert(key) }
                 } else {
                     inconclusive += 1
                 }
@@ -1348,10 +1363,10 @@ final class CoreModel: ObservableObject {
                 configuredProfile = profile
                 configuredNodes = profile.nodes ?? []
                 subscriptions = profile.subscriptions ?? []
-                let names = Set(configuredNodes.map(\.name))
-                hiddenNodes.formIntersection(names)
-                probeResults = probeResults.filter { names.contains($0.key) }
-                probeFailures = probeFailures.filter { names.contains($0.key) }
+                let keys = Set(configuredNodes.map(\.probeIdentity))
+                hiddenNodes.formIntersection(keys)
+                probeResults = probeResults.filter { keys.contains($0.key) }
+                probeFailures = probeFailures.filter { keys.contains($0.key) }
             } catch {
                 if inspectionID == id { profileReadFailed = true }
             }

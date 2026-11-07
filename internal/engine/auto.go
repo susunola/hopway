@@ -12,6 +12,7 @@ type AutoGroup struct {
 	Name       string   `json:"name"`
 	ProviderID string   `json:"providerId,omitempty"`
 	Nodes      []string `json:"nodes"`
+	NodeIDs    []string `json:"nodeIds,omitempty"`
 }
 
 type AutoConfig struct {
@@ -98,12 +99,15 @@ func (engine *Engine) validateAuto(config *AutoConfig) error {
 				}
 			}
 		}
-		for _, name := range group.Nodes {
+		for i, name := range group.Nodes {
 			if group.ProviderID != "" && !slices.Contains(providerNodes, name) {
 				return errors.New("自动选路引用了不属于该服务商的节点")
 			}
 			if engine.types[name] == "" || name == "DIRECT" || name == "REJECT" {
 				return errors.New("automatic routing references a node outside the running configuration")
+			}
+			if len(group.NodeIDs) != 0 && (len(group.NodeIDs) != len(group.Nodes) || group.NodeIDs[i] != engine.outboundIDs[name]) {
+				return errors.New("自动选路引用了已变化的节点")
 			}
 			unique[name] = true
 		}
@@ -112,6 +116,40 @@ func (engine *Engine) validateAuto(config *AutoConfig) error {
 		return errors.New("automatic routing supports up to 256 distinct nodes per region")
 	}
 	return nil
+}
+
+// BindAutoNodes fills identities for new or legacy automatic routes. Existing
+// identities survive a refresh that temporarily removes a provider.
+func (engine *Engine) BindAutoNodes(policy Policy) Policy {
+	if policy.Mode != "auto" || policy.Auto == nil {
+		return policy
+	}
+	config := *policy.Auto
+	config.Groups = slices.Clone(config.Groups)
+	for i := range config.Groups {
+		group := &config.Groups[i]
+		if len(group.NodeIDs) == len(group.Nodes) {
+			continue
+		}
+		group.NodeIDs = make([]string, len(group.Nodes))
+		for j, name := range group.Nodes {
+			if group.ProviderID != "" {
+				var belongs bool
+				for _, sub := range engine.subscriptions {
+					if sub.Key() == group.ProviderID && slices.Contains(sub.Nodes, name) {
+						belongs = true
+						break
+					}
+				}
+				if !belongs {
+					continue
+				}
+			}
+			group.NodeIDs[j] = engine.outboundIDs[name]
+		}
+	}
+	policy.Auto = &config
+	return policy
 }
 
 func (engine *Engine) MonitorAuto(ctx context.Context) {

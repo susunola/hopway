@@ -100,6 +100,7 @@ func Merge(user engine.Config, snapshots map[string]*Snapshot) (engine.Config, [
 
 func merge(user engine.Config, snapshots map[string]*Snapshot, owners map[referenceTarget]string) (engine.Config, []string) {
 	merged := user
+	merged.OutboundIDs = make(map[string]string)
 	merged.Subscriptions = append([]engine.Subscription(nil), user.Subscriptions...)
 	// Before subscriptions used snapshots, their nodes were embedded in the
 	// user file. Keep them as a fallback until all their owners have snapshots.
@@ -114,9 +115,7 @@ func merge(user engine.Config, snapshots map[string]*Snapshot, owners map[refere
 			oldOwned[name] = true
 			if !sub.Paused && snapshots[sub.Name] == nil {
 				retain[name] = true
-				if owners != nil {
-					legacyOwners[name] = sub.Key()
-				}
+				legacyOwners[name] = sub.Key()
 			}
 		}
 	}
@@ -125,7 +124,10 @@ func merge(user engine.Config, snapshots map[string]*Snapshot, owners map[refere
 		if !oldOwned[node.Name] || retain[node.Name] {
 			merged.Nodes = append(merged.Nodes, node)
 			if key := legacyOwners[node.Name]; key != "" {
-				owners[referenceTarget{name: node.Name}] = key
+				merged.OutboundIDs[node.Name] = engine.SourceOutboundID(key, node.Name, false)
+				if owners != nil {
+					owners[referenceTarget{name: node.Name}] = key
+				}
 			}
 		}
 	}
@@ -188,6 +190,7 @@ func merge(user engine.Config, snapshots map[string]*Snapshot, owners map[refere
 			rename[original] = node.Name
 			renamedNodes = renamedNodes || node.Name != original
 			merged.Nodes = append(merged.Nodes, node)
+			merged.OutboundIDs[node.Name] = engine.SourceOutboundID(key, original, false)
 			if owners != nil {
 				owners[referenceTarget{name: node.Name}] = key
 			}
@@ -200,6 +203,7 @@ func merge(user engine.Config, snapshots map[string]*Snapshot, owners map[refere
 		}
 		for _, group := range snapshot.Groups {
 			rename[group.Name] = unique(group.Name, taken)
+			merged.OutboundIDs[rename[group.Name]] = engine.SourceOutboundID(key, group.Name, true)
 			if owners != nil {
 				owners[referenceTarget{name: rename[group.Name]}] = key
 			}
@@ -437,7 +441,11 @@ func previousDocument(path, dataDir string) *Document {
 // CheckReplacement validates a newly edited on-disk profile against the
 // current running configuration, while allowing a refresh of the same file.
 func CheckReplacement(path, dataDir string, running Loaded, validate func(engine.Config) error) (Loaded, error) {
-	return load(path, dataDir, validate, &Document{Revision: running.Revision, config: &running.User})
+	candidate, err := load(path, dataDir, validate, &Document{Revision: running.Revision, config: &running.User})
+	if err != nil {
+		return Loaded{}, err
+	}
+	return candidate, validateReferenceBindings(running, candidate)
 }
 
 func load(path, dataDir string, validate func(engine.Config) error, previous *Document) (Loaded, error) {

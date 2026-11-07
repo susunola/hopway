@@ -122,3 +122,22 @@ func validateReferences(candidate, merged, previous engine.Config, dataDir, stag
 	}
 	return nil
 }
+
+// An unchanged user-authored rule or group member still refers to its
+// original provider. A display-name collision must not rebind it on reload.
+func validateReferenceBindings(previous, candidate Loaded) error {
+	bindings := make(map[referenceKey]string)
+	visitReferences(previous.User, previous.Merged, func(ref unresolvedReference, exists bool) {
+		if exists && !ref.target.ruleSet {
+			bindings[ref.referenceKey] = previous.Merged.OutboundIDs[ref.target.name]
+		}
+	})
+	var err error
+	visitReferences(candidate.User, candidate.Merged, func(ref unresolvedReference, exists bool) {
+		if old := bindings[ref.referenceKey]; err == nil && exists && old != "" &&
+			old != candidate.Merged.OutboundIDs[ref.target.name] {
+			err = fmt.Errorf("出站 %q 的订阅来源已变化，请更新引用后重新加载", ref.target.name)
+		}
+	})
+	return err
+}

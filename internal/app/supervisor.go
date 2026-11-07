@@ -213,6 +213,8 @@ func (s *Supervisor) StartContext(ctx context.Context, target sysproxy.Target, p
 	s.started = time.Now()
 	s.generation = 1
 	if s.autoPolicy != nil {
+		bound := core.BindAutoNodes(*s.autoPolicy)
+		s.autoPolicy = &bound
 		core.Restore(engine.Runtime{Policy: *s.autoPolicy})
 	}
 	s.current.Store(core)
@@ -840,6 +842,7 @@ func (s *Supervisor) SetPolicy(policy engine.Policy) error {
 	if err := core.ValidatePolicy(policy); err != nil {
 		return err
 	}
+	policy = core.BindAutoNodes(policy)
 	if s.path != "" && s.dataDir != "" {
 		if policy.Mode == "auto" {
 			data, err := json.Marshal(policy)

@@ -276,6 +276,7 @@ func (engine *Engine) Probe(ctx context.Context, names []string) {
 
 type ProbeResult struct {
 	Name         string `json:"name"`
+	ProbeKey     string `json:"probeKey,omitempty"`
 	Milliseconds int64  `json:"milliseconds,omitempty"`
 	Failure      string `json:"failure,omitempty"`
 	FailureStage string `json:"failureStage,omitempty"`
@@ -418,7 +419,7 @@ func (engine *Engine) saveProbe(ctx context.Context, epoch uint64, result *Probe
 
 func (engine *Engine) probe(ctx context.Context, name string) ProbeResult {
 	start := time.Now()
-	result := ProbeResult{Name: name, started: start}
+	result := ProbeResult{Name: name, ProbeKey: engine.probeKeys[name], started: start}
 	dialer := engine.dialers[name]
 	if dialer == nil {
 		result.Failure, result.CheckedAt = "unknown node", start.UnixMilli()
@@ -565,15 +566,34 @@ func (engine *Engine) SelectInGroup(name, member string) error {
 type Runtime struct {
 	Policy     Policy
 	Selections map[string]string // select group -> member
+	identities map[string]string
+	health     map[string]nodeHealth
+	autoHealth map[string]autoNode
+	activeAuto string
 }
 
 func (engine *Engine) Runtime() Runtime {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	runtime := Runtime{Policy: engine.policy, Selections: map[string]string{}}
+	runtime := Runtime{Policy: engine.policy, Selections: map[string]string{}, identities: engine.outboundIDs,
+		health: make(map[string]nodeHealth, len(engine.health))}
 	for name, g := range engine.groups {
 		if g.Type == GroupSelect {
 			runtime.Selections[name] = g.Selected
+		}
+	}
+	for name, health := range engine.health {
+		if key := engine.probeKeys[name]; key != "" {
+			runtime.health[key] = *health
+		}
+	}
+	if state := engine.auto; state != nil {
+		runtime.activeAuto = engine.outboundIDs[state.activeNode]
+		runtime.autoHealth = make(map[string]autoNode, len(state.health))
+		for name, health := range state.health {
+			if key := engine.probeKeys[name]; key != "" {
+				runtime.autoHealth[key] = health
+			}
 		}
 	}
 	return runtime
@@ -581,15 +601,28 @@ func (engine *Engine) Runtime() Runtime {
 
 // Restore applies what still makes sense of a previous engine's runtime state.
 func (engine *Engine) Restore(runtime Runtime) {
+	resolve := func(name string) string {
+		if runtime.identities != nil {
+			return engine.outboundNames[runtime.identities[name]]
+		}
+		return name
+	}
 	for name, member := range runtime.Selections {
-		engine.SelectInGroup(name, member)
+		engine.SelectInGroup(resolve(name), resolve(member))
+	}
+	policy := runtime.Policy
+	if policy.Mode != "auto" && runtime.identities != nil {
+		policy.Selected = resolve(policy.Selected)
+		if policy.Selected == "" {
+			policy.Selected = "REJECT"
+		}
 	}
 	if runtime.Policy.Mode == "auto" && runtime.Policy.Auto != nil {
 		config := *runtime.Policy.Auto
 		config.Groups = nil
 		for _, group := range runtime.Policy.Auto.Groups {
-			saved := group.Nodes
-			group.Nodes = nil
+			saved, savedIDs := group.Nodes, group.NodeIDs
+			group.Nodes, group.NodeIDs = nil, nil
 			var providerNodes []string
 			if group.ProviderID != "" {
 				for _, sub := range engine.subscriptions {
@@ -604,9 +637,14 @@ func (engine *Engine) Restore(runtime Runtime) {
 					}
 				}
 			}
-			for _, name := range saved {
+			for i, original := range saved {
+				name := resolve(original)
+				if i < len(savedIDs) && savedIDs[i] != "" {
+					name = engine.outboundNames[savedIDs[i]]
+				}
 				if engine.types[name] != "" && (group.ProviderID == "" || slices.Contains(providerNodes, name)) {
 					group.Nodes = append(group.Nodes, name)
+					group.NodeIDs = append(group.NodeIDs, engine.outboundIDs[name])
 				}
 			}
 			if len(group.Nodes) != 0 {
@@ -614,14 +652,56 @@ func (engine *Engine) Restore(runtime Runtime) {
 			}
 		}
 		if len(config.Groups) == 0 {
-			_ = engine.SetPolicy(Policy{Mode: "global", Selected: "REJECT"})
-			return
+			policy = Policy{Mode: "global", Selected: "REJECT"}
+		} else {
+			policy.Auto = &config
 		}
-		runtime.Policy.Auto = &config
 	}
-	if err := engine.SetPolicy(runtime.Policy); err != nil && runtime.Policy.Mode == "auto" {
+	if err := engine.SetPolicy(policy); err != nil && policy.Mode == "auto" {
 		_ = engine.SetPolicy(Policy{Mode: "global", Selected: "REJECT"})
 	}
+	engine.restoreProbeHistory(runtime)
+}
+
+func (engine *Engine) restoreProbeHistory(runtime Runtime) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	for name, key := range engine.probeKeys {
+		if sample, ok := runtime.health[key]; ok {
+			if current := engine.health[name]; current == nil ||
+				maxTime(sample.checked, sample.succeeded).After(maxTime(current.checked, current.succeeded)) {
+				engine.health[name] = &sample
+			}
+		}
+	}
+	if state := engine.auto; state != nil {
+		for _, group := range state.config.Groups {
+			for _, name := range group.Nodes {
+				if sample, ok := runtime.autoHealth[engine.probeKeys[name]]; ok {
+					if _, exists := state.health[name]; !exists {
+						state.health[name] = sample
+					}
+				}
+			}
+		}
+		active := engine.outboundNames[runtime.activeAuto]
+		if state.activeNode == "" && active != "" && state.health[active].viable(state.switching.FailoverFailures) {
+			for i, group := range state.config.Groups {
+				if !state.unavailable[i] && slices.Contains(group.Nodes, active) {
+					state.activeGroup, state.activeNode = i, active
+					break
+				}
+			}
+		}
+		state.orderedCandidates = state.candidates()
+	}
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 // Active reports open connections.

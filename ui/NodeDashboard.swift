@@ -4,6 +4,7 @@ struct NodeProbeResult: Decodable {
     let name: String
     let milliseconds: Int?
     let failure: String?
+    var probeKey: String?
     var inconclusive: Bool?
     var failureStage: String?
     var failureCode: String?
@@ -13,7 +14,7 @@ struct NodeProbeResult: Decodable {
     var receivedAt = Date.now
     var fromRuntime = false
 
-    private enum CodingKeys: String, CodingKey { case name, milliseconds, failure, inconclusive, failureStage, failureCode, target, checkedAt }
+    private enum CodingKeys: String, CodingKey { case name, milliseconds, failure, probeKey, inconclusive, failureStage, failureCode, target, checkedAt }
 
     var isAvailable: Bool { failure == nil && inconclusive != true }
     var isFailure: Bool { failure != nil && inconclusive != true }
@@ -83,7 +84,7 @@ struct NodeDashboard: View {
         let provider: String?
         let pending: Bool
         let result: NodeProbeResult?
-        var id: String { node.name }
+        var id: String { node.probeIdentity }
         var latency: Int { result?.milliseconds ?? .max }
         var rank: Int {
             if pending { return 1 }
@@ -104,16 +105,16 @@ struct NodeDashboard: View {
             }
         }
         let keyword = filter.trimmingCharacters(in: .whitespacesAndNewlines)
-        let health = Dictionary(uniqueKeysWithValues: (core.status?.nodes ?? []).map { ($0.name, $0) })
+        let health = Dictionary((core.status?.nodes ?? []).map { ($0.probeIdentity, $0) }, uniquingKeysWith: { first, _ in first })
         let matches = core.configuredNodes.compactMap { node -> Row? in
             let provider = source[node.name]
-            guard showUnavailable || !core.hiddenNodes.contains(node.name),
+            guard showUnavailable || !core.hiddenNodes.contains(node.probeIdentity),
                   providerID == nil || provider?.id == providerID,
                   keyword.isEmpty || node.name.localizedCaseInsensitiveContains(keyword) ||
                     node.type.localizedCaseInsensitiveContains(keyword) ||
                     provider?.name.localizedCaseInsensitiveContains(keyword) == true else { return nil }
-            let pending = core.probePending.contains(node.name)
-            let result = latestReading(for: node.name, runtime: health[node.name])
+            let pending = core.probePending.contains(node.probeIdentity)
+            let result = latestReading(for: node, runtime: health[node.probeIdentity])
             guard stateFilter.includes(pending: pending, result: result) else { return nil }
             return Row(node: node, provider: provider?.name, pending: pending, result: result)
         }
@@ -124,13 +125,13 @@ struct NodeDashboard: View {
         }
     }
 
-    private func latestReading(for name: String, runtime: ProxyStatus.Node?) -> NodeProbeResult? {
-        let manual = core.probeResults[name]
+    private func latestReading(for node: ProxyStatus.Node, runtime: ProxyStatus.Node?) -> NodeProbeResult? {
+        let manual = core.probeResults[node.probeIdentity]
         guard let runtime, let alive = runtime.alive, let observed = runtime.healthAt else { return manual }
         let time = Date(timeIntervalSince1970: observed / 1000)
         if let manual, manual.observedAt >= time { return manual }
         return NodeProbeResult(
-            name: name,
+            name: node.name,
             milliseconds: runtime.latencyMs,
             failure: alive ? nil : runtime.error ?? "内核报告节点不可用",
             failureStage: runtime.failureStage,
@@ -144,7 +145,8 @@ struct NodeDashboard: View {
     var body: some View {
         let providers = providers
         let rows = rows(providers: providers)
-        let current = core.status?.auto?.node ?? core.status?.policy.selected
+        let currentName = core.status?.auto?.node ?? core.status?.policy.selected
+        let current = core.status?.nodes.first(where: { $0.name == currentName })?.probeIdentity
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center) {
                 HopPageHeading(title: "节点", detail: rows.count == core.configuredNodes.count
@@ -244,7 +246,7 @@ struct NodeDashboard: View {
                             .frame(width: 22)
                             .accessibilityHidden(true)
                             Text(location.title).lineLimit(1).help(node.name)
-                            if current == node.name {
+                            if current == node.probeIdentity {
                                 Image(systemName: "checkmark.circle.fill")
                                     .foregroundStyle(HopAppearance.accent)
                                     .help("当前选定出站")
@@ -273,27 +275,27 @@ struct NodeDashboard: View {
                     TableColumn("操作") { row in
                         Button("测速") {
                             sortByLatency = true
-                            core.testNodes(row.id)
+                            core.testNodes(row.node.name)
                         }
                         .buttonStyle(.borderless)
                         .disabled(core.probeTotal > 0 || core.saving)
                     }.width(62)
                 }
                 .contextMenu(forSelectionType: String.self) { selection in
-                    if selection.count == 1, let name = selection.first {
-                        Button("连接此节点") { core.connectToNode(name) }
+                    if selection.count == 1, let id = selection.first, let node = rows.first(where: { $0.id == id })?.node {
+                        Button("连接此节点") { core.connectToNode(node.name) }
                             .disabled(!core.canConnectToNode)
                         if let status = core.status, status.policy.mode != "auto",
-                           status.nodes.contains(where: { $0.name == name }) {
+                           status.nodes.contains(where: { $0.probeIdentity == node.probeIdentity }) {
                             Button("设为出站") {
-                                core.updatePolicy(Policy(mode: status.policy.mode, selected: name))
+                                core.selectNode(node, mode: status.policy.mode)
                             }
                             .disabled(core.updatingPolicy)
                         }
                     }
                 } primaryAction: { selection in
-                    if selection.count == 1, let name = selection.first {
-                        core.connectToNode(name)
+                    if selection.count == 1, let id = selection.first, let node = rows.first(where: { $0.id == id })?.node {
+                        core.connectToNode(node.name)
                     }
                 }
                 Text("双击节点即可连接。将鼠标移到状态上可查看测试来源、时间和失败原因。")

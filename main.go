@@ -827,8 +827,9 @@ func inspectProfile(ctx context.Context, path string, inspect, probe, refresh bo
 			result.Subs[i].ID = result.Subs[i].Key()
 			result.Subs[i].URL = ""
 		}
-		for _, node := range loaded.Merged.Nodes {
-			result.Nodes = append(result.Nodes, engine.NodeSummary{Name: node.Name, Type: node.Type})
+		probeKeys := config.ProbeKeys()
+		for _, node := range config.Nodes {
+			result.Nodes = append(result.Nodes, engine.NodeSummary{Name: node.Name, Type: node.Type, ProbeKey: probeKeys[node.Name]})
 		}
 		return output.Encode(result)
 	}

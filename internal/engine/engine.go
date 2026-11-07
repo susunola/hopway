@@ -54,7 +54,8 @@ type Config struct {
 	ConnectionHistory ConnectionHistoryConfig `json:"connectionHistory,omitzero"`
 
 	// DataDir holds caches (downloaded rule sets). Set by the caller, not saved.
-	DataDir string `json:"-"`
+	DataDir     string            `json:"-"`
+	OutboundIDs map[string]string `json:"-"` // assigned by the subscription merge
 }
 
 type TUNConfig struct {
@@ -131,14 +132,16 @@ func Decode(reader io.Reader) (Config, error) {
 }
 
 type Policy struct {
-	Auto     *AutoConfig `json:"auto,omitempty"`
-	Mode     string      `json:"mode"`
-	Selected string      `json:"selected"`
+	Auto             *AutoConfig `json:"auto,omitempty"`
+	Mode             string      `json:"mode"`
+	Selected         string      `json:"selected"`
+	ExpectedProbeKey string      `json:"expectedProbeKey,omitempty"`
 }
 
 type NodeSummary struct {
 	Name         string `json:"name"`
 	Type         string `json:"type"`
+	ProbeKey     string `json:"probeKey,omitempty"`
 	LatencyMs    int64  `json:"latencyMs,omitempty"`
 	Alive        *bool  `json:"alive,omitempty"`
 	Error        string `json:"error,omitempty"`
@@ -219,6 +222,9 @@ type Engine struct {
 	dialSlots     map[string]*endpointSlots
 	types         map[string]string
 	servers       map[string]string
+	outboundIDs   map[string]string
+	outboundNames map[string]string
+	probeKeys     map[string]string
 	order         []string
 	groups        map[string]*group
 	health        map[string]*nodeHealth
@@ -349,6 +355,17 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 	for _, g := range config.Groups {
 		engine.order = append(engine.order, g.Name)
 	}
+	engine.outboundIDs = make(map[string]string, len(engine.order))
+	engine.outboundNames = make(map[string]string, len(engine.order))
+	for _, name := range engine.order {
+		id := config.OutboundID(name, engine.groups[name] != nil)
+		engine.outboundIDs[name] = id
+		if _, ambiguous := engine.outboundNames[id]; ambiguous {
+			engine.outboundNames[id] = ""
+		} else {
+			engine.outboundNames[id] = name
+		}
+	}
 	engine.dataDir = config.DataDir
 	if err := engine.openRuleSets(ctx, config, indexes); err != nil {
 		return nil, err
@@ -396,6 +413,7 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 	if impl == nil {
 		return engine, nil // validation only
 	}
+	engine.probeKeys = config.ProbeKeys()
 	if budget == nil {
 		budget = newResourceBudget(resources)
 	}
@@ -543,6 +561,9 @@ func (engine *Engine) ValidatePolicy(policy Policy) error {
 	} else if !engine.valid(policy.Selected) {
 		return errors.New("selected outbound does not exist")
 	}
+	if policy.ExpectedProbeKey != "" && policy.ExpectedProbeKey != engine.probeKeys[policy.Selected] {
+		return errors.New("节点配置已变化，请刷新后重试")
+	}
 	return nil
 }
 
@@ -550,6 +571,7 @@ func (engine *Engine) SetPolicy(policy Policy) error {
 	if err := engine.ValidatePolicy(policy); err != nil {
 		return err
 	}
+	policy.ExpectedProbeKey = ""
 	engine.mu.Lock()
 	if engine.auto != nil && engine.auto.cancel != nil {
 		engine.auto.cancel()
@@ -1225,7 +1247,7 @@ func (engine *Engine) status(includeConnections bool) Status {
 		}
 	}
 	for _, name := range engine.order {
-		summary := NodeSummary{Name: name, Type: engine.types[name]}
+		summary := NodeSummary{Name: name, Type: engine.types[name], ProbeKey: engine.probeKeys[name]}
 		if g := engine.groups[name]; g != nil {
 			summary.Type = "group"
 			now := ""
