@@ -89,10 +89,11 @@ type NodeSummary struct {
 }
 
 type GroupStatus struct {
-	Name    string   `json:"name"`
-	Type    string   `json:"type"`
-	Members []string `json:"members"`
-	Now     string   `json:"now"` // node currently used
+	Name     string   `json:"name"`
+	Type     string   `json:"type"`
+	Members  []string `json:"members"`
+	Now      string   `json:"now"`                // node currently used
+	Selected string   `json:"selected,omitempty"` // select groups: the member chosen
 }
 
 // Record describes one connection. Timings are milliseconds.
@@ -686,7 +687,7 @@ func (engine *Engine) Status() Status {
 			if list := engine.choices(name); len(list) != 0 {
 				now = list[0].via
 			}
-			status.Groups = append(status.Groups, GroupStatus{Name: name, Type: g.Type, Members: g.Members, Now: now})
+			status.Groups = append(status.Groups, GroupStatus{Name: name, Type: g.Type, Members: g.Members, Now: now, Selected: g.Selected})
 		}
 		if h := engine.health[name]; h != nil {
 			alive := h.alive

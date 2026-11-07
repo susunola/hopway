@@ -99,8 +99,46 @@ struct ProxyStatus: Decodable {
         let error: String?
     }
 
+    struct PolicyGroup: Decodable, Identifiable {
+        let name: String
+        let type: String
+        let members: [String]
+        let now: String
+        let selected: String?
+        var id: String { name }
+
+        var typeLabel: String {
+            switch type {
+            case "select": "手动选择"
+            case "url-test": "自动选最快"
+            case "fallback": "故障转移"
+            default: type
+            }
+        }
+    }
+
+    struct Subscription: Decodable, Identifiable {
+        let name: String
+        let url: String
+        let nodes: Int
+        let updated: Double?
+        let error: String?
+        var id: String { url }
+    }
+
+    struct RuleSet: Decodable, Identifiable {
+        let name: String
+        let entries: Int
+        let updated: Double?
+        let error: String?
+        var id: String { name }
+    }
+
     let policy: Policy
     let warnings: [String]?
+    let groups: [PolicyGroup]?
+    let subscriptions: [Subscription]?
+    let ruleSets: [RuleSet]?
     let systemProxy: SystemProxy?
     let tun: TUN?
     let nodes: [Node]
@@ -377,6 +415,41 @@ final class CoreModel: ObservableObject {
                 if endpoint?.token == info.token { message = "增强模式服务操作失败 · " + error.localizedDescription }
             }
         }
+    }
+
+    /// Picks the member a select group uses.
+    func selectInGroup(_ group: String, member: String) {
+        guard let info = endpoint else { return }
+        Task {
+            do {
+                struct Body: Encodable { let selected: String }
+                _ = try await call(info, path: "groups/" + group, method: "PUT", body: JSONEncoder().encode(Body(selected: member)))
+                await refresh(info)
+            } catch {
+                if endpoint?.token == info.token { message = "切换失败 · " + error.localizedDescription }
+            }
+        }
+    }
+
+    /// Starts a background request (probe, refresh) and re-reads status shortly after.
+    func trigger(_ path: String, done text: String) {
+        guard let info = endpoint else { return }
+        message = text
+        Task {
+            do {
+                _ = try await call(info, path: path, method: "POST")
+                try? await Task.sleep(for: .seconds(4))
+                await refresh(info)
+                if message == text { message = nil }
+            } catch {
+                if endpoint?.token == info.token { message = error.localizedDescription }
+            }
+        }
+    }
+
+    /// "HK 01 · 83 ms" for a member of a group.
+    func memberLabel(_ name: String) -> String {
+        status?.nodes.first(where: { $0.name == name })?.label ?? name
     }
 
     func importClipboard() {
