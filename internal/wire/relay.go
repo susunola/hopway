@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"io"
 	"net"
+	"sync"
 )
 
 type BufferedConn struct {
@@ -26,10 +27,26 @@ func CloseWrite(conn net.Conn) error {
 	return conn.Close()
 }
 
+var relayBuffers = sync.Pool{New: func() any { return new([32 * 1024]byte) }}
+
+func copyRelay(destination io.Writer, source io.Reader) (int64, error) {
+	// Preserve the connection's optimized copy methods when present.
+	if _, ok := source.(io.WriterTo); ok {
+		return io.Copy(destination, source)
+	}
+	if _, ok := destination.(io.ReaderFrom); ok {
+		return io.Copy(destination, source)
+	}
+	// Stream wrappers used by the proxy fall back to a regular buffer.
+	buffer := relayBuffers.Get().(*[32 * 1024]byte)
+	defer relayBuffers.Put(buffer)
+	return io.CopyBuffer(destination, source, buffer[:])
+}
+
 func Relay(client, upstream net.Conn) {
 	results := make(chan error, 2)
 	copyStream := func(destination, source net.Conn) {
-		_, err := io.Copy(destination, source)
+		_, err := copyRelay(destination, source)
 		if err == nil {
 			err = CloseWrite(destination)
 		}
