@@ -583,7 +583,7 @@ private struct Dashboard: View {
         ScrollView {
             VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
                 HStack {
-                    HopPageHeading(title: "设置", detail: "接入方式和常用配置")
+                    HopPageHeading(title: "设置", detail: "启动偏好、接入端口和高级配置")
                     Spacer()
                     Button(action: core.exportDiagnostics) {
                         Label(core.exportingDiagnostics ? "正在生成…" : "导出诊断…", systemImage: "doc.text.magnifyingglass")
@@ -591,67 +591,11 @@ private struct Dashboard: View {
                     .fixedSize()
                     .disabled(core.exportingDiagnostics)
                 }
-                accessSettings
                 AdvancedSettingsPanel(core: core, draft: $advancedDraft) { showsConfigurationEditor = true }
                 configurationFeedback
             }
             .padding(.bottom, 12)
         }
-    }
-
-    private var accessSettings: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Label("macOS 接入", systemImage: "network").font(.headline)
-            switch core.phase {
-            case .stopped:
-                let enabled = [
-                    core.configuredProfile?.systemProxy == true ? "系统代理" : nil,
-                    core.configuredProfile?.tunEnabled == true ? "TUN" : nil
-                ].compactMap { $0 }
-                Text(enabled.isEmpty ? "未接管 · 可在下方设置启动时的接入方式" : "未接管 · 启动时开启 " + enabled.joined(separator: "、"))
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            case .starting, .stopping:
-                ProgressView(core.phase.rawValue).controlSize(.small)
-            case .running:
-                if let status = core.status {
-                    HStack(spacing: 20) {
-                        Toggle("系统代理", isOn: Binding(
-                            get: { status.systemProxy?.enabled ?? false }, set: core.setSystemProxy))
-                            .disabled(status.systemProxy?.supported != true || core.statusReadFailed)
-                            .fixedSize()
-                        Toggle("TUN 增强模式", isOn: Binding(
-                            get: { status.tun?.enabled ?? false }, set: core.setTUN))
-                            .disabled(status.tun?.supported != true || core.statusReadFailed || core.changingTUN)
-                            .fixedSize()
-                        Spacer()
-                        if status.tun?.supported == true {
-                            Menu("TUN 助手") {
-                                Button(status.tun?.service == true ? "移除助手" : "安装助手") {
-                                    core.setTUNService(status.tun?.service != true)
-                                }
-                            }
-                            .fixedSize()
-                            .disabled(core.statusReadFailed || core.changingTUN)
-                        }
-                    }
-                    if let error = status.systemProxy?.error {
-                        Label("系统代理 · " + error, systemImage: "exclamationmark.circle")
-                            .font(.callout).foregroundStyle(HopAppearance.warning)
-                    }
-                    if let error = status.tun?.error {
-                        Label("TUN · " + error, systemImage: "exclamationmark.circle")
-                            .font(.callout).foregroundStyle(HopAppearance.warning)
-                    }
-                } else if core.statusReadFailed {
-                    Text("暂时无法读取接入状态。").font(.callout).foregroundStyle(HopAppearance.warning)
-                } else {
-                    ProgressView("正在读取接入状态…").controlSize(.small)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .hopPanel()
     }
 
     @ViewBuilder

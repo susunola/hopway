@@ -39,6 +39,7 @@ struct OverviewDashboard: View {
         VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
             HopPageHeading(title: "概览").padding(.bottom, 2)
             proxyControl
+            accessIssues
             if core.statusReadFailed {
                 Label(core.statusReadAt.map { "状态读取失败，显示 " + $0.formatted(date: .omitted, time: .standard) + " 的记录" }
                       ?? "暂时无法读取内核状态", systemImage: "exclamationmark.circle")
@@ -76,7 +77,7 @@ struct OverviewDashboard: View {
             }
             .accessibilityElement(children: .combine)
             Spacer(minLength: 10)
-            controlMetric("接入方式", value: core.accessLabel)
+            proxyAccessControls
             controlMetric("活动连接", value: core.status.map { $0.active.formatted() } ?? (core.phase == .stopped ? "0" : "—"))
             Button(action: core.toggle) {
                 Label(running || core.phase == .stopping ? "停止代理" : "启动代理", systemImage: "power")
@@ -95,6 +96,47 @@ struct OverviewDashboard: View {
                     startPoint: .leading, endPoint: .trailing
                 ))
         }
+    }
+
+    private var proxyAccessControls: some View {
+        let status = core.status
+        let ready = running && !core.statusReadFailed
+        return VStack(alignment: .leading, spacing: 5) {
+            Text("macOS 接入 · " + (core.phase == .stopped ? "启动后可切换" : core.accessLabel))
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.72))
+                .lineLimit(1)
+            HStack(spacing: 12) {
+                Toggle("系统代理", isOn: Binding(
+                    get: { status?.systemProxy?.enabled == true }, set: core.setSystemProxy))
+                    .disabled(!ready || status?.systemProxy?.supported != true)
+                Toggle("TUN 增强模式", isOn: Binding(
+                    get: { status?.tun?.enabled == true }, set: core.setTUN))
+                    .disabled(!ready || status?.tun?.supported != true || core.changingTUN)
+            }
+            .font(.callout)
+            .toggleStyle(.checkbox)
+            .tint(HopAppearance.mint)
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    @ViewBuilder
+    private var accessIssues: some View {
+        if running, let status = core.status {
+            if let error = status.systemProxy?.error {
+                accessIssue("系统代理 · " + error)
+            }
+            if let error = status.tun?.error {
+                accessIssue("TUN · " + error)
+            }
+        }
+    }
+
+    private func accessIssue(_ text: String) -> some View {
+        Label(text, systemImage: "exclamationmark.circle")
+            .font(.callout)
+            .foregroundStyle(HopAppearance.warning)
     }
 
     private func controlMetric(_ title: String, value: String) -> some View {

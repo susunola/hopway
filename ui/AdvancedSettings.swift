@@ -300,6 +300,16 @@ struct AdvancedSettingsPanel: View {
                         .fixedSize()
                     Toggle("TUN 接管 IPv6", isOn: values.ipv6)
                         .fixedSize()
+                    Spacer(minLength: 0)
+                    let tun = core.status?.tun
+                    Menu("TUN 助手") {
+                        Button(tun?.service == true ? "移除助手" : "安装助手") {
+                            core.setTUNService(tun?.service != true)
+                        }
+                    }
+                    .fixedSize()
+                    .disabled(core.phase != .running || tun?.supported != true || core.statusReadFailed || core.changingTUN)
+                    .help(core.phase == .stopped ? "启动代理后可管理 TUN 助手。" : "管理 TUN 助手")
                 }
                 hint("IPv6 设置在下次开启 TUN 时生效。")
             }
