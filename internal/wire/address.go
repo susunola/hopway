@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -32,23 +33,30 @@ func Split(target string) (string, uint16, error) {
 
 // EncodeAddress uses the common SOCKS5 address layout, including the port.
 func EncodeAddress(target string) ([]byte, error) {
+	return AppendAddress(nil, target)
+}
+
+// AppendAddress adds a SOCKS5 address and port to dst.
+func AppendAddress(dst []byte, target string) ([]byte, error) {
 	host, port, err := Split(target)
 	if err != nil {
 		return nil, err
 	}
-	var address []byte
 	ip := net.ParseIP(host)
 	switch {
 	case ip.To4() != nil:
-		address = append([]byte{1}, ip.To4()...)
+		dst = append(slices.Grow(dst, 7), 1)
+		dst = append(dst, ip.To4()...)
 	case ip != nil:
-		address = append([]byte{4}, ip.To16()...)
+		dst = append(slices.Grow(dst, 19), 4)
+		dst = append(dst, ip.To16()...)
 	case len(host) <= 255:
-		address = append([]byte{3, byte(len(host))}, host...)
+		dst = append(slices.Grow(dst, 4+len(host)), 3, byte(len(host)))
+		dst = append(dst, host...)
 	default:
 		return nil, errors.New("destination name exceeds 255 bytes")
 	}
-	return binary.BigEndian.AppendUint16(address, port), nil
+	return binary.BigEndian.AppendUint16(dst, port), nil
 }
 
 func ReadAddress(reader io.Reader, kind byte) (string, error) {

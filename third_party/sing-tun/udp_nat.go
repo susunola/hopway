@@ -690,6 +690,8 @@ func (c *udpNatConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) er
 	return c.writer.WritePacket(buffer, destination)
 }
 
+func (c *udpNatConn) UpstreamWriter() any { return c.writer }
+
 func (c *udpNatConn) CreatePacketBatchWriter() (N.PacketBatchWriter, bool) {
 	if c.service.filtering != NATFilteringEndpointIndependent {
 		return nil, false

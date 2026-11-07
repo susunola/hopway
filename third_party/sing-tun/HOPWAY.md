@@ -12,3 +12,6 @@ queue. The stack reserves before allocating and returns capacity on read,
 discard, expiration, eviction and close. An upstream failure can also count
 the unread packets it discards. Without a budget and callback, applications
 keep the original queue behavior.
+
+The UDP NAT connection exposes its underlying writer so callers can reserve
+packet header space before reading a reply.

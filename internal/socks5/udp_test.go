@@ -7,6 +7,7 @@ import (
 	"net"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,12 +16,12 @@ import (
 	"mac-proxy/internal/wire"
 )
 
-func openUDPAssociation(t *testing.T, dial DialPacketFunc) (*net.UDPConn, *net.UDPAddr) {
+func openUDPAssociation(t testing.TB, dial DialPacketFunc) (*net.UDPConn, *net.UDPAddr) {
 	t.Helper()
 	return openUDPAssociationWithIdle(t, dial, udpSessionIdle)
 }
 
-func openUDPAssociationWithIdle(t *testing.T, dial DialPacketFunc, idle time.Duration) (*net.UDPConn, *net.UDPAddr) {
+func openUDPAssociationWithIdle(t testing.TB, dial DialPacketFunc, idle time.Duration) (*net.UDPConn, *net.UDPAddr) {
 	t.Helper()
 	loopback := net.IPv4(127, 0, 0, 1)
 	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: loopback})
@@ -318,27 +319,33 @@ func TestUDPAssociationRelaysOutOfOrderAndDuplicateReplies(t *testing.T) {
 	client, relay := openUDPAssociation(t, func(ctx context.Context, _, target string) (net.PacketConn, error) {
 		return backend.DirectPacket(ctx, target, nil)
 	})
-	sendUDP(t, client, relay, target, "first")
-	sendUDP(t, client, relay, target, "second")
-	var buffer [128]byte
+	const largePayloadSize = 8000
+	requests := []string{"first", "", strings.Repeat("q", largePayloadSize), "second"}
+	for _, request := range requests {
+		sendUDP(t, client, relay, target, request)
+	}
+	buffer := make([]byte, 65535)
 	origin.SetDeadline(time.Now().Add(time.Second))
 	var returnAddress *net.UDPAddr
-	for range 2 {
-		_, returnAddress, err = origin.ReadFromUDP(buffer[:])
+	for _, request := range requests {
+		var n int
+		n, returnAddress, err = origin.ReadFromUDP(buffer)
 		if err != nil {
 			t.Fatal(err)
 		}
+		if string(buffer[:n]) != request {
+			t.Fatalf("upstream packet differs, got %d bytes, want %d", n, len(request))
+		}
 	}
-	replies := []string{"second", "first", "second", "third"}
+	replies := []string{"second", "", strings.Repeat("r", largePayloadSize), "first", "second", "third"}
 	for _, reply := range replies {
 		if _, err := origin.WriteToUDP([]byte(reply), returnAddress); err != nil {
 			t.Fatal(err)
 		}
 	}
 	client.SetReadDeadline(time.Now().Add(time.Second))
-	var received []string
-	for range replies {
-		n, _, err := client.ReadFromUDP(buffer[:])
+	for i, want := range replies {
+		n, _, err := client.ReadFromUDP(buffer)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -346,10 +353,9 @@ func TestUDPAssociationRelaysOutOfOrderAndDuplicateReplies(t *testing.T) {
 		if err != nil || from != target {
 			t.Fatalf("unexpected reply source %q: %v", from, err)
 		}
-		received = append(received, string(payload))
-	}
-	if !slices.Equal(received, replies) {
-		t.Fatalf("replies = %v, want %v", received, replies)
+		if string(payload) != want {
+			t.Fatalf("reply %d differs, got %d bytes, want %d", i, len(payload), len(want))
+		}
 	}
 }
 

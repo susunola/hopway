@@ -3,6 +3,7 @@
 package tun
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
@@ -43,7 +44,7 @@ func TestDevice(t *testing.T) {
 	udpEcho, _ := net.ListenPacket("udp", "127.0.0.1:0")
 	defer udpEcho.Close()
 	go func() {
-		buffer := make([]byte, 2048)
+		buffer := make([]byte, 65535)
 		for {
 			n, from, err := udpEcho.ReadFrom(buffer)
 			if err != nil {
@@ -88,7 +89,7 @@ func TestDevice(t *testing.T) {
 	<-started
 	defer upstream.Shutdown()
 
-	service, err := Start(Options{Name: "hwtest0", AutoRoute: true, UpstreamDNS: []string{upstream.PacketConn.LocalAddr().String()},
+	service, err := Start(Options{Name: "hwtest0", MTU: 40000, AutoRoute: true, UpstreamDNS: []string{upstream.PacketConn.LocalAddr().String()},
 		RouteAddress: []netip.Prefix{DefaultFakeRange}}, core.Dial, core.DialPacket)
 	if err != nil {
 		t.Skipf("cannot create a TUN device here: %v", err)
@@ -157,6 +158,19 @@ func TestDevice(t *testing.T) {
 	n, err := udpConn.Read(buffer)
 	if err != nil || string(buffer[:n]) != "datagram" {
 		t.Fatalf("udp echo %q %v", buffer[:n], err)
+	}
+	// A larger MTU must not truncate payloads to the former 16 KiB copy buffer.
+	large := bytes.Repeat([]byte{0x6b}, 32000)
+	received := make([]byte, len(large)+1)
+	for _, payload := range [][]byte{large, nil, []byte("short packet after jumbo")} {
+		udpConn.SetDeadline(time.Now().Add(3 * time.Second))
+		if n, err := udpConn.Write(payload); err != nil || n != len(payload) {
+			t.Fatalf("sent %d / %d UDP bytes: %v", n, len(payload), err)
+		}
+		n, err := udpConn.Read(received)
+		if err != nil || !bytes.Equal(received[:n], payload) {
+			t.Fatalf("received %d / %d UDP bytes: %v", n, len(payload), err)
+		}
 	}
 	// Non-address queries sent to the tunnel go to the real upstream.
 	txt := new(dns.Msg)

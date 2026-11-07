@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 
 	"mac-proxy/internal/backend"
@@ -25,6 +26,7 @@ const (
 	udpSessionIdle           = 5 * time.Minute
 	udpWriteTimeout          = 2 * time.Second
 	maxUDPAssociations       = 256
+	udpReplyHeadroom         = 3 + 1 + 1 + 255 + 2 // RSV/FRAG, ATYP, domain length, name and port
 )
 
 var udpAssociations = make(chan struct{}, maxUDPAssociations)
@@ -165,7 +167,8 @@ func (s *udpSession) enqueue(payload []byte) bool {
 		wire.SOCKSUDPDrops.Add(wire.UDPQueueFull, 1)
 		return false
 	}
-	s.queue <- bytes.Clone(payload)
+	buffer := buf.Get(len(payload))
+	s.queue <- append(buffer[:0], payload...)
 	return true
 }
 
@@ -180,12 +183,15 @@ func (s *udpSession) discard(err error) {
 }
 
 func releaseUDPData(data []byte) {
+	if data != nil {
+		_ = buf.Put(data)
+	}
 	wire.UDPQueue.Release(udpQueueCharge(len(data)))
 }
 
 func udpQueueCharge(size int) int {
 	// Include the slice header and round up to cover allocation size classes.
-	return 32 + 1<<bits.Len(uint(max(size, 1)-1))
+	return 32 + 1<<bits.Len(uint(max(size, 64)-1))
 }
 
 func (s *udpSession) run(relay *net.UDPConn, client netip.AddrPort, target string, dial DialPacketFunc) error {
@@ -236,14 +242,15 @@ func (s *udpSession) run(relay *net.UDPConn, client netip.AddrPort, target strin
 }
 
 func (s *udpSession) replies(session net.PacketConn, relay *net.UDPConn, client netip.AddrPort) {
-	buffer := make([]byte, 65535)
+	buffer := make([]byte, udpReplyHeadroom+65535)
+	var header [udpReplyHeadroom]byte
 	for s.ctx.Err() == nil {
 		remaining := s.idle - (time.Since(s.started) - time.Duration(s.lastActive.Load()))
 		if remaining <= 0 {
 			return
 		}
 		_ = session.SetReadDeadline(time.Now().Add(remaining))
-		n, from, err := session.ReadFrom(buffer)
+		n, from, err := session.ReadFrom(buffer[udpReplyHeadroom:])
 		if err != nil {
 			if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
 				continue
@@ -254,16 +261,13 @@ func (s *udpSession) replies(session net.PacketConn, relay *net.UDPConn, client 
 			return
 		}
 		s.touch()
-		address, err := wire.EncodeAddress(M.SocksaddrFromNet(from).String())
-		if socks, ok := from.(M.Socksaddr); ok {
-			address, err = wire.EncodeAddress(socks.String())
-		}
+		prefix, err := wire.AppendAddress(header[:3], M.SocksaddrFromNet(from).String())
 		if err != nil {
 			continue
 		}
-		datagram := append([]byte{0, 0, 0}, address...)
-		datagram = append(datagram, buffer[:n]...)
-		if _, err := relay.WriteToUDPAddrPort(datagram, client); err != nil {
+		start := udpReplyHeadroom - len(prefix)
+		copy(buffer[start:udpReplyHeadroom], prefix)
+		if _, err := relay.WriteToUDPAddrPort(buffer[start:udpReplyHeadroom+n], client); err != nil {
 			return
 		}
 	}

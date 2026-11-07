@@ -409,25 +409,27 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	}
 	written := M.ParseSocksaddr(target)
 	lifetime, _ := conn.(interface{ SetTimeout(time.Duration) bool })
+	downloadOptions := N.NewReadWaitOptions(nil, conn)
 	go func() {
-		buffer := make([]byte, 65535)
 		for {
-			n, from, err := remote.ReadFrom(buffer)
+			packet := downloadOptions.NewBufferSize(65535)
+			n, from, err := remote.ReadFrom(packet.FreeBytes())
 			if err != nil {
+				packet.Release()
 				finish(nil)
 				return
 			}
 			key := M.SocksaddrFromNet(from)
-			if socks, ok := from.(M.Socksaddr); ok {
-				key = socks
-			}
 			original := key
 			if key == written {
 				original = destination // restore the original address, often a fake IP
 			} else if !original.IsIP() {
+				packet.Release()
 				continue
 			}
-			if err := conn.WritePacket(buf.As(append([]byte(nil), buffer[:n]...)), original); err != nil {
+			packet.Truncate(n)
+			downloadOptions.PostReturn(packet)
+			if err := conn.WritePacket(packet, original); err != nil {
 				finish(err)
 				return
 			}
@@ -439,23 +441,38 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 			}
 		}
 	}()
+	var readPacket func() (*buf.Buffer, M.Socksaddr, error)
+	var scratch *buf.Buffer
+	if waiter, ok := conn.(N.PacketReadWaiter); ok && !waiter.InitializeReadWaiter(N.ReadWaitOptions{}) {
+		readPacket = waiter.WaitReadPacket
+	} else {
+		scratch = buf.NewSize(max(buf.UDPBufferSize, int(s.options.MTU)))
+		defer scratch.Release()
+		readPacket = func() (*buf.Buffer, M.Socksaddr, error) {
+			scratch.Reset()
+			to, err := conn.ReadPacket(scratch)
+			return scratch, to, err
+		}
+	}
 	for {
-		packet := buf.NewPacket()
-		to, err := conn.ReadPacket(packet)
-		if err != nil {
+		packet, to, err := readPacket()
+		if err == nil {
+			if to == destination {
+				_, writeErr := remote.WriteTo(packet.Bytes(), written)
+				if writeErr != nil && ctx.Err() == nil && !errors.Is(writeErr, net.ErrClosed) {
+					wire.TUNUDPDrops.Add(backend.PacketDropReason(writeErr), 1)
+				}
+			} else {
+				wire.TUNUDPDrops.Add(wire.UDPInvalid, 1)
+			}
+		}
+		if packet != scratch {
 			packet.Release()
+		}
+		if err != nil {
 			finish(nil)
 			return
 		}
-		if to == destination {
-			_, err := remote.WriteTo(packet.Bytes(), written)
-			if err != nil && ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
-				wire.TUNUDPDrops.Add(backend.PacketDropReason(err), 1)
-			}
-		} else {
-			wire.TUNUDPDrops.Add(wire.UDPInvalid, 1)
-		}
-		packet.Release()
 	}
 }
 
