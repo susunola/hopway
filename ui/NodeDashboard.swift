@@ -28,25 +28,59 @@ struct NodeDashboard: View {
     @State private var sortByLatency = false
     @State private var showUnavailable = false
 
-    private var rows: [ProxyStatus.Node] {
-        let matches = core.configuredNodes.filter {
-            (showUnavailable || !core.hiddenNodes.contains($0.name)) &&
-                (filter.isEmpty || $0.name.localizedCaseInsensitiveContains(filter) || $0.type.localizedCaseInsensitiveContains(filter))
+    @State private var providerID: String?
+
+    private struct Row: Identifiable {
+        let node: ProxyStatus.Node
+        let provider: String?
+        let pending: Bool
+        let result: NodeProbeResult?
+        var id: String { node.name }
+        var latency: Int { result?.milliseconds ?? .max }
+        var rank: Int {
+            if pending { return 1 }
+            if result == nil { return 2 }
+            return result?.failure == nil ? 0 : 3
         }
-        guard sortByLatency else { return matches }
-        return matches.sorted { latencyRank($0.name) < latencyRank($1.name) }
     }
 
-    private func latencyRank(_ name: String) -> Int {
-        guard !core.probePending.contains(name), let result = core.probeResults[name],
-              result.failure == nil else { return .max }
-        return result.milliseconds ?? .max
+    private var providers: [SubscriptionSummary] {
+        core.subscriptions.filter { !$0.isPaused && !($0.nodes ?? []).isEmpty }
+    }
+
+    private func rows(providers: [SubscriptionSummary]) -> [Row] {
+        var source: [String: SubscriptionSummary] = [:]
+        for provider in providers {
+            for name in provider.nodes ?? [] where source[name] == nil {
+                source[name] = provider
+            }
+        }
+        let keyword = filter.trimmingCharacters(in: .whitespacesAndNewlines)
+        let matches = core.configuredNodes.compactMap { node -> Row? in
+            let provider = source[node.name]
+            guard showUnavailable || !core.hiddenNodes.contains(node.name),
+                  providerID == nil || provider?.id == providerID,
+                  keyword.isEmpty || node.name.localizedCaseInsensitiveContains(keyword) ||
+                    node.type.localizedCaseInsensitiveContains(keyword) ||
+                    provider?.name.localizedCaseInsensitiveContains(keyword) == true else { return nil }
+            return Row(node: node, provider: provider?.name, pending: core.probePending.contains(node.name),
+                       result: core.probeResults[node.name])
+        }
+        guard sortByLatency else { return matches }
+        return matches.sorted {
+            if $0.rank != $1.rank { return $0.rank < $1.rank }
+            return $0.rank == 0 && $0.latency < $1.latency
+        }
     }
 
     var body: some View {
+        let providers = providers
+        let rows = rows(providers: providers)
+        let current = core.status?.auto?.node ?? core.status?.policy.selected
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center) {
-                HopPageHeading(title: "节点", detail: "\(core.configuredNodes.count) 个节点")
+                HopPageHeading(title: "节点", detail: rows.count == core.configuredNodes.count
+                               ? "\(rows.count) 个节点" : "显示 \(rows.count) / \(core.configuredNodes.count) 个节点")
                 Spacer()
                 Menu {
                     Button("输入链接…", action: importLink)
@@ -75,8 +109,19 @@ struct NodeDashboard: View {
             }
             if !core.configuredNodes.isEmpty {
                 HStack {
-                    HopSearchField(placeholder: "搜索名称或协议", text: $filter)
-                        .frame(width: 215)
+                    HopSearchField(placeholder: "搜索节点、协议或订阅", text: $filter)
+                        .frame(minWidth: 140, idealWidth: 210, maxWidth: 245)
+                    if !providers.isEmpty {
+                        Picker("订阅来源", selection: $providerID) {
+                            Text("全部订阅").tag(String?.none)
+                            ForEach(providers) { provider in
+                                Text(provider.name).tag(Optional(provider.id))
+                            }
+                        }
+                        .labelsHidden()
+                        .accessibilityLabel("订阅来源")
+                        .frame(maxWidth: 145)
+                    }
                     Spacer()
                     if !core.hiddenNodes.isEmpty {
                         Toggle("显示暂不可用（\(core.hiddenNodes.count)）", isOn: $showUnavailable)
@@ -104,11 +149,14 @@ struct NodeDashboard: View {
             } else if rows.isEmpty {
                 ContentUnavailableView(
                     "没有可显示的节点", systemImage: "magnifyingglass",
-                    description: Text(core.hiddenNodes.isEmpty ? "试试其他关键词。" : "可开启「显示暂不可用」查看已隐藏的节点。")
+                    description: Text(core.hiddenNodes.isEmpty || showUnavailable
+                        ? "试试其他关键词或订阅。"
+                        : "可以清除筛选，或显示暂不可用的节点。")
                 )
             } else {
                 Table(rows, selection: $selectedNode) {
-                    TableColumn("节点名称") { node in
+                    TableColumn("节点名称") { row in
+                        let node = row.node
                         let location = NodeLocation(name: node.name)
                         HStack(spacing: 8) {
                             Group {
@@ -123,7 +171,7 @@ struct NodeDashboard: View {
                             .frame(width: 22)
                             .accessibilityHidden(true)
                             Text(location.title).lineLimit(1).help(node.name)
-                            if (core.status?.auto?.node ?? core.status?.policy.selected) == node.name {
+                            if current == node.name {
                                 Image(systemName: "checkmark.circle.fill")
                                     .foregroundStyle(HopAppearance.accent)
                                     .help("当前选定出站")
@@ -132,23 +180,27 @@ struct NodeDashboard: View {
                         }
                     }.width(min: 155, ideal: 265)
                     TableColumn("协议") {
-                        Text($0.type.uppercased())
+                        Text($0.node.type.uppercased())
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
                     }.width(min: 70, ideal: 84)
-                    TableColumn("状态") { node in statusCell(node.name) }.width(min: 85, ideal: 100)
-                    TableColumn("延迟") { node in
-                        if !core.probePending.contains(node.name), let result = core.probeResults[node.name],
-                           result.failure == nil, let milliseconds = result.milliseconds {
+                    TableColumn("订阅") { row in
+                        Text(row.provider ?? "本地").lineLimit(1)
+                            .foregroundStyle(.secondary)
+                            .help(row.provider ?? "本地节点")
+                    }.width(min: 58, ideal: 105)
+                    TableColumn("状态") { row in statusCell(row) }.width(min: 72, ideal: 86)
+                    TableColumn("延迟") { row in
+                        if row.rank == 0, let milliseconds = row.result?.milliseconds {
                             Text("\(milliseconds) ms").monospacedDigit()
                         } else {
                             Text("—").foregroundStyle(.secondary)
                         }
-                    }.width(min: 85, ideal: 100)
-                    TableColumn("操作") { node in
+                    }.width(min: 64, ideal: 78)
+                    TableColumn("操作") { row in
                         Button("测速") {
                             sortByLatency = true
-                            core.testNodes(node.name)
+                            core.testNodes(row.id)
                         }
                         .buttonStyle(.borderless)
                         .disabled(core.probeTotal > 0 || core.saving)
@@ -176,15 +228,18 @@ struct NodeDashboard: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .onChange(of: providers.map(\.id)) { _, ids in
+            if let providerID, !ids.contains(providerID) { self.providerID = nil }
+        }
     }
 
-    private func statusCell(_ name: String) -> some View {
+    private func statusCell(_ row: Row) -> some View {
         Group {
-            if core.probePending.contains(name) {
+            if row.pending {
                 Label("测试中", systemImage: "clock").foregroundStyle(.secondary)
-            } else if let result = core.probeResults[name] {
+            } else if let result = row.result {
                 Label(result.status, systemImage: result.failure == nil ? "checkmark.circle.fill" : "exclamationmark.circle")
-                    .foregroundStyle(result.failure == nil ? Color.green : .orange)
+                    .foregroundStyle(result.failure == nil ? HopAppearance.accent : .orange)
                     .help(result.explanation)
             } else {
                 Text("未测试").foregroundStyle(.secondary)
