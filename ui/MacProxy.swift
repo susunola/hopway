@@ -66,7 +66,7 @@ private enum DashboardPage: String, CaseIterable {
         case .nodes: "point.3.connected.trianglepath.dotted"
         case .subscriptions: "tray.full"
         case .usage: "chart.bar.xaxis"
-        case .policies: "point.3.connected.trianglepath.dotted"
+        case .policies: "arrow.triangle.branch"
         case .connections: "arrow.left.arrow.right"
         case .settings: "gearshape"
         }
@@ -95,7 +95,12 @@ private struct Dashboard: View {
                 Group {
                     switch page {
                     case .overview:
-                        OverviewDashboard(core: core, showNodes: { page = .nodes }, importLink: { showsLinkImport = true })
+                        OverviewDashboard(
+                            core: core,
+                            showNodes: { page = .nodes },
+                            showUsage: { page = .usage },
+                            importLink: { showsLinkImport = true }
+                        )
                     case .nodes:
                         NodeDashboard(core: core) { showsLinkImport = true }
                     case .policies:

@@ -14,8 +14,35 @@ struct TrafficHistory: Decodable {
         }
     }
 
+    struct Day: Identifiable {
+        let date: Date
+        let nodes: [String: Count]
+        let count: Count
+        var id: Date { date }
+    }
+
     let since: String
     let days: [String: [String: Count]]
+
+    func series(from start: Date, through end: Date, calendar: Calendar) -> [Day] {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        guard let since = formatter.date(from: since) else { return [] }
+        var date = max(since, start)
+        var result: [Day] = []
+        while date <= end {
+            let nodes = days[formatter.string(from: date)] ?? [:]
+            var total = Count()
+            for count in nodes.values { total.add(count) }
+            result.append(Day(date: date, nodes: nodes, count: total))
+            guard let next = calendar.date(byAdding: .day, value: 1, to: date) else { break }
+            date = next
+        }
+        return result
+    }
 }
 
 struct TrafficRate: Equatable {
@@ -91,12 +118,6 @@ struct LocalTrafficView: View {
         }
     }
 
-    private struct Day: Identifiable {
-        let date: Date
-        let count: TrafficHistory.Count
-        var id: Date { date }
-    }
-
     private struct Node: Identifiable {
         let name: String
         let provider: String
@@ -105,7 +126,7 @@ struct LocalTrafficView: View {
     }
 
     private struct Report {
-        var days: [Day] = []
+        var days: [TrafficHistory.Day] = []
         var nodes: [Node] = []
         var total = TrafficHistory.Count()
     }
@@ -115,25 +136,12 @@ struct LocalTrafficView: View {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .current
         let today = calendar.startOfDay(for: .now)
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = calendar
-        formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "yyyy-MM-dd"
-        guard let since = formatter.date(from: history.since) else { return Report() }
-        var date = max(since, period.start(before: today, calendar: calendar))
-        var report = Report()
+        let start = period.start(before: today, calendar: calendar)
+        var report = Report(days: history.series(from: start, through: today, calendar: calendar))
         var counts: [String: TrafficHistory.Count] = [:]
-        while date <= today {
-            var day = TrafficHistory.Count()
-            for (name, value) in history.days[formatter.string(from: date)] ?? [:] {
-                counts[name, default: .init()].add(value)
-                day.add(value)
-            }
-            report.days.append(Day(date: date, count: day))
-            report.total.add(day)
-            guard let next = calendar.date(byAdding: .day, value: 1, to: date) else { break }
-            date = next
+        for day in report.days {
+            for (name, value) in day.nodes { counts[name, default: .init()].add(value) }
+            report.total.add(day.count)
         }
 
         var providers: [String: [String]] = [:]
@@ -172,7 +180,7 @@ struct LocalTrafficView: View {
                 Spacer()
             }
             if data.total.total > 0 {
-                chart(data.days)
+                TrafficTrendChart(days: data.days, height: 138)
                 breakdown(data.nodes, total: data.total.total)
             } else {
                 Label(
@@ -191,45 +199,6 @@ struct LocalTrafficView: View {
             Text(title).font(.caption).foregroundStyle(.secondary)
             Text(trafficBytes(count)).font(.system(.title2, design: .rounded).weight(.semibold).monospacedDigit())
         }
-    }
-
-    private func chart(_ days: [Day]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Chart(days) { day in
-                BarMark(
-                    x: .value("日期", day.date, unit: .day),
-                    y: .value("下载", Double(day.count.download))
-                )
-                .foregroundStyle(by: .value("方向", "下载"))
-                BarMark(
-                    x: .value("日期", day.date, unit: .day),
-                    y: .value("上传", Double(day.count.upload))
-                )
-                .foregroundStyle(by: .value("方向", "上传"))
-            }
-            .chartForegroundStyleScale(["下载": HopAppearance.accent, "上传": HopAppearance.mint.opacity(0.76)])
-            .chartLegend(.hidden)
-            .chartXAxis {
-                AxisMarks(values: .stride(by: .day, count: days.count > 15 ? 5 : days.count > 6 ? 3 : 1)) {
-                    AxisValueLabel(format: .dateTime.month(.defaultDigits).day(.defaultDigits))
-                }
-            }
-            .chartYAxis(.hidden)
-            .frame(height: 138)
-            HStack(spacing: 12) {
-                legend("下载", color: HopAppearance.accent)
-                legend("上传", color: HopAppearance.mint.opacity(0.76))
-            }
-        }
-    }
-
-    private func legend(_ title: String, color: Color) -> some View {
-        HStack(spacing: 5) {
-            RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 9, height: 9)
-            Text(title)
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
     }
 
     private func breakdown(_ nodes: [Node], total: UInt64) -> some View {
@@ -257,6 +226,50 @@ struct LocalTrafficView: View {
                 .font(.callout)
             }
         }
+    }
+}
+
+struct TrafficTrendChart: View {
+    let days: [TrafficHistory.Day]
+    let height: CGFloat
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Chart(days) { day in
+                BarMark(
+                    x: .value("日期", day.date, unit: .day),
+                    y: .value("下载", Double(day.count.download))
+                )
+                .foregroundStyle(by: .value("方向", "下载"))
+                BarMark(
+                    x: .value("日期", day.date, unit: .day),
+                    y: .value("上传", Double(day.count.upload))
+                )
+                .foregroundStyle(by: .value("方向", "上传"))
+            }
+            .chartForegroundStyleScale(["下载": HopAppearance.accent, "上传": HopAppearance.mint.opacity(0.76)])
+            .chartLegend(.hidden)
+            .chartXAxis {
+                AxisMarks(values: .stride(by: .day, count: days.count > 15 ? 5 : days.count > 6 ? 3 : 1)) {
+                    AxisValueLabel(format: .dateTime.month(.defaultDigits).day(.defaultDigits))
+                }
+            }
+            .chartYAxis(.hidden)
+            .frame(height: height)
+            HStack(spacing: 12) {
+                legend("下载", color: HopAppearance.accent)
+                legend("上传", color: HopAppearance.mint.opacity(0.76))
+            }
+        }
+    }
+
+    private func legend(_ title: String, color: Color) -> some View {
+        HStack(spacing: 5) {
+            RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 9, height: 9)
+            Text(title)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
     }
 }
 
