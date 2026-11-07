@@ -54,6 +54,13 @@ type ruleSetState struct {
 }
 
 func (engine *Engine) openRuleSets(config Config) (map[string]*ruleset.Set, error) {
+	interval := defaultRuleSetInterval
+	if minutes := config.RuleSetRefreshMin; minutes != 0 {
+		if minutes < 10 || minutes > 10080 {
+			return nil, errors.New("ruleSetRefreshMin must be between 10 and 10080")
+		}
+		interval = minutes * 60
+	}
 	sets := map[string]*ruleset.Set{}
 	for _, rs := range config.RuleSets {
 		if rs.Name == "" || sets[rs.Name] != nil {
@@ -73,7 +80,7 @@ func (engine *Engine) openRuleSets(config Config) (map[string]*ruleset.Set, erro
 			state.format = ruleset.DetectFormat(rs.URL + rs.Path)
 		}
 		if state.Interval == 0 {
-			state.Interval = defaultRuleSetInterval
+			state.Interval = interval
 		}
 		switch state.format {
 		case ruleset.FormatSRS, ruleset.FormatYAML, ruleset.FormatText:

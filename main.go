@@ -537,7 +537,10 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	router.HandleFunc("POST /reload", func(writer http.ResponseWriter, request *http.Request) {
 		if err := supervisor.ReloadRevisionContext(request.Context(), request.Header.Get("X-HopWay-Revision")); err != nil {
 			status := http.StatusBadRequest
-			if errors.Is(err, app.ErrPortsChanged) || errors.Is(err, profile.ErrConfigurationChanged) {
+			if errors.Is(err, app.ErrPortsChanged) || errors.Is(err, app.ErrResourcesChanged) {
+				writer.Header().Set("X-HopWay-Restart-Required", "1")
+				status = http.StatusConflict
+			} else if errors.Is(err, profile.ErrConfigurationChanged) {
 				status = http.StatusConflict
 			}
 			http.Error(writer, err.Error(), status)

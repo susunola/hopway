@@ -21,6 +21,7 @@ var errEndpointBusy = errors.New("proxy endpoint has too many unfinished connect
 type endpointBudget struct {
 	mu           sync.Mutex
 	entries      map[string]*endpointSlots
+	maxOpening   int
 	probeOpening chan struct{}
 	networkEpoch uint64
 	now          func() time.Time
@@ -53,7 +54,7 @@ func (b *endpointBudget) retain(key string) *endpointSlots {
 	slot := b.entries[key]
 	if slot == nil {
 		slot = &endpointSlots{
-			key: key, opening: make(chan struct{}, endpointDialLimit), probing: make(chan struct{}, endpointProbeLimit),
+			key: key, opening: make(chan struct{}, b.maxOpening), probing: make(chan struct{}, endpointProbeLimit),
 		}
 		b.entries[key] = slot
 	}

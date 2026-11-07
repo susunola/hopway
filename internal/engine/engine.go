@@ -41,12 +41,14 @@ type Config struct {
 	Subscriptions          []Subscription `json:"subscriptions,omitempty"`
 	SubscriptionNodes      []string       `json:"subscriptionNodes,omitempty"` // inline nodes from older versions
 	SubscriptionRefreshMin int            `json:"subscriptionRefreshMin,omitempty"`
+	RuleSetRefreshMin      int            `json:"ruleSetRefreshMin,omitempty"`
 	// SystemProxy points macOS's proxy settings at HopWay while it runs.
 	SystemProxy bool `json:"systemProxy,omitempty"`
 	// TUN captures all traffic through a virtual network device.
 	TUN             *TUNConfig        `json:"tun,omitempty"`
 	MaxDialAttempts int               `json:"maxDialAttempts,omitempty"`
 	Performance     PerformanceConfig `json:"performance,omitzero"`
+	Resources       ResourceLimits    `json:"resources,omitzero"`
 
 	// DataDir holds caches (downloaded rule sets). Set by the caller, not saved.
 	DataDir string `json:"-"`
@@ -161,6 +163,7 @@ type Status struct {
 	Active         int                           `json:"active"`
 	SessionTraffic *trafficCount                 `json:"sessionTraffic,omitempty"`
 	UDPDrops       map[string]wire.UDPDropCounts `json:"udpDrops,omitempty"`
+	Resources      *ResourceStatus               `json:"resources,omitempty"`
 }
 
 type Engine struct {
@@ -245,6 +248,10 @@ func NewWithResourceBudget(config Config, impl backend.Backend, budget *Resource
 	if err != nil {
 		return nil, err
 	}
+	resources, err := config.Resources.effective()
+	if err != nil {
+		return nil, err
+	}
 	engine := &Engine{subscriptions: config.Subscriptions, autoWake: make(chan struct{}, 1), dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL, probeFallback: defaultProbeFallback,
@@ -322,7 +329,7 @@ func NewWithResourceBudget(config Config, impl backend.Backend, budget *Resource
 		return engine, nil // validation only
 	}
 	if budget == nil {
-		budget = NewResourceBudget()
+		budget = newResourceBudget(resources)
 	}
 	engine.budget = budget
 	engine.backend = impl.Name()
@@ -1067,6 +1074,9 @@ func (engine *Engine) status(includeConnections bool) Status {
 	defer engine.mu.Unlock()
 	status := Status{Backend: engine.backend, Policy: engine.policy, Active: len(engine.live) + len(engine.livePackets),
 		RuleSets: engine.ruleSetStatus(), SessionTraffic: engine.traffic.sessionTotals()}
+	if engine.budget != nil {
+		status.Resources = engine.budget.status()
+	}
 	if includeConnections {
 		status.Connections = engine.connectionSnapshot()
 	}

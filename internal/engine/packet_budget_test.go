@@ -16,10 +16,15 @@ import (
 )
 
 func TestUDPSessionBudgetEvictsLeastRecentAcrossGenerations(t *testing.T) {
-	budget := newResourceBudget(3, 4)
+	config := Default()
+	config.Resources = ResourceLimits{UDPSessionLimit: 32, UDPOpenLimit: 4}
+	budget, err := NewResourceBudget(config.Resources)
+	if err != nil {
+		t.Fatal(err)
+	}
 	newCore := func() *Engine {
 		t.Helper()
-		core, err := NewWithResourceBudget(Default(), backend.Native{}, budget)
+		core, err := NewWithResourceBudget(config, backend.Native{}, budget)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -43,10 +48,12 @@ func TestUDPSessionBudgetEvictsLeastRecentAcrossGenerations(t *testing.T) {
 	}
 	old, replacement := newCore(), newCore()
 	recent, idle := open(old), open(old)
+	for range config.Resources.UDPSessionLimit - 2 {
+		open(replacement)
+	}
 	if _, err := recent.WriteTo([]byte("outbound activity keeps this session"), destination); err != nil {
 		t.Fatal(err)
 	}
-	open(replacement)
 	open(replacement)
 	if _, err := idle.WriteTo([]byte("evicted"), destination); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("least recent session from the old engine still writable: %v", err)
@@ -57,12 +64,52 @@ func TestUDPSessionBudgetEvictsLeastRecentAcrossGenerations(t *testing.T) {
 	if n := old.Active() + replacement.Active(); n != budget.maxSessions {
 		t.Fatalf("%d active UDP sessions after replacement, want %d", n, budget.maxSessions)
 	}
+	if got := replacement.CompactStatus().Resources; got.UDPSessions != 32 || got.UDPSessionLimit != 32 || got.UDPOpenLimit != 4 {
+		t.Fatalf("incorrect shared resource status: %+v", got)
+	}
 	old.Close()
 	replacement.Close()
 	budget.mu.Lock()
 	defer budget.mu.Unlock()
 	if len(budget.sessions) != 0 || len(budget.outbounds) != 0 {
 		t.Fatal("closed engines left session budget entries")
+	}
+}
+
+func TestConfiguredUDPConcurrentOpens(t *testing.T) {
+	config := Default()
+	config.Mode, config.Selected = "global", "slow"
+	config.Resources.UDPOpenLimit = 1
+	config.Nodes = []outbound.Node{{Name: "slow", Type: "socks5", Server: "127.0.0.1:1"}}
+	core, err := New(config, backend.Native{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	started, done := make(chan struct{}, 2), make(chan struct{})
+	core.dialers["slow"] = packetBudgetDialer{open: func(ctx context.Context, _ string) (net.PacketConn, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	go func() {
+		defer close(done)
+		_, _ = core.DialPacket(ctx, "fixture", "127.0.0.1:53")
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("first UDP dial did not reach its outbound")
+	}
+	if _, err := core.DialPacket(ctx, "fixture", "127.0.0.1:53"); !errors.Is(err, backend.ErrPacketCongested) {
+		t.Fatalf("second UDP dial exceeded the configured cap: %v", err)
+	}
+	cancel()
+	<-done
+	if got := core.CompactStatus().Resources; got.UDPOpenLimit != 1 || got.UDPOpening != 0 {
+		t.Fatalf("incorrect UDP opening status after cancellation: %+v", got)
 	}
 }
 

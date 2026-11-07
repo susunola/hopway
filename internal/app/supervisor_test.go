@@ -301,6 +301,61 @@ func TestReloadRejectsBrokenConfig(t *testing.T) {
 	}
 }
 
+func TestResourceLimitsApplyOnlyOnRestart(t *testing.T) {
+	dir := t.TempDir()
+	path, cache := filepath.Join(dir, "config.json"), filepath.Join(dir, "cache")
+	config := engine.Default()
+	save := func() {
+		t.Helper()
+		data, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := func() *Supervisor {
+		t.Helper()
+		s, err := Open(path, cache, backend.Native{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(s.Close)
+		if err := s.Start(sysproxy.Target{}); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	save()
+	s := start()
+	defaults := s.CompactStatus().Resources.ResourceLimits
+	config.Resources = defaults
+	save()
+	if err := s.Reload(); err != nil {
+		t.Fatalf("explicit defaults must reload: %v", err)
+	}
+	config.Resources = engine.ResourceLimits{UDPSessionLimit: 32, UDPOpenLimit: 1, EndpointDialLimit: 4}
+	save()
+	before := s.Engine()
+	if err := s.Reload(); !errors.Is(err, ErrResourcesChanged) || s.Engine() != before {
+		t.Fatalf("changing resource limits must keep the running engine: %v", err)
+	}
+	if got := s.CompactStatus().Resources.ResourceLimits; got != defaults {
+		t.Fatalf("pending values replaced the running limits: %+v", got)
+	}
+	s.Close()
+	s = start()
+	if got := s.CompactStatus().Resources.ResourceLimits; got != config.Resources {
+		t.Fatalf("restart did not apply the saved limits: %+v", got)
+	}
+	config.Resources.UDPSessionLimit = -1
+	save()
+	if err := s.Reload(); err == nil || errors.Is(err, ErrResourcesChanged) {
+		t.Fatalf("invalid limits must fail validation: %v", err)
+	}
+}
+
 func TestAutoPolicySurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")

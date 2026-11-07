@@ -21,7 +21,10 @@ func TestEndpointBudgetAcrossReloadTCPUDPAndProbe(t *testing.T) {
 		{Name: "alias", Type: "socks5", Server: "LOCALHOST.:9100"},
 		{Name: "other", Type: "socks5", Server: "127.0.0.1:9101"},
 	}
-	budget := NewResourceBudget()
+	budget, err := NewResourceBudget(config.Resources)
+	if err != nil {
+		t.Fatal(err)
+	}
 	newCore := func() *Engine {
 		t.Helper()
 		core, err := NewWithResourceBudget(config, backend.Native{}, budget)
@@ -112,13 +115,14 @@ func TestEndpointBudgetAcrossReloadTCPUDPAndProbe(t *testing.T) {
 
 func TestSaturatedEndpointProbeIsInconclusive(t *testing.T) {
 	config := Default()
+	config.Resources.EndpointDialLimit = 4
 	config.Nodes = []outbound.Node{{Name: "busy", Type: "socks5", Server: "127.0.0.1:9200"}}
 	core, err := New(config, backend.Native{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer core.Close()
-	for range endpointDialLimit {
+	for range config.Resources.EndpointDialLimit {
 		slot, err := core.acquireDialSlot("busy")
 		if err != nil {
 			t.Fatal(err)

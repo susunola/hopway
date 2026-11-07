@@ -238,6 +238,14 @@ struct ProxyStatus: Decodable, Equatable {
     let generation: UInt64
     let sessionTraffic: TrafficHistory.Count?
     let udpDrops: [String: UDPDropCounts]?
+    struct Resources: Decodable, Equatable {
+        let udpSessions: Int
+        let udpSessionLimit: Int
+        let udpOpening: Int
+        let udpOpenLimit: Int
+        let endpointDialLimit: Int
+    }
+    let resources: Resources?
     let reloaded: Double?
     let revision: String?
     let profileFallback: Bool?
@@ -293,6 +301,7 @@ struct ProfileInspection: Decodable {
 
 struct CoreError: LocalizedError {
     let message: String
+    var requiresRestart = false
     var errorDescription: String? { message }
 }
 
@@ -627,8 +636,10 @@ final class CoreModel: ObservableObject {
         if let revision { request.setValue(revision, forHTTPHeaderField: "X-HopWay-Revision") }
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw CoreError(message: String(decoding: data.prefix(1024), as: UTF8.self))
+        let http = response as? HTTPURLResponse
+        guard let http, (200..<300).contains(http.statusCode) else {
+            throw CoreError(message: String(decoding: data.prefix(1024), as: UTF8.self),
+                            requiresRestart: http?.value(forHTTPHeaderField: "X-HopWay-Restart-Required") == "1")
         }
         return data
     }
@@ -645,6 +656,9 @@ final class CoreModel: ObservableObject {
             configurationNotice = nil
             await refresh(info)
             return "已生效，无需重启。"
+        } catch let error as CoreError where error.requiresRestart {
+            configurationNotice = "本次配置将在重启代理后生效。"
+            return "重启代理后生效。"
         } catch {
             configurationNotice = "当前内核仍在使用上次成功应用的配置。"
             let reason = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1484,15 +1498,15 @@ final class CoreModel: ObservableObject {
         saveConfiguration(draft)
     }
 
-    func saveAdvanced(_ candidate: String, basedOn source: String, needsRestart: Bool, activation: String?) {
+    func saveAdvanced(_ candidate: String, basedOn source: String, activation: String?) {
         guard !changed, saved == source else {
             message = "配置已有更新，请重新打开高级配置后再保存。"
             return
         }
-        saveConfiguration(candidate, needsRestart: needsRestart, activation: activation)
+        saveConfiguration(candidate, activation: activation)
     }
 
-    private func saveConfiguration(_ candidate: String, needsRestart: Bool = false, activation: String? = nil) {
+    private func saveConfiguration(_ candidate: String, activation: String? = nil) {
         guard !saving, let executable else { return }
         saving = true
         message = nil
@@ -1506,10 +1520,7 @@ final class CoreModel: ObservableObject {
                 }.value
                 acceptSavedConfiguration(candidate, revision: revision)
                 if phase == .running {
-                    if needsRestart {
-                        message = "配置已保存。重启代理后应用新的监听端口和本次改动。"
-                        configurationNotice = "已保存的端口将在重启后使用。"
-                    } else if let activation {
+                    if let activation {
                         let applied = await applyRunning()
                         message = applied == "已生效，无需重启。" ? "配置已保存。\(activation)" : "配置已保存，\(applied)"
                         if configurationNotice == nil { configurationNotice = activation }

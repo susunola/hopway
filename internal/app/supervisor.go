@@ -134,7 +134,7 @@ func OpenContext(ctx context.Context, path, dataDir string, impl backend.Backend
 		return nil, err
 	}
 	s := &Supervisor{path: path, dataDir: dataDir, impl: impl, lease: lease,
-		budget: engine.NewResourceBudget(), subErr: map[string]string{}, subMeta: map[string]SubscriptionStatus{},
+		subErr: map[string]string{}, subMeta: map[string]SubscriptionStatus{},
 		refreshGate: make(chan struct{}, 1), controlSlots: make(chan struct{}, 8)}
 	s.proxy = sysproxy.New(dataDir, nil)
 	var recoveryErr error
@@ -182,7 +182,11 @@ func (s *Supervisor) Config() engine.Config { return s.loaded.Merged }
 // Start builds the engine; ports are HopWay's own listeners. target is
 // where the system proxy points when it is enabled.
 func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
-	core, err := engine.NewWithResourceBudget(s.loaded.Merged, s.impl, s.budget, ports...)
+	budget, err := engine.NewResourceBudget(s.loaded.Merged.Resources)
+	if err != nil {
+		return err
+	}
+	core, err := engine.NewWithResourceBudget(s.loaded.Merged, s.impl, budget, ports...)
 	if err != nil {
 		return err
 	}
@@ -196,6 +200,7 @@ func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
 		}
 	}
 	s.ports = ports
+	s.budget = budget
 	s.proxyTarget = target
 	s.started = time.Now()
 	s.generation = 1
@@ -510,6 +515,7 @@ func (s *Supervisor) Close() {
 }
 
 var ErrPortsChanged = errors.New("监听端口已修改")
+var ErrResourcesChanged = errors.New("连接资源上限已修改")
 
 // Reload re-reads the profile and swaps in a new engine. New connections use
 // it at once; open ones finish on the old engine.
@@ -552,6 +558,9 @@ func (s *Supervisor) reloadLocked(ctx context.Context, expected string) error {
 	running := s.loaded.Merged
 	if loaded.Merged.SOCKSPort != running.SOCKSPort || loaded.Merged.HTTPPort != running.HTTPPort {
 		return ErrPortsChanged
+	}
+	if s.budget != nil && !s.budget.Matches(loaded.Merged.Resources) {
+		return ErrResourcesChanged
 	}
 	core, err := engine.NewWithResourceBudget(loaded.Merged, s.impl, s.budget, s.ports...)
 	if err != nil {

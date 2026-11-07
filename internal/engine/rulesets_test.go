@@ -5,8 +5,10 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -48,6 +50,53 @@ func TestRuleSetMatching(t *testing.T) {
 	}
 	if _, err := newMatcher([]Rule{{Type: RuleRuleSet, Value: "missing", Via: "A"}}, func(string) bool { return true }, nil); err == nil {
 		t.Error("accepted a rule referring to an unknown rule set")
+	}
+}
+
+func TestConfiguredRuleSetRefreshRespectsSourceOverride(t *testing.T) {
+	var defaultHits, overrideHits atomic.Int32
+	const content = "payload:\n  - '+.blocked.test'\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/default.yaml" {
+			defaultHits.Add(1)
+		} else {
+			overrideHits.Add(1)
+		}
+		_, _ = w.Write([]byte(content))
+	}))
+	defer server.Close()
+	config := Default()
+	config.RuleSetRefreshMin = 10
+	config.DataDir = t.TempDir()
+	config.RuleSets = []RuleSet{
+		{Name: "default", URL: server.URL + "/default.yaml", Behavior: ruleset.BehaviorDomain},
+		{Name: "override", URL: server.URL + "/override.yaml", Behavior: ruleset.BehaviorDomain, Interval: 1200},
+	}
+	validation, err := New(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, set := range validation.ruleSets {
+		path := validation.cachePath(set)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cached := time.Now().Add(-15 * time.Minute)
+		if err := os.Chtimes(path, cached, cached); err != nil {
+			t.Fatal(err)
+		}
+	}
+	core, err := New(config, backend.Native{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	core.RefreshRuleSets(context.Background(), false)
+	if d, o := defaultHits.Load(), overrideHits.Load(); d != 1 || o != 0 {
+		t.Fatalf("15-minute cache with 10- and 20-minute intervals: downloads %d and %d", d, o)
 	}
 }
 

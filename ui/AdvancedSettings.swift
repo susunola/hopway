@@ -19,6 +19,10 @@ struct AdvancedSettingsDraft {
         var probeConcurrency = ""
         var autoRouteInterval = ""
         var subscriptionRefresh = ""
+        var ruleSetRefresh = ""
+        var udpSessionLimit = ""
+        var udpOpenLimit = ""
+        var endpointDialLimit = ""
     }
 
     let source: String
@@ -33,6 +37,7 @@ struct AdvancedSettingsDraft {
         let tun = config["tun"] as? [String: Any] ?? [:]
         let health = config["health"] as? [String: Any] ?? [:]
         let performance = config["performance"] as? [String: Any] ?? [:]
+        let resources = config["resources"] as? [String: Any] ?? [:]
         let loaded = Values(
             socksPort: String(config["socksPort"] as? Int ?? 1080),
             httpPort: String(config["httpPort"] as? Int ?? 8080),
@@ -49,7 +54,11 @@ struct AdvancedSettingsDraft {
             probeTimeout: Self.nonzeroText(performance["probeTimeoutMs"]),
             probeConcurrency: Self.nonzeroText(performance["probeConcurrency"]),
             autoRouteInterval: Self.nonzeroText(performance["autoRouteIntervalSec"]),
-            subscriptionRefresh: Self.nonzeroText(config["subscriptionRefreshMin"])
+            subscriptionRefresh: Self.nonzeroText(config["subscriptionRefreshMin"]),
+            ruleSetRefresh: Self.nonzeroText(config["ruleSetRefreshMin"]),
+            udpSessionLimit: Self.nonzeroText(resources["udpSessionLimit"]),
+            udpOpenLimit: Self.nonzeroText(resources["udpOpenLimit"]),
+            endpointDialLimit: Self.nonzeroText(resources["endpointDialLimit"])
         )
         self.source = source
         original = loaded
@@ -63,14 +72,13 @@ struct AdvancedSettingsDraft {
         return String(value)
     }
 
-    func configuration() throws -> (text: String, needsRestart: Bool, activation: String?) {
+    func configuration() throws -> (text: String, activation: String?) {
         guard var config = try JSONSerialization.jsonObject(with: Data(source.utf8)) as? [String: Any] else {
             throw CoreError(message: "无法读取现有配置。")
         }
         let socks = try number(values.socksPort, in: 0...65535, label: "SOCKS5 端口", blank: 1080)
         let http = try number(values.httpPort, in: 0...65535, label: "HTTP 端口", blank: 8080)
         guard socks == 0 || socks != http else { throw CoreError(message: "SOCKS5 和 HTTP 端口不能相同。") }
-        let needsRestart = socks != Int(original.socksPort) || http != Int(original.httpPort)
         if values.socksPort != original.socksPort { config["socksPort"] = socks }
         if values.httpPort != original.httpPort { config["httpPort"] = http }
         if values.systemProxy != original.systemProxy { config["systemProxy"] = values.systemProxy ? true : nil }
@@ -111,6 +119,22 @@ struct AdvancedSettingsDraft {
             let minutes = try number(values.subscriptionRefresh, in: 10...10080, label: "订阅刷新间隔", blank: 0)
             config["subscriptionRefreshMin"] = minutes == 0 ? nil : minutes
         }
+        if values.ruleSetRefresh != original.ruleSetRefresh {
+            let minutes = try number(values.ruleSetRefresh, in: 10...10080, label: "远程规则集刷新间隔", blank: 0)
+            config["ruleSetRefreshMin"] = minutes == 0 ? nil : minutes
+        }
+
+        var resources = config["resources"] as? [String: Any] ?? [:]
+        let resourceFields: [(key: String, value: KeyPath<Values, String>, label: String, range: ClosedRange<Int>)] = [
+            ("udpSessionLimit", \.udpSessionLimit, "UDP 会话上限", 32...1024),
+            ("udpOpenLimit", \.udpOpenLimit, "UDP 并发建连上限", 1...64),
+            ("endpointDialLimit", \.endpointDialLimit, "每端点拨号并发", 4...64)
+        ]
+        for field in resourceFields where values[keyPath: field.value] != original[keyPath: field.value] {
+            let limit = try number(values[keyPath: field.value], in: field.range, label: field.label, blank: 0)
+            resources[field.key] = limit == 0 ? nil : limit
+        }
+        config["resources"] = resources.isEmpty ? nil : resources
 
         var performance = config["performance"] as? [String: Any] ?? [:]
         let fields: [(key: String, value: KeyPath<Values, String>, label: String, range: ClosedRange<Int>)] = [
@@ -138,7 +162,7 @@ struct AdvancedSettingsDraft {
             notes.append("MTU 和 IPv6 设置在重新开启 TUN 时应用。")
         }
         let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-        return (String(decoding: data, as: UTF8.self), needsRestart, notes.isEmpty ? nil : notes.joined())
+        return (String(decoding: data, as: UTF8.self), notes.isEmpty ? nil : notes.joined())
     }
 
     private func number(_ text: String, in range: ClosedRange<Int>, label: String, blank: Int) throws -> Int {
@@ -178,7 +202,7 @@ struct AdvancedSettingsPanel: View {
                 Label("请先保存或还原 JSON 草稿，再编辑高级选项。", systemImage: "doc.badge.clock")
                     .foregroundStyle(.orange)
             } else if let fields = Binding($draft) {
-                Text("留空使用默认值。运行时保存拨号、测速和订阅设置，可应用到新请求。")
+                Text("留空使用默认值。端口和连接资源上限在下次启动时应用。")
                     .font(.caption).foregroundStyle(.secondary)
                 Divider()
                 controls(fields.values)
@@ -226,6 +250,18 @@ struct AdvancedSettingsPanel: View {
                 hint("总时限适用于 TCP 和 UDP 建连。TCP 有备用出站时，前序尝试单独计时，留空最多用总时限的一半。尝试次数包含首次拨号。")
             }
             Divider()
+            section("连接资源上限", icon: "gauge.with.dots.needle.33percent") {
+                if let active = core.status?.resources, core.phase == .running, !core.statusReadFailed {
+                    hint("运行中 · UDP 会话 \(active.udpSessions) / \(active.udpSessionLimit) · UDP 正在建连 \(active.udpOpening) / \(active.udpOpenLimit) · 每端点上限 \(active.endpointDialLimit)")
+                }
+                fieldRow {
+                    field("UDP 会话上限", text: values.udpSessionLimit, prompt: "1024")
+                    field("UDP 并发建连上限", text: values.udpOpenLimit, prompt: "64")
+                    field("每端点拨号并发", text: values.endpointDialLimit, prompt: "64")
+                }
+                hint("可填范围依次为 32–1024、1–64、4–64。UDP 会话满时回收最久未活动的会话。同一地址和端口的 TCP、UDP 建连及测速共用端点额度。")
+            }
+            Divider()
             section("测速与自动选路", icon: "speedometer") {
                 field("首选测速地址", text: values.probeURL, prompt: "随订阅或默认")
                 field("备用测速地址", text: values.fallbackURL, prompt: "可留空")
@@ -240,10 +276,12 @@ struct AdvancedSettingsPanel: View {
                 hint("单节点时限涵盖首选和备用测速地址。策略组测速与按地区、服务商自动选路各自计时。")
             }
             Divider()
-            section("订阅刷新", icon: "arrow.clockwise") {
-                field("默认刷新间隔（分钟）", text: values.subscriptionRefresh, prompt: "360")
-                    .frame(maxWidth: 190)
-                hint("内核运行时每 10 分钟检查是否到期。订阅自己的刷新间隔优先。")
+            section("后台刷新", icon: "arrow.clockwise") {
+                fieldRow {
+                    field("订阅刷新间隔（分钟）", text: values.subscriptionRefresh, prompt: "360")
+                    field("远程规则集刷新间隔（分钟）", text: values.ruleSetRefresh, prompt: "1440")
+                }
+                hint("内核运行时每 10 分钟检查是否到期。来源单独指定的刷新间隔优先，保存后可热加载。")
             }
             Divider()
             section("本机端口与 TUN", icon: "network") {
@@ -298,7 +336,7 @@ struct AdvancedSettingsPanel: View {
         do {
             let candidate = try current.configuration()
             draft?.error = nil
-            core.saveAdvanced(candidate.text, basedOn: current.source, needsRestart: candidate.needsRestart, activation: candidate.activation)
+            core.saveAdvanced(candidate.text, basedOn: current.source, activation: candidate.activation)
         } catch {
             draft?.error = error.localizedDescription
         }

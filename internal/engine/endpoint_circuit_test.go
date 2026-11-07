@@ -105,9 +105,8 @@ func TestEndpointCooldownRecoversThroughLiveProbe(t *testing.T) {
 }
 
 func TestEndpointCircuitAdmitsOneRecoveryAndIgnoresOldFailures(t *testing.T) {
-	b := &NewResourceBudget().dials
 	now := time.Now()
-	b.now = func() time.Time { return now }
+	b := &endpointBudget{now: func() time.Time { return now }}
 	state := &endpointCircuit{}
 	old, _ := b.startAttempt(state, 0)
 	for range endpointFailureThreshold {
