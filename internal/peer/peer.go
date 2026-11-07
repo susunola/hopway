@@ -10,7 +10,8 @@ import (
 
 type Addrs struct {
 	Client netip.AddrPort // the application's socket
-	Server netip.AddrPort // HopWay's listener it connected to
+	Server netip.AddrPort // what it connected to (HopWay's listener, or the real target under TUN)
+	Local  bool           // the client is a process on this machine
 }
 
 type key struct{}
@@ -20,6 +21,12 @@ func With(ctx context.Context, client, server net.Addr) context.Context {
 	if !addrs.Client.IsValid() {
 		return ctx
 	}
+	addrs.Local = addrs.Client.Addr().Unmap().IsLoopback()
+	return context.WithValue(ctx, key{}, addrs)
+}
+
+// WithAddrs records addresses known to belong to a local process.
+func WithAddrs(ctx context.Context, addrs Addrs) context.Context {
 	return context.WithValue(ctx, key{}, addrs)
 }
 

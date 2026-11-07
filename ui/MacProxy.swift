@@ -123,6 +123,16 @@ private struct Dashboard: View {
                                 Text(proxy.error ?? "开启后，所有网络服务的 HTTP、HTTPS 和 SOCKS 代理都指向 HopWay；停止或退出时会还原原来的设置。")
                                     .font(.caption).foregroundStyle(proxy.error == nil ? Color.secondary : .red)
                             }
+                            if let tun = status.tun, tun.supported {
+                                Toggle("增强模式（TUN）", isOn: Binding(
+                                    get: { tun.enabled },
+                                    set: { core.setTUN($0) }
+                                ))
+                                Text(tun.error ?? (tun.enabled
+                                    ? "已接管全部流量（\(tun.device ?? "utun")）。不认系统代理的应用、命令行工具和 DNS 也会经过 HopWay。"
+                                    : "接管所有应用的流量，包括不认系统代理的应用。开启时需要输入一次管理员密码。"))
+                                    .font(.caption).foregroundStyle(tun.error == nil ? Color.secondary : .red)
+                            }
                         } else {
                             Text("启动内核后，可在这里切换路由模式和出站。")
                                 .foregroundStyle(.secondary)

@@ -168,3 +168,39 @@ func TestEnableFailureLeavesBackup(t *testing.T) {
 		t.Fatalf("restore after partial enable: %v %v %+v", restored, err, f.state["Wi-Fi"])
 	}
 }
+
+func TestDNSOverrideAndRecover(t *testing.T) {
+	dir := t.TempDir()
+	dnsState := map[string][]string{"Wi-Fi": {"192.168.1.1"}}
+	f := newFake("Wi-Fi", "Ethernet")
+	run := func(args ...string) (string, error) {
+		switch args[0] {
+		case "-getdnsservers":
+			if len(dnsState[args[1]]) == 0 {
+				return "There aren't any DNS Servers set on " + args[1] + ".", nil
+			}
+			return strings.Join(dnsState[args[1]], "\n"), nil
+		case "-setdnsservers":
+			dnsState[args[1]] = nil
+			if args[2] != "Empty" {
+				dnsState[args[1]] = args[2:]
+			}
+			return "", nil
+		}
+		return f.run(args...)
+	}
+	m := New(dir, run)
+	if err := m.SetDNS("172.19.0.2"); err != nil {
+		t.Fatal(err)
+	}
+	if dnsState["Wi-Fi"][0] != "172.19.0.2" || dnsState["Ethernet"][0] != "172.19.0.2" {
+		t.Fatalf("not applied: %v", dnsState)
+	}
+	// Crash, then the next start recovers.
+	if restored, err := New(dir, run).Recover(); !restored || err != nil {
+		t.Fatalf("recover: %v %v", restored, err)
+	}
+	if len(dnsState["Wi-Fi"]) != 1 || dnsState["Wi-Fi"][0] != "192.168.1.1" || len(dnsState["Ethernet"]) != 0 {
+		t.Fatalf("not restored: %v", dnsState)
+	}
+}

@@ -37,9 +37,16 @@ type Config struct {
 	Subscriptions []Subscription `json:"subscriptions,omitempty"`
 	// SystemProxy points macOS's proxy settings at HopWay while it runs.
 	SystemProxy bool `json:"systemProxy,omitempty"`
+	// TUN captures all traffic through a virtual network device.
+	TUN *TUNConfig `json:"tun,omitempty"`
 
 	// DataDir holds caches (downloaded rule sets). Set by the caller, not saved.
 	DataDir string `json:"-"`
+}
+
+type TUNConfig struct {
+	Enabled bool   `json:"enabled"`
+	MTU     uint32 `json:"mtu,omitempty"`
 }
 
 // Subscription is a remote node list refreshed in the background.
@@ -331,6 +338,25 @@ func (engine *Engine) route(host string, policy Policy, owner func() *process.Ow
 	return via, rule.String()
 }
 
+// Decide reports the outbound a connection to target would use, without
+// dialing. The TUN device uses it for UDP, which HopWay relays only directly.
+func (engine *Engine) Decide(target string) string {
+	host, _, err := wire.Split(target)
+	if err != nil {
+		return "REJECT"
+	}
+	engine.mu.Lock()
+	policy := engine.policy
+	engine.mu.Unlock()
+	via, _ := engine.route(host, policy, nil)
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if list := engine.choices(via); len(list) != 0 {
+		return list[0].via
+	}
+	return "REJECT"
+}
+
 func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Conn, error) {
 	host, _, err := wire.Split(target)
 	if err != nil {
@@ -346,7 +372,7 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	// outside the lock. The process is looked up here only if a process rule
 	// could decide the route; otherwise later, off the connection's path.
 	addrs, local := peer.From(ctx)
-	local = local && addrs.Client.Addr().Unmap().IsLoopback()
+	local = local && addrs.Local
 	var owner *process.Owner
 	looked := false
 	lookup := func() *process.Owner {
