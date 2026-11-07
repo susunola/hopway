@@ -14,6 +14,16 @@ struct Policy: Codable, Equatable {
     var mode: String
     var selected: String
     var auto: AutoRoutingConfig? = nil
+
+    static func label(_ mode: String) -> String {
+        switch mode {
+        case "rule": "按规则"
+        case "global": "全局"
+        case "direct": "直连"
+        case "auto": "自动"
+        default: mode
+        }
+    }
 }
 
 struct ProxyStatus: Decodable {
@@ -22,6 +32,8 @@ struct ProxyStatus: Decodable {
         let type: String
         let latencyMs: Int?
         let alive: Bool?
+        let error: String?
+        let healthAt: Double?
         var id: String { name }
 
         var label: String {
@@ -37,6 +49,7 @@ struct ProxyStatus: Decodable {
 
     struct Connection: Decodable, Identifiable {
         let id: UInt64
+        let start: Double?
         let inbound: String
         let target: String
         let via: String
@@ -58,21 +71,26 @@ struct ProxyStatus: Decodable {
 
         var inboundLabel: String { network == "udp" ? inbound + " · UDP" : inbound }
 
-        /// Where the connection failed and how long each stage took, for the tooltip.
-        var diagnosis: String {
-            var lines: [String] = []
-            if let error { lines.append(error) }
-            if let stage {
-                let names = ["route": "路由策略", "dns": "DNS 解析", "connect": "连接服务器", "handshake": "TLS / 协议握手", "upstream": "代理无响应"]
-                lines.append("失败阶段：" + (names[stage] ?? stage))
-            }
-            if let processPath { lines.append("应用：" + processPath) }
-            if let route, !route.isEmpty { lines.append("路径：" + (route + [via]).joined(separator: " → ")) }
-            if let server { lines.append("服务器：" + server) }
-            let timings = [("DNS", dnsMs), ("连接", connectMs), ("握手", handshakeMs), ("首字节", firstByteMs)]
+        var routeLabel: String { ((route ?? []) + [via]).joined(separator: " → ") }
+
+        var failureStage: String? {
+            guard let stage else { return nil }
+            let labels = ["route": "路由策略", "dns": "DNS 解析", "connect": "连接服务器",
+                          "handshake": "TLS / 协议握手", "upstream": "代理无响应"]
+            return labels[stage] ?? stage
+        }
+
+        var timingLabel: String {
+            [("DNS", dnsMs), ("连接", connectMs), ("握手", handshakeMs), ("首字节", firstByteMs)]
                 .compactMap { name, value in value.map { "\(name) \($0) ms" } }
-            if !timings.isEmpty { lines.append(timings.joined(separator: "  ")) }
-            return lines.isEmpty ? target : lines.joined(separator: "\n")
+                .joined(separator: " · ")
+        }
+
+        var diagnosis: String {
+            let lines = [error, failureStage.map { "失败阶段 · " + $0 },
+                         processPath.map { "应用 · " + $0 }, "路径 · " + routeLabel,
+                         server.map { "服务器 · " + $0 }, timingLabel.isEmpty ? nil : timingLabel]
+            return lines.compactMap { $0 }.joined(separator: "\n")
         }
 
         var stateLabel: String {
@@ -146,6 +164,32 @@ struct ProxyStatus: Decodable {
     let connections: [Connection]
     let active: Int
     let sessionTraffic: TrafficHistory.Count?
+    let reloaded: Double?
+}
+
+struct ProfileInspection: Decodable {
+    struct Group: Decodable, Identifiable {
+        let name: String
+        let type: String
+        let members: [String]
+        let selected: String?
+        var id: String { name }
+    }
+
+    let nodes: [ProxyStatus.Node]?
+    let subscriptions: [SubscriptionSummary]?
+    let groups: [Group]?
+    let ruleSets: [String]?
+    let ruleCount: Int?
+    let mode: String?
+    let selected: String?
+    let backend: String?
+    let backendVersion: String?
+    let socksPort: Int?
+    let httpPort: Int?
+    let systemProxy: Bool?
+    let tunEnabled: Bool?
+    let snapshotAt: [String: Double]?
 }
 
 struct CoreError: LocalizedError {
@@ -165,6 +209,10 @@ final class CoreModel: ObservableObject {
     @Published private(set) var phase = Phase.stopped
     @Published private(set) var endpoint: Endpoint?
     @Published private(set) var status: ProxyStatus?
+    @Published private(set) var statusReadFailed = false
+    @Published private(set) var configuredProfile: ProfileInspection?
+    @Published private(set) var profileReadFailed = false
+    private(set) var statusReadAt: Date?
     @Published private(set) var message: String?
     @Published private(set) var verifying = false
     @Published private(set) var verification: String?
@@ -183,6 +231,8 @@ final class CoreModel: ObservableObject {
     private var announcedRecovery = false
     @Published private(set) var saved = ""
 
+    private var inspectionID: UUID?
+    private var statusFailureMessage: String?
     private var trafficModifiedAt: Date?
     private var lastTrafficSample: (totals: TrafficHistory.Count, time: ContinuousClock.Instant)?
     private var quotaRefreshTask: Task<Void, Never>?
@@ -360,6 +410,8 @@ final class CoreModel: ObservableObject {
         verification = nil
         verifying = false
         status = nil
+        clearStatusFailure()
+        statusReadAt = nil
         updateTrafficRate(nil)
         updatingPolicy = false
         phase = .stopped
@@ -448,6 +500,8 @@ final class CoreModel: ObservableObject {
                previous.policy != snapshot.policy || previous.auto?.node != snapshot.auto?.node {
                 verification = nil
             }
+            statusReadAt = .now
+            clearStatusFailure()
             status = snapshot
             updateTrafficRate(snapshot.sessionTraffic)
             if before != snapshot.subscriptions?.map(\.updated) { reloadConfiguredNodes() }
@@ -461,9 +515,19 @@ final class CoreModel: ObservableObject {
             }
         } catch {
             guard !Task.isCancelled, endpoint?.token == info.token else { return }
+            if !statusReadFailed { statusReadFailed = true }
             updateTrafficRate(nil)
-            message = "读取内核状态失败 · " + error.localizedDescription
+            let failure = "读取内核状态失败 · " + error.localizedDescription
+            if message == nil || message == statusFailureMessage { message = failure }
+            statusFailureMessage = failure
         }
+    }
+
+    private func clearStatusFailure() {
+        guard statusReadFailed else { return }
+        if message == statusFailureMessage { message = nil }
+        statusFailureMessage = nil
+        statusReadFailed = false
     }
 
     func updatePolicy(_ policy: Policy) {
@@ -786,24 +850,27 @@ final class CoreModel: ObservableObject {
 
     private func reloadConfiguredNodes() {
         guard let executable else { return }
-        guard FileManager.default.fileExists(atPath: configURL.path) else { return }
         let destination = configURL
-        let version = saved
+        let id = UUID()
+        inspectionID = id
         Task {
-            guard let data = try? await Task.detached(operation: {
-                try Self.runProfileCommand("-inspect", at: destination, executable: executable)
-            }).value, version == saved else { return }
-            struct Profile: Decodable {
-                let nodes: [ProxyStatus.Node]?
-                let subscriptions: [SubscriptionSummary]?
+            do {
+                let data = try await Task.detached {
+                    try Self.runProfileCommand("-inspect", at: destination, executable: executable)
+                }.value
+                guard inspectionID == id else { return }
+                let profile = try JSONDecoder().decode(ProfileInspection.self, from: data)
+                profileReadFailed = false
+                configuredProfile = profile
+                configuredNodes = profile.nodes ?? []
+                subscriptions = profile.subscriptions ?? []
+                let names = Set(configuredNodes.map(\.name))
+                hiddenNodes.formIntersection(names)
+                probeResults = probeResults.filter { names.contains($0.key) }
+                probeFailures = probeFailures.filter { names.contains($0.key) }
+            } catch {
+                if inspectionID == id { profileReadFailed = true }
             }
-            guard let profile = try? JSONDecoder().decode(Profile.self, from: data) else { return }
-            configuredNodes = profile.nodes ?? []
-            subscriptions = profile.subscriptions ?? []
-            let names = Set(configuredNodes.map(\.name))
-            hiddenNodes.formIntersection(names)
-            probeResults = probeResults.filter { names.contains($0.key) }
-            probeFailures = probeFailures.filter { names.contains($0.key) }
         }
     }
 

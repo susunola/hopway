@@ -275,7 +275,9 @@ type Loaded struct {
 	User     engine.Config // the user's file (or the last good copy of it)
 	Merged   engine.Config // what the engine runs
 	Warnings []string
-	Fallback bool // the user's file was broken; the last good copy is in use
+	// SnapshotUpdated is keyed by subscription ID and uses Unix milliseconds.
+	SnapshotUpdated map[string]int64
+	Fallback        bool // the user's file was broken; the last good copy is in use
 }
 
 func lastGoodPath(dataDir string) string { return filepath.Join(dataDir, "last-good.json") }
@@ -338,6 +340,7 @@ func load(path, dataDir string, validate func(engine.Config) error) (Loaded, err
 		return Loaded{}, err
 	}
 	snapshots := map[string]*Snapshot{}
+	updated := map[string]int64{}
 	var warnings []string
 	for _, sub := range user.Subscriptions {
 		snapshot, err := LoadSnapshot(dataDir, sub)
@@ -348,13 +351,14 @@ func load(path, dataDir string, validate func(engine.Config) error) (Loaded, err
 			continue
 		}
 		snapshots[sub.Name] = snapshot
+		updated[sub.Key()] = snapshot.Updated
 	}
 	merged, mergeWarnings := Merge(user, snapshots)
 	merged.DataDir = dataDir
 	if err := validate(merged); err != nil {
 		return Loaded{}, err
 	}
-	return Loaded{User: user, Merged: merged, Warnings: append(warnings, mergeWarnings...)}, nil
+	return Loaded{User: user, Merged: merged, Warnings: append(warnings, mergeWarnings...), SnapshotUpdated: updated}, nil
 }
 
 func validateSubscriptions(subs []engine.Subscription) error {

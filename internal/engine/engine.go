@@ -102,6 +102,7 @@ type NodeSummary struct {
 	LatencyMs int64  `json:"latencyMs,omitempty"`
 	Alive     *bool  `json:"alive,omitempty"`
 	Error     string `json:"error,omitempty"`
+	HealthAt  int64  `json:"healthAt,omitempty"`
 }
 
 type GroupStatus struct {
@@ -817,7 +818,14 @@ func (engine *Engine) Status() Status {
 		if h := engine.health[name]; h != nil {
 			alive := h.alive
 			summary.Alive, summary.Error = &alive, h.err
-			if h.alive {
+			observed := h.checked
+			if h.succeeded.After(observed) {
+				observed = h.succeeded
+			}
+			if !observed.IsZero() {
+				summary.HealthAt = observed.UnixMilli()
+			}
+			if h.alive && h.latency > 0 {
 				summary.LatencyMs = max(h.latency.Milliseconds(), 1)
 			}
 		}

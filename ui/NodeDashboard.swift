@@ -4,6 +4,10 @@ struct NodeProbeResult: Decodable {
     let name: String
     let milliseconds: Int?
     let failure: String?
+    var receivedAt = Date.now
+    var fromRuntime = false
+
+    private enum CodingKeys: String, CodingKey { case name, milliseconds, failure }
 
     private var timedOut: Bool {
         guard let failure = failure?.lowercased() else { return false }
@@ -16,7 +20,9 @@ struct NodeProbeResult: Decodable {
     }
 
     var explanation: String {
-        failure ?? "节点已通过 HTTPS 测试"
+        let source = fromRuntime ? "内核健康记录" : "手动测速"
+        let time = receivedAt.formatted(date: .omitted, time: .shortened)
+        return "\(source) · \(time)\n" + (failure ?? (fromRuntime ? "节点当前可用" : "节点已通过 HTTPS 测试"))
     }
 }
 
@@ -29,6 +35,25 @@ struct NodeDashboard: View {
     @State private var showUnavailable = false
 
     @State private var providerID: String?
+    @State private var stateFilter = StateFilter.all
+
+    private enum StateFilter: String, CaseIterable {
+        case all = "全部状态"
+        case available = "可用"
+        case failed = "失败或超时"
+        case untested = "未测试"
+
+        func includes(pending: Bool, result: NodeProbeResult?) -> Bool {
+            if self == .all { return true }
+            guard !pending else { return false }
+            switch self {
+            case .all: return true
+            case .available: return result != nil && result?.failure == nil
+            case .failed: return result?.failure != nil
+            case .untested: return result == nil
+            }
+        }
+    }
 
     private struct Row: Identifiable {
         let node: ProxyStatus.Node
@@ -56,6 +81,7 @@ struct NodeDashboard: View {
             }
         }
         let keyword = filter.trimmingCharacters(in: .whitespacesAndNewlines)
+        let health = Dictionary(uniqueKeysWithValues: (core.status?.nodes ?? []).map { ($0.name, $0) })
         let matches = core.configuredNodes.compactMap { node -> Row? in
             let provider = source[node.name]
             guard showUnavailable || !core.hiddenNodes.contains(node.name),
@@ -63,14 +89,30 @@ struct NodeDashboard: View {
                   keyword.isEmpty || node.name.localizedCaseInsensitiveContains(keyword) ||
                     node.type.localizedCaseInsensitiveContains(keyword) ||
                     provider?.name.localizedCaseInsensitiveContains(keyword) == true else { return nil }
-            return Row(node: node, provider: provider?.name, pending: core.probePending.contains(node.name),
-                       result: core.probeResults[node.name])
+            let pending = core.probePending.contains(node.name)
+            let result = latestReading(for: node.name, runtime: health[node.name])
+            guard stateFilter.includes(pending: pending, result: result) else { return nil }
+            return Row(node: node, provider: provider?.name, pending: pending, result: result)
         }
         guard sortByLatency else { return matches }
         return matches.sorted {
             if $0.rank != $1.rank { return $0.rank < $1.rank }
             return $0.rank == 0 && $0.latency < $1.latency
         }
+    }
+
+    private func latestReading(for name: String, runtime: ProxyStatus.Node?) -> NodeProbeResult? {
+        let manual = core.probeResults[name]
+        guard let runtime, let alive = runtime.alive, let observed = runtime.healthAt else { return manual }
+        let time = Date(timeIntervalSince1970: observed / 1000)
+        if let manual, manual.receivedAt >= time { return manual }
+        return NodeProbeResult(
+            name: name,
+            milliseconds: runtime.latencyMs,
+            failure: alive ? nil : runtime.error ?? "内核报告节点不可用",
+            receivedAt: time,
+            fromRuntime: true
+        )
     }
 
     var body: some View {
@@ -122,6 +164,11 @@ struct NodeDashboard: View {
                         .accessibilityLabel("订阅来源")
                         .frame(maxWidth: 145)
                     }
+                    Picker("节点状态", selection: $stateFilter) {
+                        ForEach(StateFilter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
                     Spacer()
                     if !core.hiddenNodes.isEmpty {
                         Toggle("显示暂不可用（\(core.hiddenNodes.count)）", isOn: $showUnavailable)
@@ -223,7 +270,7 @@ struct NodeDashboard: View {
                         core.connectToNode(name)
                     }
                 }
-                Text("双击节点即可连接。连续两次失败的节点会暂时隐藏，复测成功后自动显示。")
+                Text("双击节点即可连接。将鼠标移到状态上可查看测试来源、时间和失败原因。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

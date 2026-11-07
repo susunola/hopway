@@ -70,10 +70,16 @@ struct SubscriptionDashboard: View {
     @State private var removing: SubscriptionSummary?
 
     var body: some View {
+        let active = core.subscriptions.filter { !$0.isPaused }.count
+        let paused = core.subscriptions.count - active
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 HStack {
-                    HopPageHeading(title: "订阅", detail: "管理服务商套餐、流量额度和到期时间")
+                    HopPageHeading(
+                        title: "订阅",
+                        detail: core.subscriptions.isEmpty ? "管理服务商套餐、额度和到期时间" :
+                            "\(core.subscriptions.count) 份订阅 · \(active) 份启用 · \(paused) 份暂停"
+                    )
                     Spacer()
                     Button("导入订阅…", action: importLink).disabled(core.saving)
                     Button(action: core.refreshAllSubscriptions) {
@@ -138,6 +144,8 @@ struct SubscriptionDashboard: View {
         let total = meter?.total.flatMap { $0 > 0 ? $0 : nil }
         let ratio = used.flatMap { used in total.map { Double(used) / Double($0) } }
         let warning = (ratio ?? 0) >= 0.8
+        let runtime = core.status?.subscriptions?.first { $0.id == subscription.id }
+        let nodeSync = max(runtime?.updated ?? 0, core.configuredProfile?.snapshotAt?[subscription.id] ?? 0)
         return VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline, spacing: 9) {
                 Text(subscription.name).font(.headline).lineLimit(1)
@@ -217,19 +225,40 @@ struct SubscriptionDashboard: View {
             }
             .font(.callout)
             .foregroundStyle(.secondary)
-            if let error = core.status?.subscriptions?.first(where: { $0.id == subscription.id })?.error {
-                Label(error, systemImage: "exclamationmark.circle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+            if let error = runtime?.error {
+                VStack(alignment: .leading, spacing: 3) {
+                    Label(nodeSync > 0 ? "刷新失败 · 使用上次缓存" : "刷新失败", systemImage: "exclamationmark.circle")
+                        .foregroundStyle(.orange)
+                    Text(error)
+                        .lineLimit(2)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .help(error)
+                }
+                .font(.caption)
             }
-            if let meter {
-                let updated = Date(timeIntervalSince1970: Double(meter.updatedAt))
-                Text("更新于 \(updated.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 14) { syncLabels(nodeSync: nodeSync, quotaSync: meter?.updatedAt) }
+                VStack(alignment: .leading, spacing: 4) { syncLabels(nodeSync: nodeSync, quotaSync: meter?.updatedAt) }
             }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func syncLabels(nodeSync: Double, quotaSync: Int64?) -> some View {
+        if nodeSync > 0 {
+            Text("节点同步 " + Date(timeIntervalSince1970: nodeSync / 1000).formatted(date: .abbreviated, time: .shortened))
+        } else {
+            Text("节点暂无同步记录")
+        }
+        if let quotaSync, quotaSync > 0 {
+            Text("额度更新 " + Date(timeIntervalSince1970: Double(quotaSync)).formatted(date: .abbreviated, time: .shortened))
+        } else {
+            Text("额度暂无更新记录")
+        }
     }
 
     private func expirationText(_ date: Date) -> String {

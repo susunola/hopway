@@ -103,6 +103,12 @@ struct LocalTrafficView: View {
     let history: TrafficHistory?
     let subscriptions: [SubscriptionSummary]
     @State private var period = Period.fortnight
+    @State private var source = Source.all
+    @State private var node: String?
+
+    private enum Source: Hashable {
+        case all, direct, proxy, subscription(String)
+    }
 
     private enum Period: String, CaseIterable {
         case today = "今天"
@@ -128,6 +134,7 @@ struct LocalTrafficView: View {
     private struct Report {
         var days: [TrafficHistory.Day] = []
         var nodes: [Node] = []
+        var eligibleNodes: [String] = []
         var total = TrafficHistory.Count()
     }
 
@@ -137,22 +144,42 @@ struct LocalTrafficView: View {
         calendar.timeZone = .current
         let today = calendar.startOfDay(for: .now)
         let start = period.start(before: today, calendar: calendar)
-        var report = Report(days: history.series(from: start, through: today, calendar: calendar))
-        var counts: [String: TrafficHistory.Count] = [:]
-        for day in report.days {
-            for (name, value) in day.nodes { counts[name, default: .init()].add(value) }
-            report.total.add(day.count)
-        }
-
-        var providers: [String: [String]] = [:]
+        var providers: [String: [SubscriptionSummary]] = [:]
         for subscription in subscriptions {
-            for node in Set(subscription.nodes ?? []) {
-                providers[node, default: []].append(subscription.name)
+            for name in Set(subscription.nodes ?? []) {
+                providers[name, default: []].append(subscription)
             }
         }
+        func matchesSource(_ name: String) -> Bool {
+            switch source {
+            case .all: true
+            case .direct: name == "DIRECT"
+            case .proxy: name != "DIRECT"
+            case .subscription(let id): name != "DIRECT" && providers[name]?.contains { $0.id == id } == true
+            }
+        }
+
+        var report = Report()
+        var counts: [String: TrafficHistory.Count] = [:]
+        var eligible = Set<String>()
+        for day in history.series(from: start, through: today, calendar: calendar) {
+            var scopedNodes: [String: TrafficHistory.Count] = [:]
+            var total = TrafficHistory.Count()
+            for (name, value) in day.nodes where matchesSource(name) {
+                eligible.insert(name)
+                if node == nil || node == name {
+                    scopedNodes[name] = value
+                    total.add(value)
+                    counts[name, default: .init()].add(value)
+                }
+            }
+            report.days.append(.init(date: day.date, nodes: scopedNodes, count: total))
+            report.total.add(total)
+        }
+        report.eligibleNodes = eligible.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         report.nodes = counts.map { name, count in
             let sources = providers[name] ?? []
-            let provider = name == "DIRECT" ? "直连" : sources.count > 1 ? "多个订阅" : sources.first ?? "未归属"
+            let provider = name == "DIRECT" ? "直连" : sources.count > 1 ? "多个订阅" : sources.first?.name ?? "未归属"
             return Node(name: name, provider: provider, count: count)
         }.sorted { lhs, rhs in
             lhs.count.total == rhs.count.total ? lhs.name < rhs.name : lhs.count.total > rhs.count.total
@@ -173,7 +200,28 @@ struct LocalTrafficView: View {
                 .labelsHidden()
                 .frame(width: 205)
             }
+            HStack(spacing: 12) {
+                Picker("来源", selection: $source) {
+                    Text("全部出站").tag(Source.all)
+                    Text("仅直连").tag(Source.direct)
+                    Text("仅代理节点").tag(Source.proxy)
+                    ForEach(subscriptions.filter { !($0.nodes ?? []).isEmpty }) { subscription in
+                        Text(subscription.name).tag(Source.subscription(subscription.id))
+                    }
+                }
+                .frame(maxWidth: 205)
+                Picker("节点", selection: $node) {
+                    Text("全部节点").tag(String?.none)
+                    ForEach(data.eligibleNodes, id: \.self) { name in
+                        Text(name == "DIRECT" ? "DIRECT（直连）" : NodeLocation(name: name).title)
+                            .tag(Optional(name))
+                    }
+                }
+                .frame(maxWidth: 235)
+                .disabled(data.eligibleNodes.isEmpty)
+            }
             HStack(spacing: 28) {
+                metric("合计", data.total.total)
                 metric("下载", data.total.download)
                 metric("上传", data.total.upload)
                 metric("日均", data.total.total / UInt64(max(data.days.count, 1)))
@@ -184,13 +232,20 @@ struct LocalTrafficView: View {
                 breakdown(data.nodes, total: data.total.total)
             } else {
                 Label(
-                    history == nil ? "启动代理后开始记录本机流量。" : "这段时间还没有经过 HopWay 的流量。",
+                    history == nil ? "启动代理后开始记录本机流量。" : "当前时间和筛选范围内暂无流量。",
                     systemImage: "chart.bar"
                 )
                 .foregroundStyle(.secondary)
                 .font(.callout)
                 .padding(.vertical, 23)
             }
+        }
+        .onChange(of: source) { _, _ in node = nil }
+        .onChange(of: data.eligibleNodes) { _, names in
+            if let node, !names.contains(node) { self.node = nil }
+        }
+        .onChange(of: subscriptions.filter { !($0.nodes ?? []).isEmpty }.map(\.id)) { _, ids in
+            if case .subscription(let id) = source, !ids.contains(id) { source = .all }
         }
     }
 

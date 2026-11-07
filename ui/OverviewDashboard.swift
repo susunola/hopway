@@ -36,6 +36,12 @@ struct OverviewDashboard: View {
                     .accessibilityAddTraits(.isHeader)
                     .padding(.bottom, 2)
                 proxyControl
+                if core.statusReadFailed {
+                    Label(core.statusReadAt.map { "状态读取失败，显示 " + $0.formatted(date: .omitted, time: .standard) + " 的记录" }
+                          ?? "暂时无法读取内核状态", systemImage: "exclamationmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 routing
                 localAccess
                 traffic

@@ -75,7 +75,6 @@ private enum DashboardPage: String, CaseIterable {
 
 private struct Dashboard: View {
     @ObservedObject var core: CoreModel
-    @State private var filter = ""
     @State private var routeHost = ""
     @State private var routeResult: String?
     @State private var testingRoute = false
@@ -104,13 +103,21 @@ private struct Dashboard: View {
                     case .nodes:
                         NodeDashboard(core: core) { showsLinkImport = true }
                     case .policies:
-                        ScrollView { VStack(alignment: .leading, spacing: 16) { routeTester; policies } }
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 14) {
+                                HopPageHeading(title: "策略", detail: "查看路由配置、策略组和规则集。")
+                                policySummary
+                                routeTester
+                                policies
+                            }
+                            .padding(.bottom, 12)
+                        }
                     case .subscriptions:
                         SubscriptionDashboard(core: core) { showsLinkImport = true }
                     case .usage:
                         TrafficDashboard(core: core)
                     case .connections:
-                        connections
+                        ConnectionsDashboard(core: core)
                     case .settings:
                         configuration
                     }
@@ -230,9 +237,12 @@ private struct Dashboard: View {
             Divider().padding(.bottom, 8)
             HStack(spacing: 7) {
                 Circle()
-                    .fill(core.phase == .running ? HopAppearance.accent : Color.secondary)
+                    .fill(core.statusReadFailed ? Color.orange :
+                          core.phase == .running ? HopAppearance.accent : Color.secondary)
                     .frame(width: 7, height: 7)
-                Text(core.phase.rawValue).font(.caption).foregroundStyle(.secondary)
+                Text(core.statusReadFailed ? "状态更新失败" : core.phase.rawValue)
+                    .font(.caption)
+                    .foregroundStyle(core.statusReadFailed ? Color.orange : .secondary)
             }
             .padding(.horizontal, 10)
             .padding(.bottom, 5)
@@ -244,7 +254,13 @@ private struct Dashboard: View {
 
     private var routeTester: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HopPageHeading(title: "策略", detail: "试跑一个地址，查看内核当前会选择的出口。")
+            HStack {
+                Label("路由试跑", systemImage: "arrow.triangle.branch").font(.headline)
+                Spacer()
+                if core.phase != .running {
+                    Text("启动代理后可试跑").font(.caption).foregroundStyle(.secondary)
+                }
+            }
             HStack {
                 TextField("域名或 IP", text: $routeHost)
                     .textFieldStyle(.roundedBorder)
@@ -252,13 +268,19 @@ private struct Dashboard: View {
                 Button(testingRoute ? "正在试跑…" : "试跑") {
                     testingRoute = true
                     let address = routeHost
+                    let policy = core.status?.policy
+                    let reload = core.status?.reloaded
                     Task {
                         defer { testingRoute = false }
                         do {
                             let result = try await core.explainRoute(address)
+                            guard routeHost == address, core.phase == .running,
+                                  core.status?.policy == policy, core.status?.reloaded == reload else { return }
                             routeResult = result.rule + " · " + ((result.path ?? []) + [result.outbound]).joined(separator: " → ")
                         } catch {
-                            routeResult = error.localizedDescription
+                            if routeHost == address, core.phase == .running {
+                                routeResult = error.localizedDescription
+                            }
                         }
                     }
                 }
@@ -267,74 +289,127 @@ private struct Dashboard: View {
             if let routeResult { Text(routeResult).textSelection(.enabled) }
         }
         .hopPanel()
+        .onChange(of: routeHost) { _, _ in routeResult = nil }
+        .onChange(of: core.status?.policy) { _, _ in routeResult = nil }
+        .onChange(of: core.status?.reloaded) { _, _ in routeResult = nil }
+        .onChange(of: core.phase) { _, _ in routeResult = nil }
+    }
+
+    private var policySummary: some View {
+        let profile = core.configuredProfile
+        let status = core.status
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(status == nil ? "配置摘要" : "当前路由", systemImage: "point.3.connected.trianglepath.dotted")
+                    .font(.headline)
+                Spacer()
+                Button("管理订阅") { page = .subscriptions }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(HopAppearance.accent)
+            }
+            if let mode = status?.policy.mode ?? profile?.mode {
+                let outbound: String? = if mode == "auto", status != nil {
+                    status?.auto?.node ?? "等待可用节点"
+                } else if mode == "direct" {
+                    "DIRECT"
+                } else {
+                    status?.policy.selected ?? profile?.selected
+                }
+                Text([Policy.label(mode), outbound].compactMap { $0 }.joined(separator: " · "))
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                    .help(outbound ?? Policy.label(mode))
+            }
+            if let profile {
+                Text("\(profile.ruleCount ?? 0) 条配置规则 · \(profile.groups?.count ?? 0) 个策略组 · \(profile.ruleSets?.count ?? 0) 个规则集")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            if core.profileReadFailed {
+                Label("配置读取失败，请在设置中检查已保存的配置。", systemImage: "exclamationmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+        .hopPanel()
     }
 
     private var policies: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if let status = core.status {
-                    HStack {
-                        Text("策略组").font(.headline)
-                        Spacer()
-                        Button("测速全部节点") { core.trigger("probe", done: "正在测速…") }
-                    }
-                    if let groups = status.groups, !groups.isEmpty {
-                        ForEach(groups) { group in
-                            GroupBox {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    if group.type == "select" {
-                                        Picker("使用", selection: Binding(
-                                            get: { group.selected ?? group.now },
-                                            set: { core.selectInGroup(group.name, member: $0) }
-                                        )) {
-                                            ForEach(group.members, id: \.self) { member in
-                                                Text(core.memberLabel(member)).tag(member)
-                                            }
-                                        }
-                                    } else {
-                                        Text("正在使用 " + core.memberLabel(group.now)).monospacedDigit()
-                                        Text(group.members.map { core.memberLabel($0) }.joined(separator: "，"))
-                                            .font(.caption).foregroundStyle(.secondary)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                    }
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(8)
-                            } label: {
-                                Text(group.name + " · " + group.typeLabel)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("策略组").font(.headline)
+                Spacer()
+                Button("测速全部节点") { core.trigger("probe", done: "正在测速…") }
+                    .disabled(core.phase != .running || core.statusReadFailed || core.configuredNodes.isEmpty)
+            }
+            if let status = core.status, let groups = status.groups, !groups.isEmpty {
+                ForEach(groups) { group in
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text(group.name + " · " + group.typeLabel).font(.callout.weight(.semibold))
+                        if group.type == "select" {
+                            Picker("使用", selection: Binding(
+                                get: { group.selected ?? group.now },
+                                set: { core.selectInGroup(group.name, member: $0) }
+                            )) {
+                                ForEach(group.members, id: \.self) { Text(core.memberLabel($0)).tag($0) }
                             }
-                        }
-                    } else {
-                        Text("还没有策略组。导入 Clash 订阅时会一并导入，也可以在配置里编写 groups。")
-                            .foregroundStyle(.secondary)
-                    }
-                    if let subscriptions = status.subscriptions, !subscriptions.isEmpty {
-                        HStack {
-                            Text("订阅").font(.headline)
-                            Spacer()
-                            Button("立即更新") { core.trigger("subscriptions/refresh", done: "正在更新订阅…") }
-                        }
-                        ForEach(subscriptions) { sub in
-                            sourceRow(sub.name, detail: "\(sub.nodes) 个节点", updated: sub.updated, error: sub.error)
+                            .disabled(core.phase != .running || core.statusReadFailed)
+                        } else {
+                            Text("正在使用 " + core.memberLabel(group.now))
+                                .font(.callout).monospacedDigit()
+                            groupMembers(group.members)
                         }
                     }
-                    if let sets = status.ruleSets, !sets.isEmpty {
-                        HStack {
-                            Text("规则集").font(.headline)
-                            Spacer()
-                            Button("立即更新") { core.trigger("rulesets/refresh", done: "正在更新规则集…") }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .hopPanel()
+                }
+            } else if let groups = core.configuredProfile?.groups, !groups.isEmpty {
+                ForEach(groups) { group in
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text(group.name).font(.callout.weight(.semibold))
+                        if let selected = group.selected {
+                            Text("配置成员 " + selected).font(.callout).foregroundStyle(.secondary)
                         }
-                        ForEach(sets) { item in
-                            sourceRow(item.name, detail: "\(item.entries) 条", updated: item.updated, error: item.error)
-                        }
+                        groupMembers(group.members)
                     }
-                } else {
-                    Text("启动内核后，可以在这里切换策略组、测速和更新订阅。")
-                        .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .hopPanel()
+                }
+            } else {
+                Text(core.configuredProfile == nil ? "正在读取已保存的策略。" : "当前配置没有策略组。")
+                    .foregroundStyle(.secondary)
+                    .font(.callout)
+            }
+
+            if let sets = core.status?.ruleSets, !sets.isEmpty {
+                HStack {
+                    Text("规则集").font(.headline)
+                    Spacer()
+                    Button("更新规则集") { core.trigger("rulesets/refresh", done: "正在更新规则集…") }
+                        .disabled(core.phase != .running || core.statusReadFailed)
+                }
+                ForEach(sets) { item in
+                    sourceRow(item.name, detail: "\(item.entries) 条", updated: item.updated, error: item.error)
+                }
+            } else if let names = core.configuredProfile?.ruleSets, !names.isEmpty {
+                Text("已配置的规则集").font(.headline)
+                ForEach(names, id: \.self) { name in
+                    Text(name).font(.callout)
                 }
             }
-            .padding(14)
         }
+    }
+
+    private func groupMembers(_ names: [String]) -> some View {
+        DisclosureGroup("\(names.count) 个成员") {
+            Text(names.map { core.memberLabel($0) }.joined(separator: "，"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.callout)
     }
 
     private func sourceRow(_ name: String, detail: String, updated: Double?, error: String?) -> some View {
@@ -354,109 +429,120 @@ private struct Dashboard: View {
         .font(.callout)
     }
 
-    private var rows: [ProxyStatus.Connection] {
-        (core.status?.connections ?? [])
-            .filter { row in
-                filter.isEmpty || [row.target, row.via, row.inbound, row.stateLabel, row.rule]
-                    .contains { $0.localizedCaseInsensitiveContains(filter) }
-            }
-            .sorted { lhs, rhs in
-                if (lhs.state == "active") != (rhs.state == "active") { return lhs.state == "active" }
-                return lhs.id > rhs.id
-            }
-    }
-
-    private var connections: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HopPageHeading(title: "连接", detail: "查看流量经过的节点和命中的规则。")
-            HStack {
-                HopSearchField(placeholder: "筛选目标、节点或规则", text: $filter)
-                    .frame(width: 235)
-                Spacer()
-                Text("\(core.status?.active ?? 0) 个活动连接")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            if rows.isEmpty {
-                ContentUnavailableView(
-                    filter.isEmpty ? "暂无连接" : "没有匹配的连接",
-                    systemImage: filter.isEmpty ? "arrow.left.arrow.right" : "magnifyingglass",
-                    description: Text(filter.isEmpty ? "代理收到流量后，连接会显示在这里。" : "试试其他关键词。")
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                Table(rows) {
-                    TableColumn("目标") { Text($0.target).textSelection(.enabled).help($0.diagnosis) }.width(min: 120, ideal: 150)
-                    TableColumn("入站", value: \.inboundLabel).width(min: 68, ideal: 85)
-                    TableColumn("出站", value: \.via).width(min: 68, ideal: 95)
-                    TableColumn("规则", value: \.rule).width(min: 60, ideal: 95)
-                    TableColumn("状态") { row in
-                        Text(row.stateLabel)
-                            .foregroundStyle(row.state == "active" ? Color.green : row.state == "failed" ? .red : .secondary)
-                            .help(row.error ?? row.stateLabel)
-                    }.width(66)
-                    TableColumn("发送 / 接收") {
-                        Text("\($0.sent.formatted()) / \($0.received.formatted()) B").monospacedDigit()
-                    }.width(min: 110, ideal: 140)
+    private var configuration: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HopPageHeading(title: "设置", detail: "接入方式、监听端口和内核配置。")
+                accessSettings
+                coreSettings
+                HStack {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Label("高级配置", systemImage: "chevron.left.forwardslash.chevron.right")
+                            .font(.headline)
+                        Text(core.changed ? "有未保存的草稿" : "编辑内核的节点、规则和监听端口。")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("编辑 JSON…") { showsConfigurationEditor = true }
                 }
+                .hopPanel()
             }
+            .padding(.bottom, 12)
         }
     }
 
-    private var configuration: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HopPageHeading(title: "设置", detail: "管理 macOS 接入方式和内核配置。")
-            VStack(alignment: .leading, spacing: 9) {
-                switch core.phase {
-                case .stopped:
-                    Text("启动代理后，即可在这里设置系统代理、TUN 增强模式和 TUN 助手。")
-                        .font(.callout)
+    private var accessSettings: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Label("macOS 接入", systemImage: "network").font(.headline)
+            switch core.phase {
+            case .stopped:
+                Text("启动代理后可以接管系统代理或开启 TUN。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                if let profile = core.configuredProfile {
+                    let enabled = [
+                        profile.systemProxy == true ? "系统代理" : nil,
+                        profile.tunEnabled == true ? "TUN" : nil
+                    ].compactMap { $0 }
+                    Text(enabled.isEmpty ? "启动后手动接入" : "启动时开启 " + enabled.joined(separator: "、"))
+                        .font(.caption)
                         .foregroundStyle(.secondary)
-                    Button("启动代理", action: core.toggle)
-                        .buttonStyle(HopPrimaryButton())
-                        .disabled(core.saving)
-                case .starting, .stopping:
-                    ProgressView(core.phase.rawValue)
-                        .controlSize(.small)
-                case .running:
-                    if core.status == nil {
-                        ProgressView("正在读取接入状态…")
-                            .controlSize(.small)
-                    } else {
-                        Toggle("系统代理", isOn: Binding(
-                            get: { core.status?.systemProxy?.enabled ?? false },
-                            set: core.setSystemProxy))
-                            .disabled(core.status?.systemProxy?.supported != true)
-                        Toggle("TUN 增强模式", isOn: Binding(
-                            get: { core.status?.tun?.enabled ?? false },
-                            set: core.setTUN))
-                            .disabled(core.status?.tun?.supported != true)
-                        Button(core.status?.tun?.service == true ? "移除 TUN 助手" : "安装 TUN 助手") {
-                            core.setTUNService(core.status?.tun?.service != true)
+                }
+                Button("启动代理", action: core.toggle)
+                    .buttonStyle(HopPrimaryButton())
+                    .disabled(core.saving)
+            case .starting, .stopping:
+                ProgressView(core.phase.rawValue).controlSize(.small)
+            case .running:
+                if let status = core.status {
+                    Toggle("系统代理", isOn: Binding(
+                        get: { status.systemProxy?.enabled ?? false }, set: core.setSystemProxy))
+                        .disabled(status.systemProxy?.supported != true || core.statusReadFailed)
+                    Toggle("TUN 增强模式", isOn: Binding(
+                        get: { status.tun?.enabled ?? false }, set: core.setTUN))
+                        .disabled(status.tun?.supported != true || core.statusReadFailed)
+                    HStack {
+                        Button(status.tun?.service == true ? "移除 TUN 助手" : "安装 TUN 助手") {
+                            core.setTUNService(status.tun?.service != true)
                         }
-                        .disabled(core.status?.tun?.supported != true)
-                        if let error = core.status?.systemProxy?.error ?? core.status?.tun?.error {
-                            Text(error).font(.callout).foregroundStyle(.orange)
+                        .disabled(status.tun?.supported != true || core.statusReadFailed)
+                        if let device = status.tun?.device {
+                            Text("设备 " + device).font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                    if let error = status.systemProxy?.error {
+                        Label("系统代理 · " + error, systemImage: "exclamationmark.circle")
+                            .font(.callout).foregroundStyle(.orange)
+                    }
+                    if let error = status.tun?.error {
+                        Label("TUN · " + error, systemImage: "exclamationmark.circle")
+                            .font(.callout).foregroundStyle(.orange)
+                    }
+                } else if core.statusReadFailed {
+                    Text("暂时无法读取接入状态。").font(.callout).foregroundStyle(.orange)
+                } else {
+                    ProgressView("正在读取接入状态…").controlSize(.small)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .hopPanel()
-            HStack {
-                VStack(alignment: .leading, spacing: 5) {
-                    Label("高级配置", systemImage: "chevron.left.forwardslash.chevron.right")
-                        .font(.headline)
-                    Text(core.changed ? "有未保存的草稿" : "编辑内核的节点、规则和监听端口。")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("编辑 JSON…") { showsConfigurationEditor = true }
-            }
-            .hopPanel()
-            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .hopPanel()
+    }
+
+    private var coreSettings: some View {
+        let profile = core.configuredProfile
+        let backend = [profile?.backend, profile?.backendVersion].compactMap { $0 }.joined(separator: " ")
+        return VStack(alignment: .leading, spacing: 9) {
+            Label("监听与内核", systemImage: "cpu").font(.headline)
+            if let profile {
+                HStack(spacing: 18) {
+                    LabeledContent("SOCKS5", value: portLabel(profile.socksPort, running: core.endpoint?.socks))
+                    LabeledContent("HTTP", value: portLabel(profile.httpPort, running: core.endpoint?.http))
+                }
+                .monospacedDigit()
+                if !backend.isEmpty { LabeledContent("内核后端", value: backend) }
+                if let applied = core.status?.reloaded {
+                    LabeledContent("配置应用时间", value: Date(timeIntervalSince1970: applied / 1000)
+                        .formatted(date: .abbreviated, time: .shortened))
+                }
+            } else if !core.profileReadFailed {
+                Text("正在读取已保存的配置。").foregroundStyle(.secondary)
+            }
+            if core.profileReadFailed {
+                Label("读取已保存的配置失败", systemImage: "exclamationmark.circle")
+                    .foregroundStyle(.orange)
+            }
+        }
+        .font(.callout)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .hopPanel()
+    }
+
+    private func portLabel(_ configured: Int?, running: String?) -> String {
+        if let running { return running }
+        guard let configured else { return "未读取" }
+        return configured == 0 ? "启动时分配" : "\(configured)（已配置）"
     }
 
     private var configurationEditor: some View {
@@ -487,7 +573,7 @@ private struct Dashboard: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary))
                 .accessibilityLabel("JSON 配置编辑器")
-            Text(core.message ?? "保存后于下次启动生效。关闭会保留草稿。")
+            Text(core.message ?? "保存后尝试热加载。修改监听端口需重启代理。关闭会保留草稿。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)

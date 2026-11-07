@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -475,10 +476,39 @@ func inspectProfile(path string, inspect, probe, refresh bool, names []string, r
 	}
 	if inspect {
 		type summary struct {
-			Nodes []engine.NodeSummary  `json:"nodes"`
-			Subs  []engine.Subscription `json:"subscriptions"`
+			Nodes          []engine.NodeSummary  `json:"nodes"`
+			Subs           []engine.Subscription `json:"subscriptions"`
+			Groups         []engine.Group        `json:"groups,omitempty"`
+			RuleSets       []string              `json:"ruleSets,omitempty"`
+			RuleCount      int                   `json:"ruleCount"`
+			Mode           string                `json:"mode"`
+			Selected       string                `json:"selected"`
+			Backend        string                `json:"backend"`
+			BackendVersion string                `json:"backendVersion,omitempty"`
+			SOCKSPort      int                   `json:"socksPort"`
+			HTTPPort       int                   `json:"httpPort"`
+			SystemProxy    bool                  `json:"systemProxy"`
+			TUNEnabled     bool                  `json:"tunEnabled"`
+			SnapshotAt     map[string]int64      `json:"snapshotAt,omitempty"`
 		}
-		result := summary{Subs: loaded.Merged.Subscriptions}
+		config := loaded.Merged
+		result := summary{
+			Subs: config.Subscriptions, Groups: config.Groups, RuleCount: len(config.Rules),
+			Mode: config.Mode, Selected: config.Selected, Backend: impl.Name(), SnapshotAt: loaded.SnapshotUpdated,
+			SOCKSPort: config.SOCKSPort, HTTPPort: config.HTTPPort,
+			SystemProxy: config.SystemProxy, TUNEnabled: config.TUN != nil && config.TUN.Enabled,
+		}
+		if build, ok := debug.ReadBuildInfo(); ok && impl.Name() == "sing-box" {
+			for _, dep := range build.Deps {
+				if dep.Path == "github.com/sagernet/sing-box" {
+					result.BackendVersion = dep.Version
+					break
+				}
+			}
+		}
+		for _, set := range config.RuleSets {
+			result.RuleSets = append(result.RuleSets, set.Name)
+		}
 		for i := range result.Subs {
 			result.Subs[i].ID = result.Subs[i].Key()
 			result.Subs[i].URL = ""
