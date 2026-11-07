@@ -25,6 +25,8 @@ type Config struct {
 	Selected  string          `json:"selected"`
 	Nodes     []outbound.Node `json:"nodes"`
 	Rules     []Rule          `json:"rules"`
+	// Subscriptions lists the providers imported by URL, with their plan usage.
+	Subscriptions []Subscription `json:"subscriptions,omitempty"`
 }
 
 type Rule struct {
@@ -58,8 +60,17 @@ type Policy struct {
 }
 
 type NodeSummary struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	Name         string `json:"name"`
+	Type         string `json:"type"`
+	Subscription string `json:"subscription,omitempty"`
+	// Health is "ok", "down" or empty when the node has not been checked yet.
+	Health    string `json:"health,omitempty"`
+	LatencyMS int64  `json:"latency,omitempty"`
+	// Spent is true when the node's plan is used up or expired; AUTO skips it.
+	Spent bool `json:"spent,omitempty"`
+	// Sent and Recv count bytes through this outbound since the core started.
+	Sent uint64 `json:"sent"`
+	Recv uint64 `json:"received"`
 }
 
 type Record struct {
@@ -79,6 +90,12 @@ type Status struct {
 	Nodes       []NodeSummary `json:"nodes"`
 	Connections []Record      `json:"connections"`
 	Active      int           `json:"active"`
+	// Auto is the node AUTO currently resolves to.
+	Auto string `json:"auto"`
+	// Subscriptions mirrors the loaded config, including plan usage.
+	Subscriptions []Subscription `json:"subscriptions"`
+	// Revision increases each time a new config is loaded with Reload.
+	Revision uint64 `json:"revision"`
 }
 
 type Engine struct {
@@ -91,6 +108,13 @@ type Engine struct {
 	live     map[uint64]*tracked
 	recent   []Record
 	ports    map[uint16]bool
+	order    []string
+	spent    map[string]bool
+	health   map[string]*health
+	usage    map[string]*counter
+	trigger  chan struct{}
+	plans    []Subscription
+	revision uint64
 }
 
 func New(config Config, localPorts ...int) (*Engine, error) {
@@ -100,21 +124,34 @@ func New(config Config, localPorts ...int) (*Engine, error) {
 	}
 	engine := &Engine{
 		nodes: make(map[string]outbound.Node), live: make(map[uint64]*tracked),
-		summary: []NodeSummary{{"DIRECT", "direct"}, {"REJECT", "reject"}},
-		ports:   make(map[uint16]bool),
+		summary: []NodeSummary{{Name: Auto, Type: "auto"}, {Name: "DIRECT", Type: "direct"}, {Name: "REJECT", Type: "reject"}},
+		ports:   make(map[uint16]bool), spent: make(map[string]bool), health: make(map[string]*health),
+		usage: map[string]*counter{"DIRECT": {}}, trigger: make(chan struct{}, 1),
 	}
+	plans, err := validateSubscriptions(config.Subscriptions)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	engine.plans = append([]Subscription{}, config.Subscriptions...)
 	for _, port := range localPorts {
 		engine.ports[uint16(port)] = true
 	}
 	for _, node := range config.Nodes {
-		if node.Name == "" || strings.TrimSpace(node.Name) != node.Name || engine.validVia(node.Name) || node.Name == "SELECT" {
+		if node.Name == "" || strings.TrimSpace(node.Name) != node.Name || engine.validVia(node.Name) || node.Name == "SELECT" || node.Name == Auto {
 			return nil, fmt.Errorf("invalid or duplicate node name %q", node.Name)
 		}
 		if err := node.Validate(); err != nil {
 			return nil, fmt.Errorf("node %q: %w", node.Name, err)
 		}
 		engine.nodes[node.Name] = node
-		engine.summary = append(engine.summary, NodeSummary{node.Name, node.Type})
+		engine.order = append(engine.order, node.Name)
+		engine.health[node.Name] = &health{}
+		engine.usage[node.Name] = &counter{}
+		if plan, ok := plans[node.Subscription]; ok && !plan.Usable(now) {
+			engine.spent[node.Name] = true
+		}
+		engine.summary = append(engine.summary, NodeSummary{Name: node.Name, Type: node.Type, Subscription: node.Subscription})
 	}
 	for index, rule := range config.Rules {
 		if !engine.validVia(rule.Via) && rule.Via != "SELECT" {
@@ -149,7 +186,7 @@ func New(config Config, localPorts ...int) (*Engine, error) {
 
 func (engine *Engine) validVia(name string) bool {
 	_, exists := engine.nodes[name]
-	return exists || name == "DIRECT" || name == "REJECT"
+	return exists || name == "DIRECT" || name == "REJECT" || name == Auto
 }
 
 func (engine *Engine) SetPolicy(policy Policy) error {
@@ -220,19 +257,35 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	engine.mu.Lock()
 	engine.sequence++
 	via, rule := engine.route(host, engine.policy)
+	// Node values are copied under the lock because Reload may swap the map.
+	var tries []outbound.Node
+	if via == Auto {
+		for _, name := range engine.autoOrder(autoAttempts) {
+			tries = append(tries, engine.nodes[name])
+		}
+		rule += " · auto"
+		if len(tries) == 0 {
+			via = "DIRECT"
+		}
+	}
+	node := engine.nodes[via]
 	record := Record{ID: engine.sequence, Target: target, Inbound: inbound, Via: via, Rule: rule, State: "active"}
 	engine.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 	var conn net.Conn
-	switch via {
-	case "DIRECT":
+	switch {
+	case len(tries) != 0:
+		record.Via, conn, err = engine.dialAuto(ctx, tries, target)
+	case via == "DIRECT":
 		conn, err = engine.networkDial(ctx, target)
-	case "REJECT":
+	case via == "REJECT":
 		err = outbound.ErrRejected
 	default:
-		conn, err = engine.nodes[via].Dial(ctx, target, engine.networkDial)
+		attempt, stop := context.WithTimeout(ctx, 8*time.Second)
+		conn, err = node.Dial(attempt, target, engine.networkDial)
+		stop()
 	}
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
@@ -244,7 +297,7 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		engine.remember(record)
 		return nil, err
 	}
-	tracked := &tracked{Conn: conn, engine: engine, record: record}
+	tracked := &tracked{Conn: conn, engine: engine, record: record, usage: engine.usage[record.Via]}
 	engine.live[record.ID] = tracked
 	return tracked, nil
 }
@@ -266,13 +319,26 @@ func (engine *Engine) Status() Status {
 		records = append(records, conn.snapshot())
 	}
 	records = append(records, engine.recent...)
-	return Status{engine.policy, engine.summary, records, len(engine.live)}
+	nodes := make([]NodeSummary, len(engine.summary))
+	for index, node := range engine.summary {
+		if state := engine.health[node.Name]; state != nil {
+			node.Health, node.LatencyMS = state.state, state.latency.Milliseconds()
+		}
+		if usage := engine.usage[node.Name]; usage != nil {
+			node.Sent, node.Recv = usage.sent.Load(), usage.recv.Load()
+		}
+		node.Spent = engine.spent[node.Name]
+		nodes[index] = node
+	}
+	return Status{engine.policy, nodes, records, len(engine.live), engine.autoChoice(),
+		append([]Subscription{}, engine.plans...), engine.revision}
 }
 
 type tracked struct {
 	net.Conn
 	engine     *Engine
 	record     Record
+	usage      *counter
 	sent, recv atomic.Uint64
 	once       sync.Once
 }
@@ -286,12 +352,18 @@ func (conn *tracked) snapshot() Record {
 func (conn *tracked) Read(data []byte) (int, error) {
 	count, err := conn.Conn.Read(data)
 	conn.recv.Add(uint64(count))
+	if conn.usage != nil {
+		conn.usage.recv.Add(uint64(count))
+	}
 	return count, err
 }
 
 func (conn *tracked) Write(data []byte) (int, error) {
 	count, err := conn.Conn.Write(data)
 	conn.sent.Add(uint64(count))
+	if conn.usage != nil {
+		conn.usage.sent.Add(uint64(count))
+	}
 	return count, err
 }
 
@@ -311,4 +383,53 @@ func (conn *tracked) Close() error {
 		conn.engine.remember(record)
 	})
 	return err
+}
+
+// Reload swaps in a new configuration without dropping live connections.
+// Health and traffic counters carry over for nodes that keep their name, and
+// the current policy is kept when it is still valid.
+func (engine *Engine) Reload(config Config) error {
+	engine.mu.Lock()
+	ports := make([]int, 0, len(engine.ports))
+	for port := range engine.ports {
+		ports = append(ports, int(port))
+	}
+	current := engine.policy
+	engine.mu.Unlock()
+	next, err := New(config, ports...)
+	if err != nil {
+		return err
+	}
+	if next.validVia(current.Selected) {
+		next.policy = current
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	for name, state := range engine.health {
+		if _, kept := next.health[name]; kept {
+			next.health[name] = state
+		}
+	}
+	for name, usage := range engine.usage {
+		if _, kept := next.usage[name]; kept {
+			next.usage[name] = usage
+		}
+	}
+	engine.policy, engine.nodes, engine.summary, engine.rules = next.policy, next.nodes, next.summary, next.rules
+	engine.order, engine.spent, engine.health, engine.usage = next.order, next.spent, next.health, next.usage
+	engine.plans = next.plans
+	engine.revision++
+	engine.CheckNow()
+	return nil
+}
+
+// Traffic returns cumulative bytes per outbound since the core started.
+func (engine *Engine) Traffic() map[string][2]uint64 {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	totals := make(map[string][2]uint64, len(engine.usage))
+	for name, usage := range engine.usage {
+		totals[name] = [2]uint64{usage.sent.Load(), usage.recv.Load()}
+	}
+	return totals
 }

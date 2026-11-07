@@ -34,8 +34,10 @@ type Node struct {
 	CAPEM      string `json:"caPEM,omitempty"`
 	UUID       string `json:"uuid,omitempty"`
 	TLS        bool   `json:"tls,omitempty"`
-	rootCAs    *x509.CertPool
-	v2Dial     func(net.Conn, M.Socksaddr) (net.Conn, error)
+	// Subscription names the provider this node was imported from; empty for hand-written nodes.
+	Subscription string `json:"subscription,omitempty"`
+	rootCAs      *x509.CertPool
+	v2Dial       func(net.Conn, M.Socksaddr) (net.Conn, error)
 }
 
 func (node *Node) Validate() error {

@@ -27,8 +27,42 @@ type Result struct {
 	Added   int           `json:"added"`
 	Skipped int           `json:"skipped"`
 	Notes   []string      `json:"notes"`
-	names   map[string]bool
-	seen    map[string]bool
+	// Subscription names the subscription created or refreshed by this import.
+	Subscription string `json:"subscription,omitempty"`
+	names        map[string]bool
+	seen         map[string]bool
+}
+
+func withSubscription(plans []engine.Subscription, plan engine.Subscription) []engine.Subscription {
+	merged := append([]engine.Subscription(nil), plans...)
+	for index := range merged {
+		if merged[index].Name == plan.Name {
+			merged[index] = plan
+			return merged
+		}
+	}
+	return append(merged, plan)
+}
+
+// repairReferences points the selection and rules away from nodes that a
+// subscription refresh removed, so the refreshed config stays valid.
+func (result *Result) repairReferences() {
+	present := map[string]bool{"DIRECT": true, "REJECT": true, "SELECT": true, engine.Auto: true}
+	for _, node := range result.Config.Nodes {
+		present[node.Name] = true
+	}
+	if !present[result.Config.Selected] {
+		result.Notes = append(result.Notes, fmt.Sprintf("选定出站 %s 已不在订阅中，改为自动选择", result.Config.Selected))
+		result.Config.Selected = engine.Auto
+	}
+	rules := append([]engine.Rule(nil), result.Config.Rules...)
+	for index, rule := range rules {
+		if !present[rule.Via] {
+			result.Notes = append(result.Notes, fmt.Sprintf("规则 %d 的出站 %s 已不在订阅中，改为 SELECT", index+1, rule.Via))
+			rules[index].Via = "SELECT"
+		}
+	}
+	result.Config.Rules = rules
 }
 
 type clash struct {
@@ -105,9 +139,11 @@ func readBounded(reader io.Reader) ([]byte, error) {
 	return data, nil
 }
 
-func fetch(ctx context.Context, source *url.URL) ([]byte, error) {
+// fetch downloads a subscription and returns its body and the provider's
+// Subscription-Userinfo header, which carries plan usage.
+func fetch(ctx context.Context, source *url.URL) ([]byte, string, error) {
 	if source.User != nil || source.Hostname() == "" {
-		return nil, errors.New("订阅地址无效")
+		return nil, "", errors.New("订阅地址无效")
 	}
 	client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(next *http.Request, via []*http.Request) error {
 		if len(via) >= 5 || next.URL.User != nil ||
@@ -118,18 +154,63 @@ func fetch(ctx context.Context, source *url.URL) ([]byte, error) {
 	}}
 	request, err := http.NewRequestWithContext(ctx, "GET", source.String(), nil)
 	if err != nil {
-		return nil, errors.New("订阅地址无效")
+		return nil, "", errors.New("订阅地址无效")
 	}
 	request.Header.Set("User-Agent", "clash/HopWay")
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, errors.New("无法下载订阅，请检查网络和链接")
+		return nil, "", errors.New("无法下载订阅，请检查网络和链接")
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("订阅服务器返回 HTTP %d", response.StatusCode)
+		return nil, "", fmt.Errorf("订阅服务器返回 HTTP %d", response.StatusCode)
 	}
-	return readBounded(response.Body)
+	data, err := readBounded(response.Body)
+	return data, response.Header.Get("Subscription-Userinfo"), err
+}
+
+// parseUserinfo reads "upload=1; download=2; total=3; expire=4". Unknown or
+// malformed fields are ignored, since providers format this loosely.
+func parseUserinfo(header string, plan *engine.Subscription) {
+	for _, part := range strings.Split(header, ";") {
+		key, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok {
+			continue
+		}
+		number, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil || number < 0 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "upload":
+			plan.Upload = int64(number)
+		case "download":
+			plan.Download = int64(number)
+		case "total":
+			plan.Total = int64(number)
+		case "expire":
+			plan.Expire = int64(number)
+		}
+	}
+}
+
+// subscriptionFor returns the existing subscription for source, or a new one
+// named after its host. Re-importing a known URL refreshes that subscription.
+func subscriptionFor(plans []engine.Subscription, source *url.URL) (engine.Subscription, bool) {
+	address := source.String()
+	taken := make(map[string]bool, len(plans))
+	for _, plan := range plans {
+		if plan.URL == address {
+			return plan, true
+		}
+		taken[plan.Name] = true
+	}
+	name := strings.TrimPrefix(source.Hostname(), "www.")
+	candidate := name
+	for i := 2; taken[candidate]; i++ {
+		candidate = fmt.Sprintf("%s (%d)", name, i)
+	}
+	return engine.Subscription{Name: candidate, URL: address}, false
 }
 
 func Import(ctx context.Context, input io.Reader, base engine.Config) (Result, error) {
@@ -141,13 +222,20 @@ func Import(ctx context.Context, input io.Reader, base engine.Config) (Result, e
 	if raw == "" {
 		return Result{}, errors.New("没有可导入的内容")
 	}
+	var plan *engine.Subscription
+	refresh := false
 	if !strings.ContainsAny(raw, " \r\n\t") {
 		if source, err := url.Parse(raw); err == nil && (source.Scheme == "https" || source.Scheme == "http") {
-			data, err := fetch(ctx, source)
+			data, userinfo, err := fetch(ctx, source)
 			if err != nil {
 				return Result{}, err
 			}
 			raw = strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
+			found, known := subscriptionFor(base.Subscriptions, source)
+			found.Upload, found.Download, found.Total, found.Expire = 0, 0, 0, 0
+			parseUserinfo(userinfo, &found)
+			found.Updated = time.Now().Unix()
+			plan, refresh = &found, known
 		}
 	}
 	if config, err := engine.Decode(strings.NewReader(raw)); strings.HasPrefix(raw, "{") && err == nil {
@@ -157,7 +245,21 @@ func Import(ctx context.Context, input io.Reader, base engine.Config) (Result, e
 		return Result{Config: config, Added: len(config.Nodes), Notes: []string{"已导入完整 JSON 配置"}}, nil
 	}
 
-	result := Result{Config: base, Notes: []string{}, names: map[string]bool{"DIRECT": true, "REJECT": true, "SELECT": true}, seen: make(map[string]bool)}
+	hadNodes := len(base.Nodes) != 0
+	if refresh {
+		// A refresh replaces the nodes this subscription contributed before.
+		kept := make([]outbound.Node, 0, len(base.Nodes))
+		for _, node := range base.Nodes {
+			if node.Subscription != plan.Name {
+				kept = append(kept, node)
+			}
+		}
+		base.Nodes = kept
+	}
+	result := Result{Config: base, Notes: []string{}, names: map[string]bool{"DIRECT": true, "REJECT": true, "SELECT": true, engine.Auto: true}, seen: make(map[string]bool)}
+	if plan != nil {
+		result.Subscription = plan.Name
+	}
 	for _, node := range base.Nodes {
 		result.names[node.Name] = true
 		result.seen[identity(node)] = true
@@ -198,8 +300,13 @@ func Import(ctx context.Context, input io.Reader, base engine.Config) (Result, e
 	if result.Added == 0 && result.Skipped > 0 {
 		return Result{}, fmt.Errorf("没有新增节点，跳过 %d 项。%s", result.Skipped, strings.Join(result.Notes, "；"))
 	}
-	if len(base.Nodes) == 0 && len(result.Config.Nodes) != 0 && result.Config.Selected == "DIRECT" {
-		result.Config.Selected = result.Config.Nodes[0].Name
+	if plan != nil {
+		result.Config.Subscriptions = withSubscription(base.Subscriptions, *plan)
+	}
+	result.repairReferences()
+	if !hadNodes && len(result.Config.Nodes) != 0 && result.Config.Selected == "DIRECT" {
+		// New setups route the selected outbound through AUTO for failover.
+		result.Config.Selected = engine.Auto
 	}
 	if _, err := engine.New(result.Config); err != nil {
 		return Result{}, err
@@ -242,6 +349,7 @@ func (result *Result) add(node outbound.Node, err error) {
 		return
 	}
 	node.Name = name
+	node.Subscription = result.Subscription
 	for i := 2; result.names[node.Name]; i++ {
 		node.Name = fmt.Sprintf("%s (%d)", name, i)
 	}
@@ -252,7 +360,7 @@ func (result *Result) add(node outbound.Node, err error) {
 }
 
 func identity(node outbound.Node) string {
-	node.Name = ""
+	node.Name, node.Subscription = "", ""
 	data, _ := json.Marshal(node)
 	return string(data)
 }
