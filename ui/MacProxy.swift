@@ -69,6 +69,7 @@ private struct Dashboard: View {
             Divider()
             TabView(selection: $selectedTab) {
                 overview.tabItem { Label("概览", systemImage: "gauge.with.dots.needle.33percent") }.tag("overview")
+                policies.tabItem { Label("策略", systemImage: "square.stack.3d.up") }.tag("policies")
                 connections.tabItem { Label("连接", systemImage: "arrow.left.arrow.right") }.tag("connections")
                 configuration.tabItem { Label("配置", systemImage: "slider.horizontal.3") }.tag("configuration")
             }
@@ -151,7 +152,7 @@ private struct Dashboard: View {
                 }
                 GroupBox {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("在应用里填入上方代理地址。若想在 macOS 设置系统代理，打开「系统设置 → 网络 → 当前网络 → 详细信息 → 代理」，按需填写 Web、安全 Web 或 SOCKS 代理。停用内核前关闭这些设置。")
+                        Text("打开上方「设为系统代理」，大多数应用会自动经过 HopWay；不认系统代理的应用和命令行工具，可以打开增强模式（TUN），或者在应用里手动填写上方的代理地址。")
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         HStack {
@@ -167,6 +168,91 @@ private struct Dashboard: View {
             }
             .padding(14)
         }
+    }
+
+    private var policies: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                if let status = core.status {
+                    HStack {
+                        Text("策略组").font(.headline)
+                        Spacer()
+                        Button("测速全部节点") { core.trigger("probe", done: "正在测速…") }
+                    }
+                    if let groups = status.groups, !groups.isEmpty {
+                        ForEach(groups) { group in
+                            GroupBox {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    if group.type == "select" {
+                                        Picker("使用", selection: Binding(
+                                            get: { group.selected ?? group.now },
+                                            set: { core.selectInGroup(group.name, member: $0) }
+                                        )) {
+                                            ForEach(group.members, id: \.self) { member in
+                                                Text(core.memberLabel(member)).tag(member)
+                                            }
+                                        }
+                                    } else {
+                                        Text("正在使用 " + core.memberLabel(group.now)).monospacedDigit()
+                                        Text(group.members.map { core.memberLabel($0) }.joined(separator: "，"))
+                                            .font(.caption).foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                            } label: {
+                                Text(group.name + " · " + group.typeLabel)
+                            }
+                        }
+                    } else {
+                        Text("还没有策略组。导入 Clash 订阅时会一并导入，也可以在配置里编写 groups。")
+                            .foregroundStyle(.secondary)
+                    }
+                    if let subscriptions = status.subscriptions, !subscriptions.isEmpty {
+                        HStack {
+                            Text("订阅").font(.headline)
+                            Spacer()
+                            Button("立即更新") { core.trigger("subscriptions/refresh", done: "正在更新订阅…") }
+                        }
+                        ForEach(subscriptions) { sub in
+                            sourceRow(sub.name, detail: "\(sub.nodes) 个节点", updated: sub.updated, error: sub.error)
+                        }
+                    }
+                    if let sets = status.ruleSets, !sets.isEmpty {
+                        HStack {
+                            Text("规则集").font(.headline)
+                            Spacer()
+                            Button("立即更新") { core.trigger("rulesets/refresh", done: "正在更新规则集…") }
+                        }
+                        ForEach(sets) { item in
+                            sourceRow(item.name, detail: "\(item.entries) 条", updated: item.updated, error: item.error)
+                        }
+                    }
+                } else {
+                    Text("启动内核后，可以在这里切换策略组、测速和更新订阅。")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(14)
+        }
+    }
+
+    private func sourceRow(_ name: String, detail: String, updated: Double?, error: String?) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(name)
+            Text(detail).foregroundStyle(.secondary).monospacedDigit()
+            Spacer()
+            if let error {
+                Text(error).foregroundStyle(.red).lineLimit(1).help(error)
+            } else if let updated {
+                Text(Date(timeIntervalSince1970: updated / 1000).formatted(date: .abbreviated, time: .shortened))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("尚未下载").foregroundStyle(.secondary)
+            }
+        }
+        .font(.callout)
     }
 
     private func metric(_ title: String, _ value: String?, icon: String, copyable: Bool = true) -> some View {
