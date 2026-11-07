@@ -53,7 +53,7 @@ func HandleWithUDP(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc
 
 	command, target, reply, err := readRequest(client, dialPacket != nil)
 	if err == nil && command == udpAssociate {
-		return associate(client, dialPacket)
+		return associate(client, target, dialPacket)
 	}
 	if err != nil {
 		if reply != replySuccess {

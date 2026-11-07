@@ -105,6 +105,9 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 	fd = 0 // the TUN device now owns the descriptor
 	s.stack, err = stun.NewStack("system", stun.StackOptions{
 		Context: s.ctx, Tun: s.device, TunOptions: tunOptions, UDPTimeout: 5 * time.Minute,
+		// The first packet selects the outbound. Separate destinations
+		// must not share that choice even if the app uses one UDP socket.
+		UDPMapping: stun.NATMappingAddressAndPortDependent, UDPNATMax: 1024,
 		Handler: s, Logger: logger.NOP(), InterfaceFinder: finder,
 	})
 	if err != nil {
@@ -238,15 +241,14 @@ func (s *Service) NewConnectionEx(ctx context.Context, conn net.Conn, source, de
 // DIRECT, or a node that carries UDP. If the route cannot carry UDP the
 // flow is dropped, and QUIC applications fall back to TCP.
 func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	if destination.IsIP() && s.fake.Contains(destination.Addr) {
-		if _, ok := s.fake.Lookup(destination.Addr); !ok {
-			conn.Close()
-			done(onClose, errors.New("unknown fake address"))
-			return
-		}
+	target := s.target(destination)
+	if destination.IsIP() && s.fake.Contains(destination.Addr) && target == destination.String() {
+		conn.Close()
+		done(onClose, errors.New("unknown fake address"))
+		return
 	}
 	ctx = peer.WithAddrs(ctx, peer.Addrs{Client: source.AddrPort(), Server: destination.AddrPort(), Local: true})
-	remote, err := s.dialPacket(ctx, "TUN", s.target(destination))
+	remote, err := s.dialPacket(ctx, "TUN", target)
 	if err != nil {
 		conn.Close()
 		done(onClose, err)
@@ -260,9 +262,7 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 			done(onClose, err)
 		})
 	}
-	// What the app sent to (often a fake IP), keyed by what was written.
-	var mu sync.Mutex
-	replyTo := map[string]M.Socksaddr{}
+	written := M.ParseSocksaddr(target)
 	go func() {
 		buffer := make([]byte, 65535)
 		for {
@@ -276,14 +276,11 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 			if socks, ok := from.(M.Socksaddr); ok {
 				key = socks
 			}
-			mu.Lock()
-			original, ok := replyTo[key.String()]
-			mu.Unlock()
-			if !ok {
-				original = key
-				if !original.IsIP() { // a reply naming a host the app never asked for
-					continue
-				}
+			original := key
+			if key == written {
+				original = destination // restore the original address, often a fake IP
+			} else if !original.IsIP() {
+				continue
 			}
 			if err := conn.WritePacket(buf.As(append([]byte(nil), buffer[:n]...)), original); err != nil {
 				finish(err)
@@ -299,15 +296,9 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 			finish(nil)
 			return
 		}
-		written := M.ParseSocksaddr(s.target(to))
-		mu.Lock()
-		if len(replyTo) > 1024 {
-			replyTo = map[string]M.Socksaddr{}
+		if to == destination {
+			_, _ = remote.WriteTo(packet.Bytes(), written)
 		}
-		replyTo[written.String()] = to
-		mu.Unlock()
-		_, err = remote.WriteTo(packet.Bytes(), written)
 		packet.Release()
-		_ = err // one undeliverable datagram does not end the flow
 	}
 }
