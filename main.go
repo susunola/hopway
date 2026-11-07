@@ -14,12 +14,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"mac-proxy/internal/app"
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
 	"mac-proxy/internal/httpproxy"
 	"mac-proxy/internal/importer"
+	"mac-proxy/internal/profile"
 	"mac-proxy/internal/socks5"
 )
 
@@ -38,13 +42,9 @@ func main() {
 	importInput := flag.Bool("import", false, "read a subscription URL or profile from stdin and print converted JSON")
 	flag.Parse()
 	if *importInput {
-		base, err := loadConfig(*path)
+		result, err := runImport(*path)
 		if err == nil {
-			var result importer.Result
-			result, err = importer.Import(context.Background(), os.Stdin, base, backend.Default())
-			if err == nil {
-				err = json.NewEncoder(os.Stdout).Encode(result)
-			}
+			err = json.NewEncoder(os.Stdout).Encode(result)
 		}
 		if err != nil {
 			log.SetFlags(0)
@@ -61,36 +61,79 @@ func main() {
 	}
 }
 
+// runImport converts pasted input. A subscription URL becomes a subscription
+// entry (its nodes are cached and refreshed automatically); anything else is
+// merged into the configuration as before.
+func runImport(path string) (importer.Result, error) {
+	base, err := loadConfig(path)
+	if errors.Is(err, os.ErrNotExist) {
+		base, err = engine.Default(), nil
+	}
+	if err != nil {
+		return importer.Result{}, err
+	}
+	data, err := io.ReadAll(io.LimitReader(os.Stdin, importer.MaxSize+1))
+	if err != nil {
+		return importer.Result{}, err
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
+	impl := backend.Default()
+	if !strings.ContainsAny(raw, " \r\n\t") && (strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "http://")) {
+		return profile.Subscribe(context.Background(), base, raw, dataDir(path), impl)
+	}
+	result, err := importer.Import(context.Background(), strings.NewReader(raw), base, impl)
+	result.Config.DataDir = ""
+	return result, err
+}
+
 func listen(port int) (*net.TCPListener, error) {
 	return net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
 }
 
 func loadConfig(path string) (engine.Config, error) {
-	if path == "" {
-		return engine.Default(), nil
+	config := engine.Default()
+	if path != "" {
+		file, err := os.Open(path)
+		if err != nil {
+			return engine.Config{}, err
+		}
+		defer file.Close()
+		if config, err = engine.Decode(file); err != nil {
+			return engine.Config{}, err
+		}
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return engine.Config{}, err
+	config.DataDir = dataDir(path)
+	return config, nil
+}
+
+// dataDir keeps caches next to the configuration file.
+func dataDir(configPath string) string {
+	if configPath != "" {
+		return filepath.Join(filepath.Dir(configPath), "cache")
 	}
-	defer file.Close()
-	return engine.Decode(file)
+	if dir, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(dir, "HopWay")
+	}
+	return ""
 }
 
 func run(path string, port int, check, managed bool) error {
-	config, err := loadConfig(path)
+	impl := backend.Default()
+	validate := func(config engine.Config) error { return engine.Validate(config, impl) }
+	if check {
+		loaded, err := profile.Check(path, dataDir(path), validate)
+		for _, warning := range loaded.Warnings {
+			log.Printf("warning: %s", warning)
+		}
+		return err
+	}
+	supervisor, err := app.Open(path, dataDir(path), impl)
 	if err != nil {
 		return err
 	}
+	config := supervisor.Config()
 	if port != -1 {
 		config.SOCKSPort = port
-	}
-	impl := backend.Default()
-	if err := engine.Validate(config, impl); err != nil {
-		return err
-	}
-	if check {
-		return nil
 	}
 
 	socks, err := listen(config.SOCKSPort)
@@ -121,15 +164,14 @@ func run(path string, port int, check, managed bool) error {
 		info.Control = "http://" + control.Addr().String()
 		info.Token = hex.EncodeToString(token[:])
 	}
-	core, err := engine.New(config, impl, ports...)
-	if err != nil {
+	if err := supervisor.Start(ports...); err != nil {
 		return err
 	}
-	defer core.Close()
+	defer supervisor.Close()
 	serverErrors := make(chan error, 3)
-	go func() { serverErrors <- serveSOCKS(socks, core) }()
+	go func() { serverErrors <- serveSOCKS(socks, supervisor.Dial) }()
 	httpServer := &http.Server{
-		Handler: httpproxy.Handler(core.Dial), ReadHeaderTimeout: 10 * time.Second,
+		Handler: httpproxy.Handler(supervisor.Dial), ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout: 30 * time.Second, MaxHeaderBytes: 64 << 10,
 	}
 	go func() { serverErrors <- httpServer.Serve(httpProxy) }()
@@ -137,8 +179,8 @@ func run(path string, port int, check, managed bool) error {
 	log.Printf("HTTP proxy listening on %s", info.HTTP)
 	if managed {
 		server := &http.Server{
-			Handler: controlHandler(core, info.Token), ReadTimeout: 5 * time.Second,
-			WriteTimeout: 5 * time.Second, IdleTimeout: 10 * time.Second, MaxHeaderBytes: 8 << 10,
+			Handler: controlHandler(supervisor, info.Token), ReadTimeout: 5 * time.Second,
+			WriteTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second, MaxHeaderBytes: 8 << 10,
 		}
 		go func() { serverErrors <- server.Serve(control) }()
 		if err := json.NewEncoder(os.Stdout).Encode(info); err != nil {
@@ -152,7 +194,7 @@ func run(path string, port int, check, managed bool) error {
 	return <-serverErrors
 }
 
-func serveSOCKS(listener *net.TCPListener, core *engine.Engine) error {
+func serveSOCKS(listener *net.TCPListener, dial func(context.Context, string, string) (net.Conn, error)) error {
 	for {
 		client, err := listener.AcceptTCP()
 		if err != nil {
@@ -160,16 +202,17 @@ func serveSOCKS(listener *net.TCPListener, core *engine.Engine) error {
 		}
 		go func() {
 			defer client.Close()
-			socks5.Handle(client, core.Dial)
+			socks5.Handle(client, dial)
 		}()
 	}
 }
 
-func controlHandler(core *engine.Engine, token string) http.Handler {
+func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
+	core := supervisor.Engine // the engine changes on reload; always use the current one
 	router := http.NewServeMux()
 	router.HandleFunc("GET /status", func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(writer).Encode(core.Status())
+		json.NewEncoder(writer).Encode(supervisor.Status())
 	})
 	router.HandleFunc("PUT /policy", func(writer http.ResponseWriter, request *http.Request) {
 		var policy engine.Policy
@@ -180,7 +223,7 @@ func controlHandler(core *engine.Engine, token string) http.Handler {
 			err = errors.New("expected one policy object")
 		}
 		if err == nil {
-			err = core.SetPolicy(policy)
+			err = core().SetPolicy(policy)
 		}
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
@@ -196,7 +239,7 @@ func controlHandler(core *engine.Engine, token string) http.Handler {
 		decoder.DisallowUnknownFields()
 		err := decoder.Decode(&body)
 		if err == nil {
-			err = core.SelectInGroup(request.PathValue("name"), body.Selected)
+			err = core().SelectInGroup(request.PathValue("name"), body.Selected)
 		}
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
@@ -207,8 +250,29 @@ func controlHandler(core *engine.Engine, token string) http.Handler {
 	// Probing takes seconds, longer than the control API's write timeout, so
 	// it runs in the background and results appear in /status.
 	router.HandleFunc("POST /probe", func(writer http.ResponseWriter, request *http.Request) {
-		go core.Probe(context.Background(), nil)
+		go core().Probe(context.Background(), nil)
 		writer.WriteHeader(http.StatusAccepted)
+	})
+	router.HandleFunc("POST /rulesets/refresh", func(writer http.ResponseWriter, request *http.Request) {
+		go core().RefreshRuleSets(context.Background(), true)
+		writer.WriteHeader(http.StatusAccepted)
+	})
+	router.HandleFunc("POST /subscriptions/refresh", func(writer http.ResponseWriter, request *http.Request) {
+		go supervisor.RefreshSubscriptions(context.Background(), true)
+		writer.WriteHeader(http.StatusAccepted)
+	})
+	// Reload applies a saved configuration without restarting: open
+	// connections stay on the previous engine until they finish.
+	router.HandleFunc("POST /reload", func(writer http.ResponseWriter, request *http.Request) {
+		if err := supervisor.Reload(); err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, app.ErrPortsChanged) {
+				status = http.StatusConflict
+			}
+			http.Error(writer, err.Error(), status)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
 	})
 	authorization := []byte("Bearer " + token)
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

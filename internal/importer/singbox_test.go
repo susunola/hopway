@@ -77,11 +77,63 @@ rules:
 	if len(config.Groups) != 2 || config.Selected != "Proxy" || config.Health == nil || config.Health.Interval != 600 {
 		t.Fatalf("groups %+v health %+v selected %s", config.Groups, config.Health, config.Selected)
 	}
-	if len(config.Rules) != 5 || !config.Rules[2].NoResolve || config.Rules[3].Type != engine.RuleProcessName ||
-		config.Rules[4].Type != engine.RuleMatch || config.Rules[4].Via != "Proxy" {
+	if len(config.Rules) != 6 || !config.Rules[2].NoResolve || config.Rules[3].Type != engine.RuleRuleSet ||
+		config.Rules[4].Type != engine.RuleProcessName || config.Rules[5].Type != engine.RuleMatch || config.Rules[5].Via != "Proxy" {
 		t.Fatalf("rules %+v", config.Rules)
 	}
 	core, err := engine.New(config, backend.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.Close()
+}
+
+func TestClashRuleProvidersAndGeo(t *testing.T) {
+	const profile = `
+proxies:
+  - {name: HK, type: trojan, server: hk.test, port: 443, password: x}
+proxy-groups:
+  - {name: Proxy, type: select, proxies: [HK, DIRECT]}
+rule-providers:
+  reject: {type: http, behavior: domain, url: "https://example.test/reject.txt", interval: 86400}
+  apple: {type: http, behavior: classical, format: yaml, url: "https://example.test/apple.yaml"}
+  binary: {type: http, behavior: domain, format: mrs, url: "https://example.test/x.mrs"}
+  local: {type: file, behavior: domain, path: ./x.yaml}
+rules:
+  - RULE-SET,reject,REJECT
+  - RULE-SET,apple,DIRECT
+  - RULE-SET,binary,REJECT
+  - RULE-SET,local,REJECT
+  - GEOSITE,google,Proxy
+  - GEOIP,LAN,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - GEOIP,cn,DIRECT
+  - MATCH,Proxy
+`
+	result, err := Import(context.Background(), strings.NewReader(profile), engine.Default(), backend.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sets := map[string]engine.RuleSet{}
+	for _, set := range result.Config.RuleSets {
+		sets[set.Name] = set
+	}
+	if len(sets) != 4 || sets["reject"].Format != "text" || sets["apple"].Format != "yaml" ||
+		sets["geoip-cn"].URL != "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" ||
+		sets["geosite-google"].URL == "" {
+		t.Fatalf("rule sets %+v", result.Config.RuleSets)
+	}
+	lan := 0
+	for _, rule := range result.Config.Rules {
+		if rule.Type == engine.RuleIPCIDR && rule.NoResolve {
+			lan++
+		}
+	}
+	// 4 rule-set rules + geosite + 12 LAN ranges + 2 geoip + match; mrs and file providers skipped.
+	if lan != 12 || len(result.Config.Rules) != 2+1+12+2+1 {
+		t.Fatalf("rules %+v", result.Config.Rules)
+	}
+	core, err := engine.New(result.Config, backend.Default())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -28,6 +28,6 @@
 下一步：
 
 1. ~~不用 TUN 也能识别发起连接的进程~~：已完成。支持 `process-name`、`process-path` 规则，连接表新增「应用」列。
-2. 规则集（远程 `RULE-SET`、GeoSite/GeoIP 的 `.srs` 文件）和订阅定时刷新，刷新失败时保留上一次可用的配置。
+2. ~~规则集与订阅刷新~~：已完成。支持 `.srs`、Clash yaml/text 规则集，导入 Clash 的 GEOIP、GEOSITE 和 RULE-SET，订阅后台刷新并热加载，配置损坏时回退到上一次可用的配置。
 3. 可恢复的系统代理开关，覆盖睡眠唤醒、网络切换（切换后清空 DNS 缓存、重新测速）以及内核崩溃后的还原。
 4. 用 Network Extension 做 TUN，处理 UDP、DNS 和 IPv6。

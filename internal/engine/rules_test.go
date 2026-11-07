@@ -19,7 +19,7 @@ func TestRuleSemantics(t *testing.T) {
 		{Type: RuleIPCIDR, Value: "2001:db8::/32", Via: "F"},
 		{Type: RuleMatch, Via: "G"},
 	}
-	m, err := newMatcher(rules, func(string) bool { return true })
+	m, err := newMatcher(rules, func(string) bool { return true }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestRuleValidation(t *testing.T) {
 		{{Type: RuleDomain, Value: "*.wild", Via: "X"}},
 		{{Type: "geoip", Value: "CN", Via: "X"}},
 	} {
-		if _, err := newMatcher(rules, func(string) bool { return true }); err == nil {
+		if _, err := newMatcher(rules, func(string) bool { return true }, nil); err == nil {
 			t.Errorf("accepted invalid rules %+v", rules)
 		}
 	}
@@ -92,7 +92,7 @@ func bigRuleSet(n int) []Rule {
 }
 
 func BenchmarkMatch100k(b *testing.B) {
-	m, err := newMatcher(bigRuleSet(100_000), func(string) bool { return true })
+	m, err := newMatcher(bigRuleSet(100_000), func(string) bool { return true }, nil)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestProcessRules(t *testing.T) {
 		{Type: RuleProcessPath, Value: "/usr/bin/curl", Via: "D"},
 		{Type: RuleMatch, Via: "E"},
 	}
-	m, err := newMatcher(rules, func(string) bool { return true })
+	m, err := newMatcher(rules, func(string) bool { return true }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

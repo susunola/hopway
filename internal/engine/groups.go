@@ -326,3 +326,36 @@ func (engine *Engine) SelectInGroup(name, member string) error {
 	}
 	return errors.New("not a member of this group")
 }
+
+// Runtime is the state a user changes while HopWay runs, carried across reloads.
+type Runtime struct {
+	Policy     Policy
+	Selections map[string]string // select group -> member
+}
+
+func (engine *Engine) Runtime() Runtime {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	runtime := Runtime{Policy: engine.policy, Selections: map[string]string{}}
+	for name, g := range engine.groups {
+		if g.Type == GroupSelect {
+			runtime.Selections[name] = g.Selected
+		}
+	}
+	return runtime
+}
+
+// Restore applies what still makes sense of a previous engine's runtime state.
+func (engine *Engine) Restore(runtime Runtime) {
+	for name, member := range runtime.Selections {
+		engine.SelectInGroup(name, member)
+	}
+	engine.SetPolicy(runtime.Policy)
+}
+
+// Active reports open connections.
+func (engine *Engine) Active() int {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	return len(engine.live)
+}
