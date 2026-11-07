@@ -36,4 +36,4 @@
 
 5. ~~经代理节点转发 UDP~~：已完成。TUN 和 SOCKS5 UDP ASSOCIATE 两个入口都支持，8 种协议都做过互通测试。
 6. ~~IPv6~~：已完成（可选开关 `tun.ipv6`）。IPv6 fake-ip 地址池和 AAAA 应答已经测过；网卡和路由这一层还需要在 Mac 上验证（测试环境的内核没有 IPv6）。
-7. 常驻的特权服务（SMAppService），免去每次开启 TUN 都要输入密码。
+7. ~~免密 TUN 服务~~：已完成。launchd 守护进程，uid 由内核凭证核验，每次交出网卡后退出并由 launchd 重启。

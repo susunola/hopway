@@ -87,3 +87,27 @@ func helperSocket() (string, *net.UnixListener, func(), error) {
 	os.Chmod(dir, 0o711)
 	return path, listener, func() { listener.Close(); os.RemoveAll(dir) }, nil
 }
+
+func unixRights(fd int) []byte { return unix.UnixRights(fd) }
+func closeFD(fd int)           { unix.Close(fd) }
+
+// receiveRights reads one message that may carry a descriptor.
+func receiveRights(conn *net.UnixConn) (int, []byte, error) {
+	data := make([]byte, 4096)
+	oob := make([]byte, unix.CmsgSpace(4))
+	n, oobn, _, _, err := conn.ReadMsgUnix(data, oob)
+	if err != nil {
+		return 0, nil, err
+	}
+	fd := 0
+	if messages, err := unix.ParseSocketControlMessage(oob[:oobn]); err == nil && len(messages) == 1 {
+		if fds, err := unix.ParseUnixRights(&messages[0]); err == nil && len(fds) == 1 {
+			fd = fds[0]
+		}
+	}
+	return fd, data[:n], nil
+}
+
+func dialRaw(path string) (*net.UnixConn, error) {
+	return net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+}

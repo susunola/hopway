@@ -130,8 +130,13 @@ private struct Dashboard: View {
                                 ))
                                 Text(tun.error ?? (tun.enabled
                                     ? "已接管全部流量（\(tun.device ?? "utun")）。不认系统代理的应用、命令行工具和 DNS 也会经过 HopWay。"
-                                    : "接管所有应用的流量，包括不认系统代理的应用。开启时需要输入一次管理员密码。"))
+                                    : (tun.service == true ? "接管所有应用的流量，包括不认系统代理的应用。" : "接管所有应用的流量，包括不认系统代理的应用。开启时需要输入一次管理员密码。")))
                                     .font(.caption).foregroundStyle(tun.error == nil ? Color.secondary : .red)
+                                Button(tun.service == true ? "卸载免密服务" : "安装免密服务（开启 TUN 不再询问密码）") {
+                                    core.setTUNService(tun.service != true)
+                                }
+                                .buttonStyle(.link)
+                                .font(.caption)
                             }
                         } else {
                             Text("启动内核后，可在这里切换路由模式和出站。")
