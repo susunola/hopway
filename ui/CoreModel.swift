@@ -145,6 +145,7 @@ struct ProxyStatus: Decodable {
     let nodes: [Node]
     let connections: [Connection]
     let active: Int
+    let sessionTraffic: TrafficHistory.Count?
 }
 
 struct CoreError: LocalizedError {
@@ -170,6 +171,7 @@ final class CoreModel: ObservableObject {
     @Published private(set) var saving = false
     @Published private(set) var updatingPolicy = false
     @Published private(set) var trafficHistory: TrafficHistory?
+    @Published private(set) var liveTraffic: TrafficRate?
     @Published private(set) var subscriptions: [SubscriptionSummary] = []
     @Published private(set) var configuredNodes: [ProxyStatus.Node] = []
     @Published private(set) var importCount = 0
@@ -182,6 +184,7 @@ final class CoreModel: ObservableObject {
     @Published private(set) var saved = ""
 
     private var trafficModifiedAt: Date?
+    private var lastTrafficSample: (totals: TrafficHistory.Count, time: ContinuousClock.Instant)?
     private var quotaRefreshTask: Task<Void, Never>?
     private var probeFailures: [String: Int] = [:]
     private var lastRecoveryAttempt: Date?
@@ -280,10 +283,7 @@ final class CoreModel: ObservableObject {
         phase = .starting
         let child = Process()
         child.executableURL = executable
-        child.arguments = ["-managed"]
-        if FileManager.default.fileExists(atPath: configURL.path) {
-            child.arguments?.append(contentsOf: ["-config", configURL.path])
-        }
+        child.arguments = ["-managed", "-config", configURL.path]
         let inputPipe = Pipe()
         let output = Pipe()
         child.standardInput = inputPipe
@@ -360,6 +360,7 @@ final class CoreModel: ObservableObject {
         verification = nil
         verifying = false
         status = nil
+        updateTrafficRate(nil)
         updatingPolicy = false
         phase = .stopped
     }
@@ -448,6 +449,7 @@ final class CoreModel: ObservableObject {
                 verification = nil
             }
             status = snapshot
+            updateTrafficRate(snapshot.sessionTraffic)
             if before != snapshot.subscriptions?.map(\.updated) { reloadConfiguredNodes() }
             reloadTraffic()
             if message == nil, let warnings = status?.warnings, !warnings.isEmpty {
@@ -459,6 +461,7 @@ final class CoreModel: ObservableObject {
             }
         } catch {
             guard !Task.isCancelled, endpoint?.token == info.token else { return }
+            updateTrafficRate(nil)
             message = "读取内核状态失败 · " + error.localizedDescription
         }
     }
@@ -639,6 +642,32 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    private func updateTrafficRate(_ totals: TrafficHistory.Count?) {
+        guard let totals else {
+            lastTrafficSample = nil
+            if liveTraffic != nil { liveTraffic = nil }
+            return
+        }
+        let now = ContinuousClock.now
+        guard let last = lastTrafficSample else {
+            lastTrafficSample = (totals, now)
+            return
+        }
+        let duration = last.time.duration(to: now)
+        // Status refreshes also happen after user actions. Use a long enough
+        // interval to avoid spikes when two responses arrive back to back.
+        guard duration >= .milliseconds(500),
+              totals.upload >= last.totals.upload,
+              totals.download >= last.totals.download else { return }
+        let elapsed = duration.components
+        let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+        liveTraffic = TrafficRate(
+            upload: Double(totals.upload - last.totals.upload) / seconds,
+            download: Double(totals.download - last.totals.download) / seconds
+        )
+        lastTrafficSample = (totals, now)
+    }
+
     private func reloadTraffic() {
         guard let modified = try? trafficURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
               modified != trafficModifiedAt,
@@ -778,7 +807,7 @@ final class CoreModel: ObservableObject {
         }
     }
 
-    func refreshUsage() { refreshSubscriptions(checkNodes: false) }
+    func refreshAllSubscriptions() { refreshSubscriptions(checkNodes: false) }
     func refreshNodes() { refreshSubscriptions(checkNodes: true) }
 
     func refreshSubscription(_ id: String) { refreshSubscriptions(checkNodes: false, id: id) }

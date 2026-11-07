@@ -33,8 +33,12 @@ def dial(address):
     return socket.create_connection((host, int(port)), timeout=3)
 
 
+ECHO_REPETITIONS = 160
+ECHO_SIZE = 256 * ECHO_REPETITIONS
+
+
 def send_echo(conn, salt=0):
-    payload = bytes((n + salt) % 256 for n in range(256)) * 160
+    payload = bytes((n + salt) % 256 for n in range(256)) * ECHO_REPETITIONS
     conn.sendall(payload)
     with conn.makefile("rb") as reader:
         assert reader.read(len(payload)) == payload
@@ -62,15 +66,28 @@ def socks_handshake(conn, port):
         assert len(reader.read(length)) == length
 
 
-def reload(ready):
+def control_request(ready, method, path):
     url = urlsplit(ready["control"])
     connection = http.client.HTTPConnection(url.hostname, url.port, timeout=3)
     try:
-        connection.request("POST", "/reload", headers={"Authorization": "Bearer " + ready["token"]})
+        connection.request(method, path, headers={"Authorization": "Bearer " + ready["token"]})
         response = connection.getresponse()
-        assert response.status == 204, (response.status, response.read())
+        return response.status, response.read()
     finally:
         connection.close()
+
+
+def reload(ready):
+    status, body = control_request(ready, "POST", "/reload")
+    assert status == 204, (status, body)
+
+
+def check_session_traffic(ready, transfers):
+    status, body = control_request(ready, "GET", "/status")
+    assert status == 200, (status, body)
+    measured = json.loads(body)["sessionTraffic"]
+    count = transfers * ECHO_SIZE
+    assert measured == {"upload": count, "download": count}, measured
 
 
 def parallel_tunnels(ready, port):
@@ -99,6 +116,8 @@ def run(binary, path, port, cycle):
                 if not selector.select(5):
                     raise RuntimeError("core did not report readiness")
             ready = json.loads(process.stdout.readline())
+            if cycle < 2:
+                check_session_traffic(ready, 0)
             if cycle == 0:
                 contender = subprocess.run([binary, "-managed", "-config", str(path)],
                                            input=b"", capture_output=True, timeout=4)
@@ -125,6 +144,8 @@ def run(binary, path, port, cycle):
                 with dial(ready["socks"]) as socks_conn:
                     socks_handshake(socks_conn, port)
                     send_echo(socks_conn)
+                    if cycle < 2:
+                        check_session_traffic(ready, 19 if cycle == 0 else 3)
                     started = time.monotonic()
                     if cycle % 2:
                         process.stdin.close()
@@ -182,7 +203,7 @@ def main():
             server.shutdown()
     print(f"{args.cycles}/{args.cycles} cycles passed: HTTP CONNECT, SOCKS5, reload with open tunnels, "
           f"SIGTERM/stdin EOF, listener and tunnel closure. "
-          f"Port conflict, profile exclusion, and 16 parallel tunnels passed. Max shutdown: {max(durations) * 1000:.1f} ms.")
+          f"Port conflict, profile exclusion, 16 parallel tunnels, and session traffic accounting passed. Max shutdown: {max(durations) * 1000:.1f} ms.")
 
 
 if __name__ == "__main__":

@@ -46,12 +46,13 @@ private struct StatusMenu: View {
 }
 
 private enum DashboardPage: String, CaseIterable {
-    case overview, nodes, policies, usage, connections, settings
+    case overview, nodes, policies, subscriptions, usage, connections, settings
 
     var title: String {
         switch self {
         case .overview: "概览"
         case .nodes: "节点"
+        case .subscriptions: "订阅"
         case .usage: "用量"
         case .policies: "策略"
         case .connections: "连接"
@@ -63,6 +64,7 @@ private enum DashboardPage: String, CaseIterable {
         switch self {
         case .overview: "house"
         case .nodes: "point.3.connected.trianglepath.dotted"
+        case .subscriptions: "tray.full"
         case .usage: "chart.bar.xaxis"
         case .policies: "point.3.connected.trianglepath.dotted"
         case .connections: "arrow.left.arrow.right"
@@ -98,8 +100,10 @@ private struct Dashboard: View {
                         NodeDashboard(core: core) { showsLinkImport = true }
                     case .policies:
                         ScrollView { VStack(alignment: .leading, spacing: 16) { routeTester; policies } }
+                    case .subscriptions:
+                        SubscriptionDashboard(core: core) { showsLinkImport = true }
                     case .usage:
-                        UsageDashboard(core: core) { showsLinkImport = true }
+                        TrafficDashboard(core: core)
                     case .connections:
                         connections
                     case .settings:
@@ -123,7 +127,9 @@ private struct Dashboard: View {
         }
         .tint(HopAppearance.accent)
         .frame(minWidth: 880, minHeight: 525)
-        .onChange(of: core.importCount) { _, _ in page = .nodes }
+        .onChange(of: core.importCount) { _, _ in
+            if page != .subscriptions { page = .nodes }
+        }
         .sheet(isPresented: $showsLinkImport, onDismiss: { importLink = ""; preview = nil; importError = nil }) {
             VStack(alignment: .leading, spacing: 12) {
                 Text("导入链接").font(.headline)

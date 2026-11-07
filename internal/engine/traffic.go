@@ -27,6 +27,7 @@ type TrafficLedger struct {
 	path    string
 	lock    *os.File
 	history trafficHistory
+	session trafficCount
 	dirty   bool
 	closed  bool
 }
@@ -78,6 +79,8 @@ func (ledger *TrafficLedger) add(now time.Time, node string, upload, download ui
 	if ledger.closed {
 		return
 	}
+	ledger.session.Upload += upload
+	ledger.session.Download += download
 	nodes := ledger.history.Days[day]
 	if nodes == nil {
 		nodes = make(map[string]trafficCount)
@@ -88,6 +91,18 @@ func (ledger *TrafficLedger) add(now time.Time, node string, upload, download ui
 	count.Download += download
 	nodes[node] = count
 	ledger.dirty = true
+}
+
+// sessionTotals excludes persisted traffic. The same ledger stays attached
+// to current and retiring engines across configuration reloads.
+func (ledger *TrafficLedger) sessionTotals() *trafficCount {
+	if ledger == nil {
+		return nil
+	}
+	ledger.mu.Lock()
+	totals := ledger.session
+	ledger.mu.Unlock()
+	return &totals
 }
 
 func (ledger *TrafficLedger) Flush() error {

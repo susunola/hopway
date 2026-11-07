@@ -18,6 +18,60 @@ struct TrafficHistory: Decodable {
     let days: [String: [String: Count]]
 }
 
+struct TrafficRate: Equatable {
+    let upload: Double
+    let download: Double
+
+    static func label(_ bytesPerSecond: Double) -> String {
+        trafficBytes(UInt64(min(bytesPerSecond.rounded(), Double(Int64.max)))) + "/s"
+    }
+}
+
+struct TrafficDashboard: View {
+    @ObservedObject var core: CoreModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HopPageHeading(title: "用量", detail: "监测本机经过 HopWay 的流量")
+                liveMonitor.hopPanel()
+                LocalTrafficView(history: core.trafficHistory, subscriptions: core.subscriptions)
+                    .hopPanel()
+            }
+            .padding(.bottom, 12)
+        }
+    }
+
+    private var liveMonitor: some View {
+        let running = core.phase == .running
+        let rate = running ? core.liveTraffic : nil
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("实时流量", systemImage: "waveform.path").font(.headline)
+                Spacer()
+                Text(rate != nil ? "监测中" : running ? "等待采样" : core.phase.rawValue)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(rate != nil ? HopAppearance.accent : Color.secondary)
+            }
+            HStack(spacing: 28) {
+                liveMetric("下载速率", rate?.download)
+                liveMetric("上传速率", rate?.upload)
+                Spacer()
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func liveMetric(_ title: String, _ rate: Double?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(rate.map(TrafficRate.label) ?? "—")
+                .font(.system(.title2, design: .rounded).weight(.semibold).monospacedDigit())
+        }
+        .frame(maxWidth: 148, alignment: .leading)
+    }
+}
+
 struct LocalTrafficView: View {
     let history: TrafficHistory?
     let subscriptions: [SubscriptionSummary]
@@ -102,8 +156,7 @@ struct LocalTrafficView: View {
         let data = report
         VStack(alignment: .leading, spacing: 15) {
             HStack {
-                Text("本机统计").font(.headline)
-                Text("经过 HopWay 的流量").font(.callout).foregroundStyle(.secondary)
+                Text("历史用量").font(.headline)
                 Spacer()
                 Picker("统计范围", selection: $period) {
                     ForEach(Period.allCases, id: \.self) { Text($0.rawValue).tag($0) }
@@ -123,7 +176,7 @@ struct LocalTrafficView: View {
                 breakdown(data.nodes, total: data.total.total)
             } else {
                 Label(
-                    history == nil ? "新版启动代理后开始记录本机流量。" : "这段时间还没有经过 HopWay 的流量。",
+                    history == nil ? "启动代理后开始记录本机流量。" : "这段时间还没有经过 HopWay 的流量。",
                     systemImage: "chart.bar"
                 )
                 .foregroundStyle(.secondary)

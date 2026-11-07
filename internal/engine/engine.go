@@ -140,14 +140,15 @@ type Record struct {
 }
 
 type Status struct {
-	Auto        *AutoStatus     `json:"auto,omitempty"`
-	Backend     string          `json:"backend"`
-	Policy      Policy          `json:"policy"`
-	Nodes       []NodeSummary   `json:"nodes"`
-	Groups      []GroupStatus   `json:"groups,omitempty"`
-	RuleSets    []RuleSetStatus `json:"ruleSets,omitempty"`
-	Connections []Record        `json:"connections"`
-	Active      int             `json:"active"`
+	Auto           *AutoStatus     `json:"auto,omitempty"`
+	Backend        string          `json:"backend"`
+	Policy         Policy          `json:"policy"`
+	Nodes          []NodeSummary   `json:"nodes"`
+	Groups         []GroupStatus   `json:"groups,omitempty"`
+	RuleSets       []RuleSetStatus `json:"ruleSets,omitempty"`
+	Connections    []Record        `json:"connections"`
+	Active         int             `json:"active"`
+	SessionTraffic *trafficCount   `json:"sessionTraffic,omitempty"`
 }
 
 type Engine struct {
@@ -796,7 +797,7 @@ func (engine *Engine) Status() Status {
 	sort.Slice(records, func(i, j int) bool { return records[i].ID < records[j].ID })
 	records = append(records, engine.recent...)
 	status := Status{Backend: engine.backend, Policy: engine.policy, Connections: records, Active: len(engine.live) + len(engine.livePackets),
-		RuleSets: engine.ruleSetStatus()}
+		RuleSets: engine.ruleSetStatus(), SessionTraffic: engine.traffic.sessionTotals()}
 	if state := engine.auto; state != nil {
 		status.Auto = &AutoStatus{Node: state.activeNode, Probing: state.probing}
 		if state.activeGroup >= 0 {

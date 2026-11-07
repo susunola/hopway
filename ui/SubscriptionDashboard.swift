@@ -62,7 +62,7 @@ struct SubscriptionSummary: Decodable, Identifiable {
     }
 }
 
-struct UsageDashboard: View {
+struct SubscriptionDashboard: View {
     @ObservedObject var core: CoreModel
     let importLink: () -> Void
     @State private var editing: SubscriptionSummary?
@@ -73,17 +73,11 @@ struct UsageDashboard: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("套餐").font(.system(size: 27, weight: .semibold))
-                            .accessibilityAddTraits(.isHeader)
-                        Text("服务商订阅额度 · App 打开时每 6 小时自动刷新")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
+                    HopPageHeading(title: "订阅", detail: "管理服务商套餐、流量额度和到期时间")
                     Spacer()
                     Button("导入订阅…", action: importLink).disabled(core.saving)
-                    Button(action: core.refreshUsage) {
-                        Label("刷新", systemImage: "arrow.clockwise")
+                    Button(action: core.refreshAllSubscriptions) {
+                        Label("刷新全部", systemImage: "arrow.clockwise")
                     }
                     .disabled(core.saving || !core.subscriptions.contains { !$0.isPaused })
                 }
@@ -93,10 +87,9 @@ struct UsageDashboard: View {
                 } else {
                     ForEach(core.subscriptions) { subscription in
                         plan(subscription)
-                        Divider()
+                            .hopPanel()
                     }
                 }
-                LocalTrafficView(history: core.trafficHistory, subscriptions: core.subscriptions)
             }
             .padding(.bottom, 12)
         }
