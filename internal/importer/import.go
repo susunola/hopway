@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"go.yaml.in/yaml/v3"
 
@@ -26,15 +27,18 @@ import (
 const MaxSize = 1 << 20
 
 type Result struct {
-	Config  engine.Config `json:"config"`
-	Added   int           `json:"added"`
-	Skipped int           `json:"skipped"`
-	Notes   []string      `json:"notes"`
-	Source  string        `json:"source,omitempty"` // subscription URL the content came from
-	names   map[string]bool
-	seen    map[string]bool
-	renamed map[string]string // original name -> final node name
-	check   func(outbound.Node) error
+	Config        engine.Config `json:"config"`
+	Added         int           `json:"added"`
+	Skipped       int           `json:"skipped"`
+	Announcements int           `json:"announcements,omitempty"`
+	incompatible  int
+	Notes         []string                  `json:"notes"`
+	Source        string                    `json:"-"`
+	Usage         *engine.SubscriptionUsage `json:"usage,omitempty"`
+	names         map[string]bool
+	seen          map[string]string
+	renamed       map[string]string // original name -> final node name
+	check         func(outbound.Node) error
 }
 
 type clash struct {
@@ -46,39 +50,44 @@ type clash struct {
 }
 
 type clashNode struct {
-	Name         string            `yaml:"name"`
-	Type         string            `yaml:"type"`
-	Server       string            `yaml:"server"`
-	Port         int               `yaml:"port"`
-	Ports        string            `yaml:"ports"`
-	Username     string            `yaml:"username"`
-	Password     string            `yaml:"password"`
-	UUID         string            `yaml:"uuid"`
-	Cipher       string            `yaml:"cipher"`
-	SNI          string            `yaml:"sni"`
-	ServerName   string            `yaml:"servername"`
-	Network      string            `yaml:"network"`
-	Flow         string            `yaml:"flow"`
-	Plugin       string            `yaml:"plugin"`
-	PluginOpts   map[string]any    `yaml:"plugin-opts"`
-	Dialer       string            `yaml:"dialer-proxy"`
-	Encryption   string            `yaml:"encryption"`
-	TLS          bool              `yaml:"tls"`
-	Insecure     bool              `yaml:"skip-cert-verify"`
-	AlterID      int               `yaml:"alterId"`
-	Reality      *clashReality     `yaml:"reality-opts"`
-	WS           *clashWS          `yaml:"ws-opts"`
-	GRPC         map[string]string `yaml:"grpc-opts"`
-	H2           *clashH2          `yaml:"h2-opts"`
-	HTTP         yaml.Node         `yaml:"http-opts"`
-	ALPN         []string          `yaml:"alpn"`
-	Fingerprint  string            `yaml:"client-fingerprint"`
-	Obfs         string            `yaml:"obfs"`
-	ObfsPassword string            `yaml:"obfs-password"`
-	Congestion   string            `yaml:"congestion-controller"`
-	UDPRelayMode string            `yaml:"udp-relay-mode"`
-	Up           string            `yaml:"up"`
-	Down         string            `yaml:"down"`
+	UDP               bool `yaml:"udp"`
+	UDPOverTCP        bool `yaml:"udp-over-tcp"`
+	UDPOverTCPVersion int  `yaml:"udp-over-tcp-version"`
+
+	Name                   string            `yaml:"name"`
+	Type                   string            `yaml:"type"`
+	Server                 string            `yaml:"server"`
+	Port                   int               `yaml:"port"`
+	Ports                  string            `yaml:"ports"`
+	Username               string            `yaml:"username"`
+	Password               string            `yaml:"password"`
+	UUID                   string            `yaml:"uuid"`
+	Cipher                 string            `yaml:"cipher"`
+	SNI                    string            `yaml:"sni"`
+	ServerName             string            `yaml:"servername"`
+	Network                string            `yaml:"network"`
+	Flow                   string            `yaml:"flow"`
+	Plugin                 string            `yaml:"plugin"`
+	PluginOpts             map[string]any    `yaml:"plugin-opts"`
+	Dialer                 string            `yaml:"dialer-proxy"`
+	Encryption             string            `yaml:"encryption"`
+	TLS                    bool              `yaml:"tls"`
+	Insecure               bool              `yaml:"skip-cert-verify"`
+	AlterID                int               `yaml:"alterId"`
+	Reality                *clashReality     `yaml:"reality-opts"`
+	WS                     *clashWS          `yaml:"ws-opts"`
+	GRPC                   map[string]string `yaml:"grpc-opts"`
+	H2                     *clashH2          `yaml:"h2-opts"`
+	HTTP                   yaml.Node         `yaml:"http-opts"`
+	ALPN                   []string          `yaml:"alpn"`
+	Fingerprint            string            `yaml:"client-fingerprint"`
+	CertificateFingerprint string            `yaml:"fingerprint"`
+	Obfs                   string            `yaml:"obfs"`
+	ObfsPassword           string            `yaml:"obfs-password"`
+	Congestion             string            `yaml:"congestion-controller"`
+	UDPRelayMode           string            `yaml:"udp-relay-mode"`
+	Up                     string            `yaml:"up"`
+	Down                   string            `yaml:"down"`
 }
 
 type clashProvider struct {
@@ -99,6 +108,7 @@ type clashWS struct {
 	Headers     map[string]string `yaml:"headers"`
 	EarlyData   int               `yaml:"max-early-data"`
 	EarlyHeader string            `yaml:"early-data-header-name"`
+	Upgrade     bool              `yaml:"v2ray-http-upgrade"`
 }
 
 type clashH2 struct {
@@ -117,6 +127,9 @@ type clashGroup struct {
 }
 
 func (n clashNode) convert() (outbound.Node, error) {
+	if n.CertificateFingerprint != "" {
+		return outbound.Node{}, errors.New("当前内核不支持 Clash 的整张 TLS 证书指纹校验")
+	}
 	if n.AlterID != 0 {
 		return outbound.Node{}, errors.New("只支持 VMess AEAD（alterId=0）")
 	}
@@ -160,7 +173,21 @@ func (n clashNode) convert() (outbound.Node, error) {
 		s.security, s.publicKey, s.shortID = "reality", n.Reality.PublicKey, n.Reality.ShortID
 	}
 	if n.WS != nil {
-		s.path, s.host, s.earlyData, s.earlyHeader = n.WS.Path, n.WS.Headers["Host"], n.WS.EarlyData, n.WS.EarlyHeader
+		s.path, s.earlyData, s.earlyHeader = n.WS.Path, n.WS.EarlyData, n.WS.EarlyHeader
+		s.headers = make(map[string]string, len(n.WS.Headers))
+		for name, value := range n.WS.Headers {
+			if strings.EqualFold(name, "Host") {
+				s.host = value
+			} else {
+				s.headers[name] = value
+			}
+		}
+		if n.WS.Upgrade {
+			if (n.Network != "ws" && n.Network != "websocket") || s.earlyData != 0 || s.earlyHeader != "" {
+				return node, errors.New("此 HTTP Upgrade 与 WebSocket 提前数据的组合不受支持")
+			}
+			s.network = "httpupgrade"
+		}
 	}
 	if n.GRPC != nil {
 		s.serviceName = n.GRPC["grpc-service-name"]
@@ -199,6 +226,59 @@ func (n clashNode) convert() (outbound.Node, error) {
 	case "trojan", "anytls":
 		s.security = map[bool]string{true: "reality", false: "tls"}[s.security == "reality"]
 	case "shadowsocks":
+		if n.Plugin == "shadow-tls" || n.Plugin == "shadowtls" {
+			layer := &outbound.ShadowTLS{Version: 2, Fingerprint: n.Fingerprint, UDP: n.UDP}
+			for key, value := range n.PluginOpts {
+				switch key {
+				case "host":
+					layer.Host, _ = value.(string)
+				case "password":
+					layer.Password, _ = value.(string)
+				case "version":
+					switch version := value.(type) {
+					case int:
+						layer.Version = version
+					case string:
+						layer.Version, _ = strconv.Atoi(version)
+					default:
+						layer.Version = 0
+					}
+				case "alpn":
+					list, ok := value.([]any)
+					if !ok {
+						return node, errors.New("ShadowTLS ALPN 格式无效")
+					}
+					for _, item := range list {
+						protocol, ok := item.(string)
+						if !ok || protocol == "" {
+							return node, errors.New("ShadowTLS ALPN 格式无效")
+						}
+						layer.ALPN = append(layer.ALPN, protocol)
+					}
+				case "skip-cert-verify":
+					if value != false {
+						return node, errors.New("ShadowTLS 要求正常验证证书")
+					}
+				default:
+					return node, fmt.Errorf("ShadowTLS 参数 %s 不受支持", key)
+				}
+			}
+			if _, explicit := n.PluginOpts["alpn"]; !explicit {
+				layer.ALPN = []string{"h2", "http/1.1"}
+			}
+			if n.UDP && n.UDPOverTCP {
+				version := n.UDPOverTCPVersion
+				if version == 0 {
+					version = 1
+				}
+				if version != 1 && version != 2 {
+					return node, errors.New("ShadowTLS UDP over TCP 版本不受支持")
+				}
+				s.extra["udp_over_tcp"] = map[string]any{"enabled": true, "version": version}
+			}
+			node.ShadowTLS = layer
+			return node, s.apply(&node)
+		}
 		if n.Plugin != "" {
 			name := n.Plugin
 			if name == "obfs" {
@@ -255,11 +335,12 @@ type Options struct {
 	// Transport carries subscription downloads; nil means a direct connection.
 	// Background refreshes pass one that goes through HopWay's own routing.
 	Transport http.RoundTripper
+	Agent     string
 }
 
-func fetch(ctx context.Context, source *url.URL, options Options) ([]byte, error) {
+func fetch(ctx context.Context, source *url.URL, options Options) ([]byte, string, error) {
 	if source.User != nil || source.Hostname() == "" {
-		return nil, errors.New("订阅地址无效")
+		return nil, "", errors.New("订阅地址无效")
 	}
 	client := &http.Client{Transport: options.Transport, Timeout: 30 * time.Second, CheckRedirect: func(next *http.Request, via []*http.Request) error {
 		if len(via) >= 5 || next.URL.User != nil ||
@@ -270,18 +351,19 @@ func fetch(ctx context.Context, source *url.URL, options Options) ([]byte, error
 	}}
 	request, err := http.NewRequestWithContext(ctx, "GET", source.String(), nil)
 	if err != nil {
-		return nil, errors.New("订阅地址无效")
+		return nil, "", errors.New("订阅地址无效")
 	}
-	request.Header.Set("User-Agent", "clash/HopWay")
+	request.Header.Set("User-Agent", options.Agent)
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, errors.New("无法下载订阅，请检查网络和链接")
+		return nil, "", errors.New("无法下载订阅，请检查网络和链接")
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("订阅服务器返回 HTTP %d", response.StatusCode)
+		return nil, "", fmt.Errorf("订阅服务器返回 HTTP %d", response.StatusCode)
 	}
-	return readBounded(response.Body)
+	data, err := readBounded(response.Body)
+	return data, response.Header.Get("Subscription-Userinfo"), err
 }
 
 func Import(ctx context.Context, input io.Reader, base engine.Config, impl backend.Backend) (Result, error) {
@@ -297,45 +379,58 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 	if raw == "" {
 		return Result{}, errors.New("没有可导入的内容")
 	}
-	sourceURL := ""
-	if !strings.ContainsAny(raw, " \r\n\t") {
-		if source, err := url.Parse(raw); err == nil && (source.Scheme == "https" || source.Scheme == "http") {
-			data, err := fetch(ctx, source, options)
-			if err != nil {
-				return Result{}, err
-			}
-			sourceURL = raw
-			raw = strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
+	source, agent, _, err := SubscriptionLink(raw)
+	if err != nil {
+		return Result{}, err
+	}
+	var meter *engine.SubscriptionUsage
+	if source != nil {
+		if options.Agent == "" || options.Agent == "clash/HopWay" {
+			options.Agent = agent
 		}
+		data, header, err := fetch(ctx, source, options)
+		if err != nil {
+			return Result{}, err
+		}
+		raw = strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
+		meter = readUsage(header, raw)
 	}
 	if config, err := engine.Decode(strings.NewReader(raw)); strings.HasPrefix(raw, "{") && err == nil {
 		if err := engine.Validate(config, impl); err != nil {
 			return Result{}, fmt.Errorf("HopWay 配置无效：%w", err)
 		}
-		return Result{Config: config, Added: len(config.Nodes), Notes: []string{"已导入完整 JSON 配置"}}, nil
+		return Result{Config: config, Usage: meter, Added: len(config.Nodes), Notes: []string{"已导入完整 JSON 配置"}}, nil
 	}
 
-	result := Result{Config: base, Notes: []string{}, names: map[string]bool{"DIRECT": true, "REJECT": true, "SELECT": true},
-		seen: make(map[string]bool), check: impl.Check, renamed: map[string]string{}}
+	result := Result{Config: base, Usage: meter, Notes: []string{}, names: map[string]bool{"DIRECT": true, "REJECT": true, "SELECT": true},
+		seen: make(map[string]string), check: impl.Check, renamed: map[string]string{}}
 	for _, node := range base.Nodes {
 		result.names[node.Name] = true
-		result.seen[identity(node)] = true
+		result.seen[identity(node)] = node.Name
 	}
 	for _, g := range base.Groups {
 		result.names[g.Name] = true // shared links must not shadow existing groups
 	}
-	if decoded, err := decodeBase64(strings.Join(strings.Fields(raw), "")); err == nil && isLinks(string(decoded)) {
-		raw = string(decoded)
+	raw = stripSubscriptionHeader(raw)
+	if decoded, err := decodeBase64(strings.Join(strings.Fields(raw), "")); err == nil && isLinks(stripSubscriptionHeader(string(decoded))) {
+		raw = stripSubscriptionHeader(string(decoded))
 	}
 	if isLinks(raw) {
 		for _, line := range strings.Fields(raw) {
+			var adjusted bool
+			if source != nil {
+				line, adjusted = verifyAnyTLSLink(line)
+			}
+			if adjusted {
+				result.noteStrictTLS()
+			}
 			node, err := parseLink(line)
 			if err == nil && node.Name == "" {
 				node.Name, _ = url.PathUnescape(node.Name)
 			}
 			result.add(node, err)
 		}
-	} else {
+	} else if !parseSurgeProfile(raw, &result) {
 		var profile clash
 		decoder := yaml.NewDecoder(strings.NewReader(raw))
 		if err := decoder.Decode(&profile); err != nil || decoder.Decode(new(yaml.Node)) != io.EOF {
@@ -347,6 +442,10 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 				result.add(outbound.Node{}, errors.New("Clash 节点字段格式无效"))
 				continue
 			}
+			if proxy.Insecure {
+				proxy.Insecure = false
+				result.noteStrictTLS()
+			}
 			node, err := proxy.convert()
 			node.Name = proxy.Name
 			result.addNamed(proxy.Name, node, err)
@@ -357,6 +456,9 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 		if len(profile.Groups) != 0 {
 			result.importClash(profile)
 		}
+	}
+	if result.Announcements != 0 {
+		result.Notes = append(result.Notes, fmt.Sprintf("已跳过 %d 条服务商公告", result.Announcements))
 	}
 	if result.Added == 0 && result.Skipped == 0 {
 		return Result{}, errors.New("没有找到内联节点。仅含远程 proxy-providers 的配置暂不支持")
@@ -373,7 +475,9 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 	if err := engine.Validate(result.Config, impl); err != nil {
 		return Result{}, err
 	}
-	result.Source = sourceURL
+	if source != nil {
+		result.Source = source.String()
+	}
 	return result, nil
 }
 
@@ -636,6 +740,11 @@ func (result *Result) add(node outbound.Node, err error) {
 }
 
 func (result *Result) addNamed(original string, node outbound.Node, err error) {
+	if subscriptionNotice(node.Name) {
+		result.Skipped++
+		result.Announcements++
+		return
+	}
 	if err == nil {
 		err = node.Validate()
 	}
@@ -644,7 +753,8 @@ func (result *Result) addNamed(original string, node outbound.Node, err error) {
 	}
 	if err != nil {
 		result.Skipped++
-		if result.Skipped <= 4 {
+		result.incompatible++
+		if result.incompatible <= 4 {
 			name := strings.TrimSpace(node.Name)
 			if name == "" {
 				name = fmt.Sprintf("第 %d 个不可导入项", result.Skipped)
@@ -660,7 +770,10 @@ func (result *Result) addNamed(original string, node outbound.Node, err error) {
 		name = node.Type + " · " + node.Server
 	}
 	key := identity(node)
-	if result.seen[key] {
+	if existing := result.seen[key]; existing != "" {
+		if _, exists := result.renamed[original]; original != "" && !exists {
+			result.renamed[original] = existing
+		}
 		result.Skipped++
 		if result.Skipped <= 4 {
 			result.Notes = append(result.Notes, "已跳过重复节点："+name)
@@ -672,7 +785,7 @@ func (result *Result) addNamed(original string, node outbound.Node, err error) {
 		node.Name = fmt.Sprintf("%s (%d)", name, i)
 	}
 	result.names[node.Name] = true
-	result.seen[key] = true
+	result.seen[key] = node.Name
 	if _, exists := result.renamed[original]; original != "" && !exists {
 		result.renamed[original] = node.Name // Clash resolves duplicates to the first
 	}
@@ -693,4 +806,59 @@ func decodeBase64(raw string) ([]byte, error) {
 		}
 	}
 	return nil, errors.New("Base64 格式错误")
+}
+func stripSubscriptionHeader(raw string) string {
+	raw = strings.TrimSpace(strings.TrimPrefix(raw, "\ufeff"))
+	for {
+		line, rest, found := strings.Cut(raw, "\n")
+		line = strings.TrimSpace(line)
+		if !found || (!strings.HasPrefix(line, "STATUS=") && !strings.HasPrefix(line, "#")) {
+			return raw
+		}
+		raw = strings.TrimSpace(rest)
+	}
+}
+
+func subscriptionNotice(name string) bool {
+	name = strings.TrimLeftFunc(name, func(character rune) bool {
+		return unicode.IsSpace(character) || unicode.Is(unicode.So, character) || character == '\uFE0F'
+	})
+	for _, prefix := range []string{
+		"剩余流量", "剩餘流量", "套餐到期", "到期时间", "距离下次重置",
+		"如果只显示当前节点", "请更新客户端", "轻语机场官网",
+		"防失联网址：", "防失联网址:", "官网：", "官网:", "官方地址：", "官方地址:",
+	} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func verifyAnyTLSLink(raw string) (string, bool) {
+	if !strings.HasPrefix(strings.ToLower(raw), "anytls://") {
+		return raw, false
+	}
+	link, err := url.Parse(raw)
+	if err != nil {
+		return raw, false
+	}
+	query, err := url.ParseQuery(link.RawQuery)
+	if err != nil || (!truthy(query.Get("allowInsecure")) && !truthy(query.Get("insecure"))) {
+		return raw, false
+	}
+	query.Del("allowInsecure")
+	query.Del("insecure")
+	link.RawQuery = query.Encode()
+	return link.String(), true
+}
+
+func (result *Result) noteStrictTLS() {
+	const note = "要求跳过证书验证的节点将按正常 TLS 校验导入"
+	for _, existing := range result.Notes {
+		if existing == note {
+			return
+		}
+	}
+	result.Notes = append(result.Notes, note)
 }

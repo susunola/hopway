@@ -139,3 +139,59 @@ rules:
 	}
 	core.Close()
 }
+
+func TestClashProviderAnnouncementsAndTransportCompatibility(t *testing.T) {
+	const raw = `
+proxies:
+  - {name: "🌲 防失联网址：example.test", type: unsupported}
+  - {name: "🌳 官网：example.test", type: unsupported}
+  - {name: "🇭🇰 香港-09 | 流媒体（节点超时请更新）", type: trojan, server: hk.test, port: 443, password: fixture, network: grpc, grpc-opts: {grpc-service-name: media}, skip-cert-verify: true, alpn: [h2]}
+  - {name: "🇭🇰 香港-10 | 流媒体", type: vless, server: hk.test, port: 443, uuid: ccc641c2-e296-455c-9f8e-8d13a9b02976, network: ws, tls: true, ws-opts: {path: /proxy, headers: {host: cdn.test, X-Example: media}, v2ray-http-upgrade: true}}
+  - {name: Pinned, type: trojan, server: hk.test, port: 443, password: fixture, fingerprint: fixture}
+`
+	result, err := Import(context.Background(), strings.NewReader(raw), engine.Default(), backend.Default())
+	if err != nil || result.Added != 2 || result.Announcements != 2 || result.Skipped != 3 {
+		t.Fatalf("got %d added, %d announcements, %d skipped, %v", result.Added, result.Announcements, result.Skipped, err)
+	}
+	first, second := string(result.Config.Nodes[0].Options), string(result.Config.Nodes[1].Options)
+	if !strings.Contains(first, `"type":"grpc"`) || !strings.Contains(first, `"alpn":["h2"]`) || strings.Contains(first, "insecure") {
+		t.Fatalf("incorrect gRPC or TLS settings: %s", first)
+	}
+	for _, want := range []string{`"type":"httpupgrade"`, `"host":"cdn.test"`, `"X-Example":"media"`} {
+		if !strings.Contains(second, want) {
+			t.Fatalf("HTTP Upgrade settings %s, missing %s", second, want)
+		}
+	}
+	if !strings.Contains(strings.Join(result.Notes, "\n"), "整张 TLS 证书指纹") {
+		t.Fatal("expected an explicit explanation for the certificate fingerprint")
+	}
+}
+
+func TestClashShadowTLSKeepsGroupAliasesAndTransport(t *testing.T) {
+	const raw = `
+proxies:
+  - {name: HK, type: ss, server: hk.test, port: 443, cipher: aes-128-gcm, password: ss-fixture, udp: true, plugin: shadow-tls, plugin-opts: {host: cover.test, password: tls-fixture, version: 3}}
+  - {name: HK alias, type: ss, server: hk.test, port: 443, cipher: aes-128-gcm, password: ss-fixture, udp: true, plugin: shadow-tls, plugin-opts: {host: cover.test, password: tls-fixture, version: 3}}
+proxy-groups:
+  - {name: Proxy, type: select, proxies: [HK alias]}
+rules:
+  - MATCH,Proxy
+`
+	result, err := Import(context.Background(), strings.NewReader(raw), engine.Default(), backend.Default())
+	if err != nil || result.Added != 1 || result.Skipped != 1 {
+		t.Fatalf("got %d added, %d skipped, %v", result.Added, result.Skipped, err)
+	}
+	node := result.Config.Nodes[0]
+	if layer := node.ShadowTLS; layer == nil || layer.Version != 3 || layer.Host != "cover.test" ||
+		layer.Password != "tls-fixture" || !layer.UDP || node.Password != "ss-fixture" {
+		t.Fatal("ShadowTLS and Shadowsocks settings must remain separate")
+	}
+	if len(result.Config.Groups) != 1 || strings.Join(result.Config.Groups[0].Members, ",") != "HK" {
+		t.Fatal("strategy group lost its duplicate node reference")
+	}
+	core, err := engine.New(result.Config, backend.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	core.Close()
+}

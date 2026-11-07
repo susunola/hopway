@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"strings"
 	"sync"
@@ -44,13 +45,11 @@ func (SingBox) Check(node outbound.Node) error {
 	if err := node.Validate(); err != nil {
 		return err
 	}
-	outboundJSON, err := Convert(node)
+	outbounds, err := convertOutbounds(node, true)
 	if err != nil {
 		return err
 	}
-	delete(outboundJSON, "detour")
-	outboundJSON["detour"] = traceTag
-	instance, err := build([]map[string]any{outboundJSON}, nil)
+	instance, err := build(outbounds, nil)
 	if err != nil {
 		return err
 	}
@@ -65,17 +64,14 @@ type singInstance struct {
 func (SingBox) Open(nodes []outbound.Node, guard Guard) (Instance, error) {
 	outbounds := make([]map[string]any, 0, len(nodes))
 	for _, node := range nodes {
-		if node.Name == traceTag {
-			return nil, nodeError(node.Name, errors.New("name is reserved"))
-		}
 		if err := node.Validate(); err != nil {
 			return nil, nodeError(node.Name, err)
 		}
-		converted, err := Convert(node)
+		converted, err := convertOutbounds(node, false)
 		if err != nil {
 			return nil, nodeError(node.Name, err)
 		}
-		outbounds = append(outbounds, converted)
+		outbounds = append(outbounds, converted...)
 	}
 	instance, err := build(outbounds, guard)
 	if err != nil {
@@ -93,12 +89,14 @@ func (SingBox) Open(nodes []outbound.Node, guard Guard) (Instance, error) {
 			instance.Close()
 			return nil, nodeError(node.Name, errors.New("outbound was not created"))
 		}
-		result.dialers[node.Name] = &singDialer{out: out, chunked: chunked}
+		packet, _ := instance.Outbound().Outbound(shadowTLSPacketTag(node.Name))
+		result.dialers[node.Name] = &singDialer{out: out, packet: packet, chunked: chunked}
 	}
 	return result, nil
 }
 
 type singDialer struct {
+	packet  adapter.Outbound
 	out     adapter.Outbound
 	chunked bool
 }
@@ -124,8 +122,12 @@ func (d *singDialer) DialContext(ctx context.Context, target string) (net.Conn, 
 // ListenPacket opens a UDP session through the node. Datagrams are written
 // with WriteTo to M.Socksaddr destinations, so names are resolved remotely.
 func (d *singDialer) ListenPacket(ctx context.Context, target string) (net.PacketConn, error) {
+	out := d.out
+	if d.packet != nil {
+		out = d.packet
+	}
 	supported := false
-	for _, network := range d.out.Network() {
+	for _, network := range out.Network() {
 		supported = supported || network == N.NetworkUDP
 	}
 	if !supported {
@@ -135,7 +137,7 @@ func (d *singDialer) ListenPacket(ctx context.Context, target string) (net.Packe
 	if !destination.IsValid() {
 		return nil, errors.New("invalid destination")
 	}
-	return d.out.ListenPacket(ctx, destination)
+	return out.ListenPacket(ctx, destination)
 }
 
 func (instance *singInstance) Dialer(name string) (Dialer, bool) {
@@ -201,6 +203,68 @@ func (o *traceOutbound) ListenPacket(ctx context.Context, destination M.Socksadd
 		return nil, err
 	}
 	return conn.(*net.UDPConn), nil
+}
+
+const shadowTLSTagPrefix = "hopway-shadowtls:"
+
+func shadowTLSPacketTag(name string) string {
+	return shadowTLSTagPrefix + "udp:" + name
+}
+
+func convertOutbounds(node outbound.Node, checking bool) ([]map[string]any, error) {
+	if node.Name == traceTag || strings.HasPrefix(node.Name, shadowTLSTagPrefix) {
+		return nil, errors.New("name is reserved")
+	}
+	main, err := Convert(node)
+	if err != nil {
+		return nil, err
+	}
+	if checking {
+		main["detour"] = traceTag
+	}
+	layer := node.ShadowTLS
+	if layer == nil {
+		return []map[string]any{main}, nil
+	}
+
+	tls := map[string]any{"enabled": true, "server_name": layer.Host}
+	if layer.ALPN != nil {
+		tls["alpn"] = layer.ALPN
+	}
+	if layer.Fingerprint != "" && layer.Fingerprint != "none" {
+		tls["utls"] = map[string]any{"enabled": true, "fingerprint": strings.ToLower(layer.Fingerprint)}
+	}
+	tag := shadowTLSTagPrefix + "tcp:" + node.Name
+	wrapper := map[string]any{
+		"type": "shadowtls", "tag": tag, "detour": main["detour"],
+		"server": main["server"], "server_port": main["server_port"],
+		"version": layer.Version, "password": layer.Password, "tls": tls,
+	}
+	// Clash uses native Shadowsocks packets when UDP is enabled, with
+	// ShadowTLS wrapping only TCP. An explicit UoT setting uses the wrapper.
+	var packet map[string]any
+	switch uot := main["udp_over_tcp"].(type) {
+	case bool:
+		if uot {
+			main["detour"] = tag
+			return []map[string]any{wrapper, main}, nil
+		}
+	case map[string]any:
+		if uot["enabled"] == true {
+			main["detour"] = tag
+			return []map[string]any{wrapper, main}, nil
+		}
+	}
+	if layer.UDP {
+		packet = maps.Clone(main)
+		packet["tag"], packet["network"] = shadowTLSPacketTag(node.Name), "udp"
+	}
+	main["detour"], main["network"] = tag, "tcp"
+	outbounds := []map[string]any{wrapper, main}
+	if packet != nil {
+		outbounds = append(outbounds, packet)
+	}
+	return outbounds, nil
 }
 
 // Convert renders a node as a sing-box outbound object.

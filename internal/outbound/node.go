@@ -29,9 +29,20 @@ type Node struct {
 	UUID       string          `json:"uuid,omitempty"`
 	TLS        bool            `json:"tls,omitempty"`
 	Options    json.RawMessage `json:"options,omitempty"`
+	ShadowTLS  *ShadowTLS      `json:"shadowTLS,omitempty"`
 
 	rootCAs *x509.CertPool
 	v2Dial  func(net.Conn, M.Socksaddr) (net.Conn, error)
+}
+
+// ShadowTLS wraps the TCP connection used by a Shadowsocks node.
+type ShadowTLS struct {
+	UDP         bool     `json:"udp,omitempty"`
+	Version     int      `json:"version"`
+	Host        string   `json:"host"`
+	Password    string   `json:"password,omitempty"`
+	Fingerprint string   `json:"clientFingerprint,omitempty"`
+	ALPN        []string `json:"alpn,omitempty"`
 }
 
 // Types lists every node type HopWay understands. The native backend
@@ -90,6 +101,14 @@ func (node Node) Validate() error {
 	case "vless", "vmess", "tuic":
 		if !validUUID(node.UUID) {
 			return fmt.Errorf("%s requires a valid UUID", node.Type)
+		}
+	}
+	if layer := node.ShadowTLS; layer != nil {
+		if node.Type != "shadowsocks" || node.TLS {
+			return errors.New("ShadowTLS requires a Shadowsocks node without a separate TLS layer")
+		}
+		if layer.Host == "" || layer.Version < 1 || layer.Version > 3 || (layer.Version > 1 && layer.Password == "") {
+			return errors.New("ShadowTLS requires a host, version 1–3 and a password for v2/v3")
 		}
 	}
 	if len(node.Options) != 0 {

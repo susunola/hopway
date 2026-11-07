@@ -61,7 +61,7 @@ func TestUDPThroughNodes(t *testing.T) {
 	target := echo.String()
 	for _, name := range names {
 		t.Run(name, func(t *testing.T) {
-			core.SetPolicy(Policy{"global", name})
+			core.SetPolicy(Policy{Mode: "global", Selected: name})
 			conn, err := core.DialPacket(context.Background(), "test", target)
 			if err != nil {
 				if required[name] {

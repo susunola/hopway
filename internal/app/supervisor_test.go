@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/engine"
+	"mac-proxy/internal/outbound"
 	"mac-proxy/internal/sysproxy"
 )
 
@@ -131,17 +133,81 @@ func TestReloadRejectsBrokenConfig(t *testing.T) {
 	}
 	defer s.Close()
 	before := s.Engine()
-	// A broken file at reload time falls back to the last good copy rather
-	// than taking the proxy down.
+	// A failed explicit reload keeps the current engine and reports the error.
 	os.WriteFile(path, []byte(`{broken`), 0o600)
-	if err := s.Reload(); err != nil {
-		t.Fatal(err)
+	if err := s.Reload(); err == nil {
+		t.Fatal("broken configuration was accepted")
 	}
-	if s.Engine() == before || len(s.Status().Warnings) == 0 {
-		t.Fatal("expected a fallback reload with a warning")
+	if s.Engine() != before {
+		t.Fatal("failed reload replaced the running engine")
 	}
 	os.WriteFile(path, []byte(`{"socksPort":4242,"httpPort":4243,"mode":"rule","selected":"DIRECT","nodes":[],"rules":[]}`), 0o600)
 	if err := s.Reload(); err != ErrPortsChanged {
 		t.Fatalf("port change: %v", err)
+	}
+}
+
+func TestAutoPolicySurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	config := engine.Default()
+	config.Nodes = []outbound.Node{{Name: "HK", Type: "socks5", Server: "127.0.0.1:1"}}
+	save := func() {
+		t.Helper()
+		data, err := json.Marshal(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	save()
+	start := func() *Supervisor {
+		t.Helper()
+		s, err := Open(path, filepath.Join(dir, "cache"), backend.Native{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Start(sysproxy.Target{}); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	first := start()
+	if err := first.SetPolicy(engine.Policy{Mode: "auto", Selected: "DIRECT", Auto: &engine.AutoConfig{
+		Region: "HK", Groups: []engine.AutoGroup{{Name: "First", Nodes: []string{"HK"}}},
+	}}); err != nil {
+		first.Close()
+		t.Fatal(err)
+	}
+	first.Close()
+	second := start()
+	defer second.Close()
+	if got := second.Engine().Runtime().Policy; got.Mode != "auto" {
+		t.Fatalf("automatic policy not restored: %+v", got)
+	}
+	nodes := config.Nodes
+	config.Nodes = nil
+	save()
+	if err := second.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if got := second.Engine().Decide("example.test:443"); got != "REJECT" {
+		t.Fatalf("missing automatic node should block the route, got %s", got)
+	}
+	config.Nodes = nodes
+	save()
+	if err := second.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if got := second.Engine().Runtime().Policy; got.Mode != "auto" {
+		t.Fatalf("automatic policy not recovered: %+v", got)
+	}
+	if err := second.SetPolicy(engine.Policy{Mode: "rule", Selected: "DIRECT"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(second.autoPolicyPath()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("manual mode should clear the saved automatic policy: %v", err)
 	}
 }

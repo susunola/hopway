@@ -1,0 +1,41 @@
+name: Verify HopWay
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  HOPWAY_TAGS: with_quic,with_utls,badlinkname,tfogo_checklinkname0
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test production protocols
+        run: go test -tags "$HOPWAY_TAGS" -ldflags=-checklinkname=0 ./...
+      - name: Check for races
+        # Keep Vision in the ordinary integration suite. Its upstream TLS
+        # buffer access and read/write race currently fail under instrumentation.
+        run: >-
+          go test -race -tags "$HOPWAY_TAGS" -ldflags=-checklinkname=0
+          -skip 'Test(ProtocolsInterop|ServerFirstTarget|UDPThroughNodes)/reality' ./...
+      - name: Diagnose upstream Vision races
+        continue-on-error: true
+        run: >-
+          go test -race -tags "$HOPWAY_TAGS" -ldflags=-checklinkname=0
+          -gcflags='github.com/sagernet/sing-vmess/vless=-d=checkptr=0'
+          -run 'TestServerFirstTarget/reality' ./internal/engine
+      - name: Build and verify the app
+        run: |
+          app="$RUNNER_TEMP/build.noindex/HopWay.app"
+          ./build-app.sh "$app"
+          codesign --verify --deep --strict "$app"
+          test -s "$app/Contents/Resources/HopWay.icns"

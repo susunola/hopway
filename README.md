@@ -4,7 +4,7 @@
 
 ## 运行
 
-打开旁边的 **HopWay.app**，点击 **启动代理**。默认 SOCKS5 监听 `127.0.0.1:1080`，HTTP 监听 `127.0.0.1:8080`。两种入站都只接受本机连接。默认规则使用直连出站。
+打开 **~/Applications/HopWay.app**，点击 **启动代理**。默认 SOCKS5 监听 `127.0.0.1:1080`，HTTP 监听 `127.0.0.1:8080`。两种入站都只接受本机连接。默认规则使用直连出站。
 
 ```bash
 curl --noproxy "" --socks5-hostname 127.0.0.1:1080 https://example.com/
@@ -138,7 +138,7 @@ TAGS=with_quic,with_utls,badlinkname,tfogo_checklinkname0
 go run -tags $TAGS -ldflags=-checklinkname=0 .          # 单独运行 Go 内核
 go run -tags $TAGS -ldflags=-checklinkname=0 . -check -config /path/config.json
 go test -tags $TAGS -ldflags=-checklinkname=0 ./...      # 含 8 种协议的端到端互通测试
-./build-app.sh                                         # 生成 ../HopWay.app
+./build-app.sh                                         # 安装到 ~/Applications/HopWay.app
 ```
 
 阅读顺序可从 `main.go` 开始，再看 `internal/socks5` 和 `internal/httpproxy` 如何接收流量，`internal/engine` 如何分流（`rules.go`）、选组和测速（`groups.go`）、记录诊断，`internal/backend` 如何把节点交给 sing-box 并测量各阶段耗时，最后看 `internal/importer` 和 `ui/CoreModel.swift`。控制接口只监听本机随机端口，每次运行产生新的令牌，提供 `GET /status`、`PUT /policy`、`PUT /groups/{name}`（切换 select 组）、`POST /probe`（立即测速全部节点）、`POST /reload`（热加载配置）、`POST /subscriptions/refresh` 和 `POST /rulesets/refresh`（立即更新）。界面关闭内核子进程的标准输入后，内核退出。

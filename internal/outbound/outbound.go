@@ -28,6 +28,9 @@ func (node *Node) PrepareNative() error {
 	if err := node.Validate(); err != nil {
 		return err
 	}
+	if node.ShadowTLS != nil {
+		return errors.New("ShadowTLS needs the sing-box backend")
+	}
 	if len(node.Options) != 0 {
 		return errors.New("extra options need the sing-box backend")
 	}

@@ -79,3 +79,49 @@ func TestLoadFallsBackToLastGood(t *testing.T) {
 		t.Fatalf("last good copy damaged: %s", good)
 	}
 }
+
+func TestMergeReplacesLegacyInlineSubscriptionNodes(t *testing.T) {
+	config := engine.Default()
+	config.Nodes = []outbound.Node{node("Old-1"), node("Old-2"), node("Manual")}
+	config.SubscriptionNodes = []string{"Old-2"} // earliest builds tracked only some nodes
+	config.Subscriptions = []engine.Subscription{
+		{Name: "first", Nodes: []string{"Old-1"}},
+		{Name: "second", Nodes: []string{"Old-2"}},
+	}
+	merged, _ := Merge(config, map[string]*Snapshot{"first": {Nodes: []outbound.Node{node("New-1")}}})
+	want := []string{"Old-2", "Manual", "New-1"}
+	if len(merged.Nodes) != len(want) {
+		t.Fatalf("got %d nodes, want %d", len(merged.Nodes), len(want))
+	}
+	for i, name := range want {
+		if merged.Nodes[i].Name != name {
+			t.Fatalf("node %d = %s, want %s", i, merged.Nodes[i].Name, name)
+		}
+	}
+	if config.Subscriptions[0].Nodes[0] != "Old-1" || merged.Subscriptions[0].Nodes[0] != "New-1" {
+		t.Fatal("the effective node list must not mutate the saved profile")
+	}
+}
+
+func TestPausedSubscriptionRetainsQuotaWithoutOfferingNodes(t *testing.T) {
+	config := engine.Default()
+	config.Nodes = []outbound.Node{node("Legacy"), node("Manual")}
+	config.Subscriptions = []engine.Subscription{{Name: "first", Paused: true, Nodes: []string{"Legacy"}}}
+	for _, snapshots := range []map[string]*Snapshot{
+		nil,
+		{"first": {Nodes: []outbound.Node{node("Cached")}, Usage: &engine.SubscriptionUsage{UpdatedAt: 42}}},
+	} {
+		merged, _ := Merge(config, snapshots)
+		if len(merged.Nodes) != 1 || merged.Nodes[0].Name != "Manual" || len(merged.Subscriptions[0].Nodes) != 0 {
+			t.Fatal("paused subscription offered a node")
+		}
+		if snapshots != nil && merged.Subscriptions[0].Usage.UpdatedAt != 42 {
+			t.Fatal("paused subscription lost its quota")
+		}
+	}
+	config.Subscriptions[0].Paused = false
+	merged, _ := Merge(config, nil)
+	if len(merged.Nodes) != 2 {
+		t.Fatal("resuming did not recover the legacy node")
+	}
+}

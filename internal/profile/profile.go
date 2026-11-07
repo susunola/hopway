@@ -19,7 +19,9 @@ import (
 
 // Snapshot is what one subscription contributed at its last refresh.
 type Snapshot struct {
-	URL      string           `json:"url"`
+	Usage   *engine.SubscriptionUsage `json:"usage,omitempty"`
+	Samples []engine.UsageSample      `json:"usageSamples,omitempty"`
+
 	Updated  int64            `json:"updated"` // unix ms
 	Nodes    []outbound.Node  `json:"nodes"`
 	Groups   []engine.Group   `json:"groups,omitempty"`
@@ -61,12 +63,33 @@ func SaveSnapshot(dataDir string, sub engine.Subscription, snapshot *Snapshot) e
 // snapshot provides yet are dropped with a warning instead of failing.
 func Merge(user engine.Config, snapshots map[string]*Snapshot) (engine.Config, []string) {
 	merged := user
-	merged.Nodes = append([]outbound.Node(nil), user.Nodes...)
+	merged.Subscriptions = append([]engine.Subscription(nil), user.Subscriptions...)
+	// Before subscriptions used snapshots, their nodes were embedded in the
+	// user file. Keep them as a fallback until all their owners have snapshots.
+	oldOwned := map[string]bool{}
+	retain := map[string]bool{}
+	for _, name := range user.SubscriptionNodes {
+		oldOwned[name] = true
+	}
+	for _, sub := range user.Subscriptions {
+		for _, name := range sub.Nodes {
+			oldOwned[name] = true
+			if !sub.Paused && snapshots[sub.Name] == nil {
+				retain[name] = true
+			}
+		}
+	}
+	merged.Nodes = nil
+	for _, node := range user.Nodes {
+		if !oldOwned[node.Name] || retain[node.Name] {
+			merged.Nodes = append(merged.Nodes, node)
+		}
+	}
 	merged.Groups = append([]engine.Group(nil), user.Groups...)
 	merged.RuleSets = append([]engine.RuleSet(nil), user.RuleSets...)
 	var warnings []string
 	taken := map[string]bool{"DIRECT": true, "REJECT": true, "SELECT": true}
-	for _, node := range user.Nodes {
+	for _, node := range merged.Nodes {
 		taken[node.Name] = true
 	}
 	for _, group := range user.Groups {
@@ -86,10 +109,22 @@ func Merge(user engine.Config, snapshots map[string]*Snapshot) (engine.Config, [
 	var subRules []engine.Rule
 	var subFinal *engine.Rule
 	firstGroup := ""
-	for _, sub := range user.Subscriptions {
+	for i, sub := range user.Subscriptions {
 		snapshot := snapshots[sub.Name]
+		if sub.Paused {
+			merged.Subscriptions[i].Nodes = nil
+			if snapshot != nil && snapshot.Usage != nil {
+				merged.Subscriptions[i].Usage, merged.Subscriptions[i].UsageSamples = snapshot.Usage, snapshot.Samples
+			}
+			continue
+		}
 		if snapshot == nil {
 			continue
+		}
+		merged.Subscriptions[i].Nodes = nil
+		if snapshot.Usage != nil {
+			merged.Subscriptions[i].Usage = snapshot.Usage
+			merged.Subscriptions[i].UsageSamples = snapshot.Samples
 		}
 		rename := map[string]string{}
 		unique := func(name string, used map[string]bool) string {
@@ -105,6 +140,7 @@ func Merge(user engine.Config, snapshots map[string]*Snapshot) (engine.Config, [
 			node.Name = unique(original, taken)
 			rename[original] = node.Name
 			merged.Nodes = append(merged.Nodes, node)
+			merged.Subscriptions[i].Nodes = append(merged.Subscriptions[i].Nodes, node.Name)
 		}
 		for _, group := range snapshot.Groups {
 			rename[group.Name] = unique(group.Name, taken)
@@ -250,9 +286,7 @@ func lastGoodPath(dataDir string) string { return filepath.Join(dataDir, "last-g
 func Load(path, dataDir string, validate func(engine.Config) error) (Loaded, error) {
 	loaded, err := load(path, dataDir, validate)
 	if err == nil {
-		if data, readErr := os.ReadFile(path); readErr == nil && path != "" && dataDir != "" {
-			engine.WriteAtomic(lastGoodPath(dataDir), data)
-		}
+		SaveLastGood(path, dataDir, loaded.User)
 		return loaded, nil
 	}
 	if dataDir == "" {
@@ -265,6 +299,18 @@ func Load(path, dataDir string, validate func(engine.Config) error) (Loaded, err
 	fallback.Fallback = true
 	fallback.Warnings = append([]string{"配置文件无效，正在使用上一次可用的配置：" + err.Error()}, fallback.Warnings...)
 	return fallback, nil
+}
+
+// SaveLastGood records the validated configuration used by the caller.
+func SaveLastGood(path, dataDir string, config engine.Config) error {
+	if path == "" || dataDir == "" {
+		return nil
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+	return engine.WriteAtomic(lastGoodPath(dataDir), data)
 }
 
 // Check validates path with its subscriptions, without any fallback.
@@ -296,7 +342,9 @@ func load(path, dataDir string, validate func(engine.Config) error) (Loaded, err
 	for _, sub := range user.Subscriptions {
 		snapshot, err := LoadSnapshot(dataDir, sub)
 		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("订阅「%s」还没有下载过", sub.Name))
+			if !sub.Paused {
+				warnings = append(warnings, fmt.Sprintf("订阅「%s」还没有下载过", sub.Name))
+			}
 			continue
 		}
 		snapshots[sub.Name] = snapshot

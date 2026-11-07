@@ -25,7 +25,7 @@ rules:
   - MATCH,Auto
 `
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.URL.Query().Get("token") != "fixture-only" || !strings.HasPrefix(request.UserAgent(), "clash/") {
+		if request.URL.Query().Get("token") != "fixture-only" || request.UserAgent() != "Clash.Meta/HopWay" {
 			http.Error(writer, "bad request", http.StatusBadRequest)
 			return
 		}

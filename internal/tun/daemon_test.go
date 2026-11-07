@@ -26,7 +26,7 @@ func TestServiceHandsOverOnlyToTheInstallingUser(t *testing.T) {
 	}
 	// The caller is uid 0 here (root may always ask); a stranger uid is refused.
 	done := make(chan error, 1)
-	go func() { done <- RunService(socket, 4242, create) }()
+	go func() { done <- RunService(socket, uint32(os.Geteuid()), create) }()
 	for !ServiceAvailable(socket) {
 	}
 	fd, name, err := OpenWithService(socket, false)
@@ -41,7 +41,7 @@ func TestServiceHandsOverOnlyToTheInstallingUser(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("service must exit after a hand-off: %v", err)
 	}
-	if info, err := os.Stat(socket); err == nil && info.Mode().Perm() != 0o666 {
+	if info, err := os.Stat(socket); err == nil && info.Mode().Perm() != 0o600 {
 		t.Fatalf("socket mode %v", info.Mode())
 	}
 }
@@ -66,7 +66,7 @@ func TestServiceRejectsOtherUsersAndVersions(t *testing.T) {
 	client.Env = append(os.Environ(), "HOPWAY_SERVICE_CLIENT="+socket)
 	client.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 4243, Gid: 4243}}
 	output, _ := client.CombinedOutput()
-	if !strings.Contains(string(output), "user 4243 is not allowed") {
+	if !strings.Contains(string(output), "permission denied") {
 		t.Fatalf("stranger was not refused: %s", output)
 	}
 	// A request with the wrong version is refused before anything is created.

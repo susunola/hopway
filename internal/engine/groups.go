@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -62,7 +63,7 @@ type choice struct {
 func validateGroups(groups []Group, known func(string) bool) (map[string]*group, error) {
 	result := make(map[string]*group, len(groups))
 	for _, g := range groups {
-		if g.Name == "" || known(g.Name) || result[g.Name] != nil || g.Name == "SELECT" {
+		if g.Name == "" || known(g.Name) || result[g.Name] != nil || (g.Name == "SELECT" || g.Name == "AUTO") {
 			return nil, fmt.Errorf("invalid or duplicate group name %q", g.Name)
 		}
 		switch g.Type {
@@ -130,6 +131,16 @@ func validateGroups(groups []Group, known func(string) bool) (map[string]*group,
 
 // choices expands an outbound name into ordered dial candidates. Caller holds engine.mu.
 func (engine *Engine) choices(name string) []choice {
+	if name == "AUTO" {
+		if engine.auto == nil || len(engine.auto.orderedCandidates) == 0 {
+			return []choice{{via: "REJECT"}}
+		}
+		list := make([]choice, 0, len(engine.auto.orderedCandidates))
+		for _, name := range engine.auto.orderedCandidates {
+			list = append(list, choice{via: name})
+		}
+		return list
+	}
 	g := engine.groups[name]
 	if g == nil {
 		return []choice{{via: name}}
@@ -241,6 +252,24 @@ func (engine *Engine) healthLoop(ctx context.Context, interval time.Duration) {
 
 // Probe measures names (all nodes if empty) concurrently and records results.
 func (engine *Engine) Probe(ctx context.Context, names []string) {
+	_ = engine.probeNodes(ctx, names, nil)
+}
+
+type ProbeResult struct {
+	Name         string `json:"name"`
+	Milliseconds int64  `json:"milliseconds,omitempty"`
+	Failure      string `json:"failure,omitempty"`
+}
+
+func (engine *Engine) ProbeResults(ctx context.Context, names []string, emit func(ProbeResult) error) error {
+	return engine.probeNodes(ctx, names, emit)
+}
+
+func (engine *Engine) probeNodes(ctx context.Context, names []string, emit func(ProbeResult) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var emitMu sync.Mutex
+	var emitErr error
 	if names == nil {
 		for name := range engine.dialers {
 			names = append(names, name)
@@ -269,8 +298,24 @@ func (engine *Engine) Probe(ctx context.Context, names []string) {
 						h.alive, h.latency, h.err = true, previous.latency, ""
 					}
 				}
-				engine.health[name] = h
+				if ctx.Err() == nil {
+					engine.health[name] = h
+				}
 				engine.mu.Unlock()
+				if emit != nil && ctx.Err() == nil {
+					result := ProbeResult{Name: name, Failure: h.err}
+					if h.alive {
+						result.Milliseconds = max(h.latency.Milliseconds(), 1)
+					}
+					emitMu.Lock()
+					if emitErr == nil {
+						emitErr = emit(result)
+						if emitErr != nil {
+							cancel()
+						}
+					}
+					emitMu.Unlock()
+				}
 			}
 		}()
 	}
@@ -282,6 +327,10 @@ func (engine *Engine) Probe(ctx context.Context, names []string) {
 	}
 	close(work)
 	wait.Wait()
+	if emitErr != nil {
+		return emitErr
+	}
+	return ctx.Err()
 }
 
 func (engine *Engine) probe(ctx context.Context, name string) (time.Duration, error) {
@@ -361,7 +410,44 @@ func (engine *Engine) Restore(runtime Runtime) {
 	for name, member := range runtime.Selections {
 		engine.SelectInGroup(name, member)
 	}
-	engine.SetPolicy(runtime.Policy)
+	if runtime.Policy.Mode == "auto" && runtime.Policy.Auto != nil {
+		config := *runtime.Policy.Auto
+		config.Groups = nil
+		for _, group := range runtime.Policy.Auto.Groups {
+			saved := group.Nodes
+			group.Nodes = nil
+			var providerNodes []string
+			if group.ProviderID != "" {
+				for _, sub := range engine.subscriptions {
+					if sub.Key() == group.ProviderID && !sub.Paused {
+						providerNodes = sub.Nodes
+						if sub.Alias != "" {
+							group.Name = sub.Alias
+						} else {
+							group.Name = sub.Name
+						}
+						break
+					}
+				}
+			}
+			for _, name := range saved {
+				if engine.types[name] != "" && (group.ProviderID == "" || slices.Contains(providerNodes, name)) {
+					group.Nodes = append(group.Nodes, name)
+				}
+			}
+			if len(group.Nodes) != 0 {
+				config.Groups = append(config.Groups, group)
+			}
+		}
+		if len(config.Groups) == 0 {
+			_ = engine.SetPolicy(Policy{Mode: "global", Selected: "REJECT"})
+			return
+		}
+		runtime.Policy.Auto = &config
+	}
+	if err := engine.SetPolicy(runtime.Policy); err != nil && runtime.Policy.Mode == "auto" {
+		_ = engine.SetPolicy(Policy{Mode: "global", Selected: "REJECT"})
+	}
 }
 
 // Active reports open connections.

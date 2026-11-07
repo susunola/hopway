@@ -22,7 +22,10 @@ import (
 	"mac-proxy/internal/wire"
 )
 
+const ConfigVersion = 1
+
 type Config struct {
+	Version   int             `json:"version,omitempty"`
 	SOCKSPort int             `json:"socksPort"`
 	HTTPPort  int             `json:"httpPort"`
 	Mode      string          `json:"mode"`
@@ -34,7 +37,8 @@ type Config struct {
 	Health    *Health         `json:"health,omitempty"`
 	// Subscriptions are merged in by the profile package; the engine only
 	// sees their nodes, groups and rules.
-	Subscriptions []Subscription `json:"subscriptions,omitempty"`
+	Subscriptions     []Subscription `json:"subscriptions,omitempty"`
+	SubscriptionNodes []string       `json:"subscriptionNodes,omitempty"` // inline nodes from older versions
 	// SystemProxy points macOS's proxy settings at HopWay while it runs.
 	SystemProxy bool `json:"systemProxy,omitempty"`
 	// TUN captures all traffic through a virtual network device.
@@ -52,9 +56,16 @@ type TUNConfig struct {
 
 // Subscription is a remote node list refreshed in the background.
 type Subscription struct {
-	Name     string `json:"name"`
-	URL      string `json:"url"`
-	Interval int    `json:"intervalSec,omitempty"` // default 12 hours
+	Name         string             `json:"name"`
+	ID           string             `json:"id,omitempty"`
+	Alias        string             `json:"alias,omitempty"`
+	Paused       bool               `json:"paused,omitempty"`
+	Agent        string             `json:"agent,omitempty"`
+	Usage        *SubscriptionUsage `json:"usage,omitempty"`
+	UsageSamples []UsageSample      `json:"usageSamples,omitempty"`
+	Nodes        []string           `json:"nodes,omitempty"`
+	URL          string             `json:"url"`
+	Interval     int                `json:"intervalSec,omitempty"` // default 6 hours
 }
 
 func Default() Config {
@@ -72,12 +83,17 @@ func Decode(reader io.Reader) (Config, error) {
 	if config == nil || decoder.Decode(new(any)) != io.EOF {
 		return Config{}, errors.New("expected one JSON configuration object")
 	}
+	if config.Version < 0 || config.Version > ConfigVersion {
+		return Config{}, fmt.Errorf("unsupported configuration version %d", config.Version)
+	}
+	config.Version = ConfigVersion
 	return *config, nil
 }
 
 type Policy struct {
-	Mode     string `json:"mode"`
-	Selected string `json:"selected"`
+	Auto     *AutoConfig `json:"auto,omitempty"`
+	Mode     string      `json:"mode"`
+	Selected string      `json:"selected"`
 }
 
 type NodeSummary struct {
@@ -124,6 +140,7 @@ type Record struct {
 }
 
 type Status struct {
+	Auto        *AutoStatus     `json:"auto,omitempty"`
 	Backend     string          `json:"backend"`
 	Policy      Policy          `json:"policy"`
 	Nodes       []NodeSummary   `json:"nodes"`
@@ -134,24 +151,28 @@ type Status struct {
 }
 
 type Engine struct {
-	mu          sync.Mutex
-	policy      Policy
-	backend     string
-	instance    backend.Instance
-	dialers     map[string]backend.Dialer
-	types       map[string]string
-	servers     map[string]string
-	order       []string
-	groups      map[string]*group
-	health      map[string]*nodeHealth
-	rules       *matcher
-	probeURL    string
-	sequence    uint64
-	live        map[uint64]*tracked
-	livePackets map[uint64]*trackedPacket
-	recent      []Record
-	ports       map[uint16]bool
-	stop        context.CancelFunc
+	auto          *autoState
+	autoWake      chan struct{}
+	subscriptions []Subscription
+	traffic       *TrafficLedger
+	mu            sync.Mutex
+	policy        Policy
+	backend       string
+	instance      backend.Instance
+	dialers       map[string]backend.Dialer
+	types         map[string]string
+	servers       map[string]string
+	order         []string
+	groups        map[string]*group
+	health        map[string]*nodeHealth
+	rules         *matcher
+	probeURL      string
+	sequence      uint64
+	live          map[uint64]*tracked
+	livePackets   map[uint64]*trackedPacket
+	recent        []Record
+	ports         map[uint16]bool
+	stop          context.CancelFunc
 
 	lookupProcess    func(client, server netip.AddrPort) (*process.Owner, error)
 	lookupProcessUDP func(client, server netip.AddrPort) (*process.Owner, error)
@@ -172,7 +193,7 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 		(config.SOCKSPort != 0 && config.SOCKSPort == config.HTTPPort) {
 		return nil, errors.New("proxy ports must be distinct or 0 for automatic assignment")
 	}
-	engine := &Engine{dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
+	engine := &Engine{subscriptions: config.Subscriptions, autoWake: make(chan struct{}, 1), dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL,
 		lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
@@ -181,7 +202,7 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 		engine.ports[uint16(port)] = true
 	}
 	for _, node := range config.Nodes {
-		if node.Name == "" || strings.TrimSpace(node.Name) != node.Name || engine.types[node.Name] != "" || node.Name == "SELECT" {
+		if node.Name == "" || strings.TrimSpace(node.Name) != node.Name || engine.types[node.Name] != "" || (node.Name == "SELECT" || node.Name == "AUTO") {
 			return nil, fmt.Errorf("invalid or duplicate node name %q", node.Name)
 		}
 		if err := node.Validate(); err != nil {
@@ -223,7 +244,7 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 			interval = config.Health.Interval
 		}
 	}
-	if err := engine.SetPolicy(Policy{config.Mode, config.Selected}); err != nil {
+	if err := engine.SetPolicy(Policy{Mode: config.Mode, Selected: config.Selected}); err != nil {
 		return nil, err
 	}
 	if impl == nil {
@@ -239,6 +260,7 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	engine.stop = cancel
+	go engine.MonitorAuto(ctx)
 	if len(engine.autoMembers()) != 0 {
 		go engine.healthLoop(ctx, time.Duration(interval)*time.Second)
 	}
@@ -296,15 +318,38 @@ func (engine *Engine) valid(name string) bool {
 	return engine.types[name] != "" || engine.groups[name] != nil
 }
 
-func (engine *Engine) SetPolicy(policy Policy) error {
-	if policy.Mode != "rule" && policy.Mode != "direct" && policy.Mode != "global" {
-		return errors.New("mode must be rule, direct or global")
+func (engine *Engine) ValidatePolicy(policy Policy) error {
+	if policy.Mode != "rule" && policy.Mode != "direct" && policy.Mode != "global" && policy.Mode != "auto" {
+		return errors.New("mode must be rule, direct, global or auto")
 	}
-	if !engine.valid(policy.Selected) {
+	if policy.Mode == "auto" {
+		if err := engine.validateAuto(policy.Auto); err != nil {
+			return err
+		}
+	} else if !engine.valid(policy.Selected) {
 		return errors.New("selected outbound does not exist")
 	}
+	return nil
+}
+
+func (engine *Engine) SetPolicy(policy Policy) error {
+	if err := engine.ValidatePolicy(policy); err != nil {
+		return err
+	}
 	engine.mu.Lock()
+	if engine.auto != nil && engine.auto.cancel != nil {
+		engine.auto.cancel()
+	}
+	engine.auto = nil
+	if policy.Mode == "auto" {
+		engine.auto = &autoState{config: policy.Auto, unavailable: engine.unavailableProviders(policy.Auto), health: make(map[string]autoNode), activeGroup: -1}
+		engine.auto.orderedCandidates = engine.auto.candidates()
+	}
 	engine.policy = policy
+	select {
+	case engine.autoWake <- struct{}{}:
+	default:
+	}
 	engine.mu.Unlock()
 	return nil
 }
@@ -328,6 +373,8 @@ func (engine *Engine) route(host string, policy Policy, owner func() *process.Ow
 	switch policy.Mode {
 	case "direct":
 		return "DIRECT", "direct mode"
+	case "auto":
+		return "AUTO", "automatic · " + policy.Auto.Region
 	case "global":
 		return policy.Selected, "global mode"
 	}
@@ -345,21 +392,35 @@ func (engine *Engine) route(host string, policy Policy, owner func() *process.Ow
 
 // Decide reports the outbound a connection to target would use, without
 // dialing. The TUN device uses it for UDP, which HopWay relays only directly.
-func (engine *Engine) Decide(target string) string {
+type RouteDecision struct {
+	Rule     string   `json:"rule"`
+	Path     []string `json:"path"`
+	Outbound string   `json:"outbound"`
+}
+
+func (engine *Engine) Explain(target string) (RouteDecision, error) {
 	host, _, err := wire.Split(target)
 	if err != nil {
-		return "REJECT"
+		return RouteDecision{}, errors.New("expected a host and port")
 	}
 	engine.mu.Lock()
 	policy := engine.policy
 	engine.mu.Unlock()
-	via, _ := engine.route(host, policy, nil)
+	via, rule := engine.route(host, policy, nil)
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if list := engine.choices(via); len(list) != 0 {
-		return list[0].via
+		return RouteDecision{Rule: rule, Path: list[0].route, Outbound: list[0].via}, nil
 	}
-	return "REJECT"
+	return RouteDecision{Rule: rule, Outbound: "REJECT"}, nil
+}
+
+func (engine *Engine) Decide(target string) string {
+	decision, err := engine.Explain(target)
+	if err != nil {
+		return "REJECT"
+	}
+	return decision.Outbound
 }
 
 func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Conn, error) {
@@ -553,12 +614,18 @@ type trackedPacket struct {
 func (conn *trackedPacket) ReadFrom(data []byte) (int, net.Addr, error) {
 	n, addr, err := conn.PacketConn.ReadFrom(data)
 	conn.recv.Add(uint64(max(n, 0)))
+	if n > 0 {
+		conn.engine.traffic.add(time.Now(), conn.record.Via, 0, uint64(n))
+	}
 	return n, addr, err
 }
 
 func (conn *trackedPacket) WriteTo(data []byte, addr net.Addr) (int, error) {
 	n, err := conn.PacketConn.WriteTo(data, addr)
 	conn.sent.Add(uint64(max(n, 0)))
+	if n > 0 {
+		conn.engine.traffic.add(time.Now(), conn.record.Via, uint64(n), 0)
+	}
 	return n, err
 }
 
@@ -679,6 +746,12 @@ func (engine *Engine) Status() Status {
 	records = append(records, engine.recent...)
 	status := Status{Backend: engine.backend, Policy: engine.policy, Connections: records, Active: len(engine.live) + len(engine.livePackets),
 		RuleSets: engine.ruleSetStatus()}
+	if state := engine.auto; state != nil {
+		status.Auto = &AutoStatus{Node: state.activeNode, Probing: state.probing}
+		if state.activeGroup >= 0 {
+			status.Auto.Provider = state.config.Groups[state.activeGroup].Name
+		}
+	}
 	for _, name := range engine.order {
 		summary := NodeSummary{Name: name, Type: engine.types[name]}
 		if g := engine.groups[name]; g != nil {
@@ -721,6 +794,9 @@ func (conn *tracked) snapshot() Record {
 
 func (conn *tracked) Read(data []byte) (int, error) {
 	count, err := conn.Conn.Read(data)
+	if conn.engine.traffic != nil && count > 0 {
+		conn.engine.traffic.add(time.Now(), conn.record.Via, 0, uint64(count))
+	}
 	if count > 0 && conn.recv.Add(uint64(count)) == uint64(count) {
 		conn.firstByte.Store(max(time.Since(conn.opened).Milliseconds(), 1))
 	}
@@ -732,6 +808,9 @@ func (conn *tracked) Read(data []byte) (int, error) {
 
 func (conn *tracked) Write(data []byte) (int, error) {
 	count, err := conn.Conn.Write(data)
+	if conn.engine.traffic != nil && count > 0 {
+		conn.engine.traffic.add(time.Now(), conn.record.Via, uint64(count), 0)
+	}
 	conn.sent.Add(uint64(count))
 	return count, err
 }

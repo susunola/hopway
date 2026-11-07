@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -46,8 +47,11 @@ func RunService(socketPath string, allowedUID uint32, create func(Options) (int,
 		return err
 	}
 	defer listener.Close()
-	// Anyone may connect; the peer credential check decides.
-	if err := os.Chmod(socketPath, 0o666); err != nil {
+	// Grant access to the installing user. Verify peer credentials as well.
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		return err
+	}
+	if err := os.Chown(socketPath, int(allowedUID), -1); err != nil {
 		return err
 	}
 	for {
@@ -66,22 +70,23 @@ func RunService(socketPath string, allowedUID uint32, create func(Options) (int,
 
 func serveRequest(conn *net.UnixConn, allowedUID uint32, create func(Options) (int, string, error)) bool {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 	reply := serviceReply{Version: ServiceVersion}
 	uid, err := peerUID(conn)
-	// Read the request before answering, so a refusal is not lost to a
-	// client that is still writing when the connection closes.
 	var request serviceRequest
-	decodeErr := json.NewDecoder(conn).Decode(&request)
 	switch {
 	case err != nil:
 		reply.Error = "cannot verify the caller: " + err.Error()
 	case uid != allowedUID && uid != 0:
 		reply.Error = fmt.Sprintf("user %d is not allowed to use this service", uid)
-	case decodeErr != nil:
-		reply.Error = "bad request"
-	case request.Version != ServiceVersion:
-		reply.Error = fmt.Sprintf("version mismatch (service %d, app %d): reinstall the service", ServiceVersion, request.Version)
+	default:
+		decoder := json.NewDecoder(io.LimitReader(conn, 1024))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			reply.Error = "bad request"
+		} else if request.Version != ServiceVersion {
+			reply.Error = fmt.Sprintf("version mismatch (service %d, app %d): reinstall the service", ServiceVersion, request.Version)
+		}
 	}
 	if reply.Error != "" {
 		json.NewEncoder(conn).Encode(reply)

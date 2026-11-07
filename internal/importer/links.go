@@ -59,8 +59,12 @@ func parseLink(raw string) (outbound.Node, error) {
 	if encryption := query.Get("encryption"); encryption != "" && encryption != "none" && kind == "vless" {
 		return node, errors.New("VLESS 加密扩展不受支持")
 	}
-	username := link.User.Username()
-	password, hasPassword := link.User.Password()
+	var username, password string
+	var hasPassword bool
+	if link.User != nil {
+		username = link.User.Username()
+		password, hasPassword = link.User.Password()
+	}
 	switch kind {
 	case "vless":
 		if hasPassword {

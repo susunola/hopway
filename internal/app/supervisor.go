@@ -5,11 +5,13 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -25,11 +27,13 @@ import (
 )
 
 type SubscriptionStatus struct {
-	Name    string `json:"name"`
-	URL     string `json:"url"`
-	Nodes   int    `json:"nodes"`
-	Updated int64  `json:"updated,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Name    string                    `json:"name"`
+	ID      string                    `json:"id"`
+	Alias   string                    `json:"alias,omitempty"`
+	Usage   *engine.SubscriptionUsage `json:"usage,omitempty"`
+	Nodes   int                       `json:"nodes"`
+	Updated int64                     `json:"updated,omitempty"`
+	Error   string                    `json:"error,omitempty"`
 }
 
 type SystemProxyStatus struct {
@@ -62,14 +66,17 @@ type Supervisor struct {
 	impl          backend.Backend
 	ports         []int
 
-	current atomic.Pointer[engine.Engine]
-	mu      sync.Mutex // serializes reloads; guards the fields below
-	loaded  profile.Loaded
-	subErr  map[string]string
-	subMeta map[string]SubscriptionStatus // nodes and update time of each snapshot
-	started time.Time
-	ctx     context.Context
-	cancel  context.CancelFunc
+	ledger     *engine.TrafficLedger
+	refreshMu  sync.Mutex
+	current    atomic.Pointer[engine.Engine]
+	mu         sync.Mutex // serializes reloads; guards the fields below
+	loaded     profile.Loaded
+	autoPolicy *engine.Policy
+	subErr     map[string]string
+	subMeta    map[string]SubscriptionStatus // nodes and update time of each snapshot
+	started    time.Time
+	ctx        context.Context
+	cancel     context.CancelFunc
 
 	proxy       *sysproxy.Manager
 	proxyTarget sysproxy.Target
@@ -100,6 +107,7 @@ func Open(path, dataDir string, impl backend.Backend) (*Supervisor, error) {
 		return nil, err
 	}
 	s.loaded = loaded
+	s.loadAutoPolicy()
 	s.readSnapshotMeta()
 	s.proxy = sysproxy.New(dataDir, nil)
 	if SystemProxySupported {
@@ -121,7 +129,7 @@ var SystemProxySupported = runtime.GOOS == "darwin"
 func (s *Supervisor) readSnapshotMeta() {
 	for _, sub := range s.loaded.User.Subscriptions {
 		if snapshot, err := profile.LoadSnapshot(s.dataDir, sub); err == nil {
-			s.subMeta[sub.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated}
+			s.subMeta[sub.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated, Usage: snapshot.Usage}
 		}
 	}
 }
@@ -137,12 +145,27 @@ func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
 	if err != nil {
 		return err
 	}
+	if s.path != "" {
+		ledger, err := engine.OpenTrafficLedger(filepath.Join(filepath.Dir(s.path), "traffic-history.json"))
+		if err == nil {
+			s.ledger = ledger
+			core.SetTrafficLedger(ledger)
+		} else {
+			s.loaded.Warnings = append(s.loaded.Warnings, "无法记录本机用量："+err.Error())
+		}
+	}
 	s.ports = ports
 	s.proxyTarget = target
 	s.started = time.Now()
+	if s.autoPolicy != nil {
+		core.Restore(engine.Runtime{Policy: *s.autoPolicy})
+	}
 	s.current.Store(core)
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	go s.subscriptionLoop()
+	if s.ledger != nil {
+		go s.flushTraffic()
+	}
 	go netmon.Watch(s.ctx, 3*time.Second, nil, s.networkChanged)
 	if s.loaded.Merged.SystemProxy {
 		s.SetSystemProxy(true)
@@ -339,6 +362,9 @@ func (s *Supervisor) Close() {
 	if core := s.current.Load(); core != nil {
 		core.Close()
 	}
+	if s.ledger != nil {
+		_ = s.ledger.Close()
+	}
 }
 
 var ErrPortsChanged = errors.New("listening ports changed; restart HopWay to apply")
@@ -352,7 +378,7 @@ func (s *Supervisor) Reload() error {
 }
 
 func (s *Supervisor) reloadLocked() error {
-	loaded, err := profile.Load(s.path, s.dataDir, s.validate)
+	loaded, err := profile.Check(s.path, s.dataDir, s.validate)
 	if err != nil {
 		return err
 	}
@@ -366,13 +392,21 @@ func (s *Supervisor) reloadLocked() error {
 	if err != nil {
 		return err
 	}
+	core.SetTrafficLedger(s.ledger)
 	if old != nil {
-		core.Restore(old.Runtime())
+		state := old.Runtime()
+		if s.autoPolicy != nil {
+			state.Policy = *s.autoPolicy
+		}
+		core.Restore(state)
 	}
 	s.loaded = loaded
 	s.readSnapshotMeta()
 	s.started = time.Now()
 	s.current.Store(core)
+	if err := profile.SaveLastGood(s.path, s.dataDir, loaded.User); err != nil {
+		s.loaded.Warnings = append(s.loaded.Warnings, "无法保存回滚配置")
+	}
 	if old != nil {
 		go retire(old)
 	}
@@ -400,7 +434,7 @@ func (s *Supervisor) Status() Status {
 	status.Reloaded = s.started.UnixMilli()
 	for _, sub := range s.loaded.User.Subscriptions {
 		entry := s.subMeta[sub.URL]
-		entry.Name, entry.URL, entry.Error = sub.Name, sub.URL, s.subErr[sub.Name]
+		entry.Name, entry.ID, entry.Alias, entry.Error = sub.Name, sub.Key(), sub.Alias, s.subErr[sub.Name]
 		status.Subscriptions = append(status.Subscriptions, entry)
 	}
 	return status
@@ -424,11 +458,28 @@ func (s *Supervisor) subscriptionLoop() {
 // they work where the subscription host is only reachable via a node. A
 // failed download keeps the previous snapshot.
 func (s *Supervisor) RefreshSubscriptions(ctx context.Context, force bool) {
+	s.refreshSubscriptions(ctx, force, "")
+}
+
+func (s *Supervisor) RefreshSubscription(ctx context.Context, id string) {
+	s.refreshSubscriptions(ctx, true, id)
+}
+
+func (s *Supervisor) refreshSubscriptions(ctx context.Context, force bool, id string) {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
 	s.mu.Lock()
-	subs := append([]engine.Subscription(nil), s.loaded.User.Subscriptions...)
+	user := s.loaded.User
+	subs := user.Subscriptions
 	s.mu.Unlock()
 	changed := false
 	for _, sub := range subs {
+		if sub.Paused || (id != "" && sub.Key() != id) {
+			continue
+		}
 		interval := time.Duration(sub.Interval) * time.Second
 		if sub.Interval == 0 {
 			interval = profile.DefaultInterval * time.Second
@@ -445,17 +496,14 @@ func (s *Supervisor) RefreshSubscriptions(ctx context.Context, force bool) {
 			},
 			ForceAttemptHTTP2: true,
 		}
-		snapshot, _, err := profile.Fetch(ctx, sub, s.impl, transport)
+		snapshot, err := profile.RefreshSnapshot(ctx, user, sub, s.dataDir, s.impl, transport)
 		transport.CloseIdleConnections()
-		if err == nil {
-			err = profile.SaveSnapshot(s.dataDir, sub, snapshot)
-		}
 		s.mu.Lock()
 		if err != nil {
 			s.subErr[sub.Name] = err.Error()
 		} else {
 			delete(s.subErr, sub.Name)
-			s.subMeta[sub.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated}
+			s.subMeta[sub.URL] = SubscriptionStatus{Nodes: len(snapshot.Nodes), Updated: snapshot.Updated, Usage: snapshot.Usage}
 			changed = true
 		}
 		s.mu.Unlock()
@@ -468,6 +516,67 @@ func (s *Supervisor) RefreshSubscriptions(ctx context.Context, force bool) {
 			s.mu.Lock()
 			s.loaded.Warnings = append(s.loaded.Warnings, "订阅已更新，但新配置无法应用："+err.Error())
 			s.mu.Unlock()
+		}
+	}
+}
+
+func (s *Supervisor) autoPolicyPath() string {
+	return filepath.Join(s.dataDir, "auto-policy.json")
+}
+
+func (s *Supervisor) loadAutoPolicy() {
+	if s.path == "" || s.dataDir == "" {
+		return
+	}
+	data, err := os.ReadFile(s.autoPolicyPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	var policy engine.Policy
+	if err != nil || json.Unmarshal(data, &policy) != nil || policy.Mode != "auto" || policy.Auto == nil {
+		s.loaded.Warnings = append(s.loaded.Warnings, "无法恢复上次的自动选路设置")
+		return
+	}
+	s.autoPolicy = &policy
+}
+
+func (s *Supervisor) SetPolicy(policy engine.Policy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	core := s.Engine()
+	if err := core.ValidatePolicy(policy); err != nil {
+		return err
+	}
+	if s.path != "" && s.dataDir != "" {
+		if policy.Mode == "auto" {
+			data, err := json.Marshal(policy)
+			if err != nil {
+				return err
+			}
+			if err := engine.WriteAtomic(s.autoPolicyPath(), data); err != nil {
+				return errors.New("无法保存自动选路设置")
+			}
+		} else if err := os.Remove(s.autoPolicyPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return errors.New("无法清除上次的自动选路设置")
+		}
+	}
+	if policy.Mode == "auto" {
+		s.autoPolicy = &policy
+	} else {
+		s.autoPolicy = nil
+	}
+	return core.SetPolicy(policy)
+}
+
+func (s *Supervisor) flushTraffic() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			_ = s.ledger.Flush()
 		}
 	}
 }

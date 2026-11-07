@@ -13,6 +13,7 @@ struct Endpoint: Decodable {
 struct Policy: Codable, Equatable {
     var mode: String
     var selected: String
+    var auto: AutoRoutingConfig? = nil
 }
 
 struct ProxyStatus: Decodable {
@@ -119,11 +120,10 @@ struct ProxyStatus: Decodable {
 
     struct Subscription: Decodable, Identifiable {
         let name: String
-        let url: String
+        let id: String
         let nodes: Int
         let updated: Double?
         let error: String?
-        var id: String { url }
     }
 
     struct RuleSet: Decodable, Identifiable {
@@ -135,6 +135,7 @@ struct ProxyStatus: Decodable {
     }
 
     let policy: Policy
+    let auto: AutoRoutingStatus?
     let warnings: [String]?
     let groups: [PolicyGroup]?
     let subscriptions: [Subscription]?
@@ -164,12 +165,27 @@ final class CoreModel: ObservableObject {
     @Published private(set) var endpoint: Endpoint?
     @Published private(set) var status: ProxyStatus?
     @Published private(set) var message: String?
+    @Published private(set) var verifying = false
+    @Published private(set) var verification: String?
     @Published private(set) var saving = false
     @Published private(set) var updatingPolicy = false
+    @Published private(set) var trafficHistory: TrafficHistory?
+    @Published private(set) var subscriptions: [SubscriptionSummary] = []
+    @Published private(set) var configuredNodes: [ProxyStatus.Node] = []
+    @Published private(set) var importCount = 0
+    @Published private(set) var hiddenNodes: Set<String> = []
+    @Published private(set) var probeResults: [String: NodeProbeResult] = [:]
+    @Published private(set) var probePending: Set<String> = []
+    @Published private(set) var probeTotal = 0
     @Published var draft = ""
     private var announcedRecovery = false
     @Published private(set) var saved = ""
 
+    private var trafficModifiedAt: Date?
+    private var quotaRefreshTask: Task<Void, Never>?
+    private var probeFailures: [String: Int] = [:]
+    private var lastRecoveryAttempt: Date?
+    private var probeProcess: Process?
     private var process: Process?
     private var input: FileHandle?
     private var polling: Task<Void, Never>?
@@ -178,11 +194,14 @@ final class CoreModel: ObservableObject {
         configuration.connectionProxyDictionary = [
             "HTTPEnable": 0, "HTTPSEnable": 0, "SOCKSEnable": 0, "ProxyAutoConfigEnable": 0
         ]
-        configuration.timeoutIntervalForRequest = 3
+        configuration.timeoutIntervalForRequest = 8
         return URLSession(configuration: configuration)
     }()
 
     private let configURL: URL
+    private var trafficURL: URL {
+        configURL.deletingLastPathComponent().appendingPathComponent("traffic-history.json")
+    }
     private let executable = Bundle.main.url(forResource: "mac-proxy-core", withExtension: nil)
 
     init() {
@@ -201,7 +220,19 @@ final class CoreModel: ObservableObject {
             message = error.localizedDescription
         }
         draft = saved
+        reloadConfiguredNodes()
+        reloadTraffic()
+        quotaRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                if Task.isCancelled { return }
+                self?.reloadTraffic()
+                self?.retryUnavailableNodes()
+            }
+        }
     }
+
+    deinit { quotaRefreshTask?.cancel() }
 
     var changed: Bool { draft != saved }
 
@@ -226,7 +257,21 @@ final class CoreModel: ObservableObject {
         }
     }
 
-    private func start() {
+    var canConnectToNode: Bool {
+        !saving && !updatingPolicy && (phase == .stopped || phase == .running)
+    }
+
+    func connectToNode(_ name: String) {
+        guard canConnectToNode, configuredNodes.contains(where: { $0.name == name }) else { return }
+        let policy = Policy(mode: "global", selected: name)
+        if phase == .stopped {
+            start(policy: policy)
+        } else {
+            updatePolicy(policy)
+        }
+    }
+
+    private func start(policy: Policy? = nil) {
         guard !saving, let executable else {
             if self.executable == nil { message = "App 内缺少代理内核。" }
             return
@@ -265,6 +310,10 @@ final class CoreModel: ObservableObject {
                 }
                 let info = try JSONDecoder().decode(Endpoint.self, from: data)
                 guard process === child, phase == .starting else { return }
+                if let policy {
+                    try await applyPolicy(policy, to: info)
+                    guard process === child, phase == .starting else { return }
+                }
                 endpoint = info
                 phase = .running
                 polling = Task {
@@ -308,6 +357,8 @@ final class CoreModel: ObservableObject {
         input = nil
         process = nil
         endpoint = nil
+        verification = nil
+        verifying = false
         status = nil
         updatingPolicy = false
         phase = .stopped
@@ -315,6 +366,7 @@ final class CoreModel: ObservableObject {
 
     private func call(_ info: Endpoint, path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
         var request = URLRequest(url: info.control.appendingPathComponent(path))
+        if path == "verify" { request.timeoutInterval = 8 }
         request.httpMethod = method
         request.httpBody = body
         request.setValue("Bearer " + info.token, forHTTPHeaderField: "Authorization")
@@ -338,11 +390,66 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    func verifyConnection() {
+        guard let info = endpoint, !verifying else { return }
+        verifying = true
+        verification = nil
+        Task {
+            let result: String
+            do {
+                _ = try await call(info, path: "verify", method: "POST")
+                result = "当前路由已通过 HTTPS 联网验证"
+            } catch {
+                result = "联网验证失败 · " + error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard endpoint?.token == info.token else { return }
+            verifying = false
+            verification = result
+            await refresh(info)
+        }
+    }
+
+    struct RouteDecision: Decodable {
+        let rule: String
+        let path: [String]?
+        let outbound: String
+    }
+
+    func explainRoute(_ host: String) async throws -> RouteDecision {
+        guard let info = endpoint else { throw CoreError(message: "请先启动内核。") }
+        var address = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if address.hasPrefix("[") && address.hasSuffix("]") {
+            address += ":443"
+        } else if !address.contains(":") {
+            address += ":443"
+        } else if address.filter({ $0 == ":" }).count > 1 && !address.hasPrefix("[") {
+            address = "[\(address)]:443"
+        }
+        var url = URLComponents(url: info.control.appendingPathComponent("route"), resolvingAgainstBaseURL: false)
+        url?.queryItems = [URLQueryItem(name: "target", value: address)]
+        guard let target = url?.url else { throw CoreError(message: "地址无效。") }
+        var request = URLRequest(url: target)
+        request.setValue("Bearer " + info.token, forHTTPHeaderField: "Authorization")
+        let (data, response) = try await session.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw CoreError(message: "请输入域名、IP 或主机与端口。")
+        }
+        return try JSONDecoder().decode(RouteDecision.self, from: data)
+    }
+
     private func refresh(_ info: Endpoint) async {
         do {
             let data = try await call(info, path: "status")
             guard endpoint?.token == info.token else { return }
-            status = try JSONDecoder().decode(ProxyStatus.self, from: data)
+            let snapshot = try JSONDecoder().decode(ProxyStatus.self, from: data)
+            let before = status?.subscriptions?.map(\.updated)
+            if let previous = status,
+               previous.policy != snapshot.policy || previous.auto?.node != snapshot.auto?.node {
+                verification = nil
+            }
+            status = snapshot
+            if before != snapshot.subscriptions?.map(\.updated) { reloadConfiguredNodes() }
+            reloadTraffic()
             if message == nil, let warnings = status?.warnings, !warnings.isEmpty {
                 message = warnings.joined(separator: "；")
             }
@@ -363,12 +470,16 @@ final class CoreModel: ObservableObject {
         Task {
             defer { if endpoint?.token == info.token { updatingPolicy = false } }
             do {
-                _ = try await call(info, path: "policy", method: "PUT", body: JSONEncoder().encode(policy))
+                try await applyPolicy(policy, to: info)
                 await refresh(info)
             } catch {
                 if endpoint?.token == info.token { message = error.localizedDescription }
             }
         }
+    }
+
+    private func applyPolicy(_ policy: Policy, to info: Endpoint) async throws {
+        _ = try await call(info, path: "policy", method: "PUT", body: JSONEncoder().encode(policy))
     }
 
     /// Points macOS's proxy settings at HopWay, or restores the user's own.
@@ -452,14 +563,280 @@ final class CoreModel: ObservableObject {
         status?.nodes.first(where: { $0.name == name })?.label ?? name
     }
 
+    func renameSubscription(_ id: String, to name: String) {
+        let alias = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard alias.count <= 80 else {
+            message = "订阅名称最多 80 个字符。"
+            return
+        }
+        updateSubscription(id, success: alias.isEmpty ? "已恢复默认订阅名称。" : "订阅名称已更新。") { records, index, _ in
+            records[index]["alias"] = alias.isEmpty ? nil : alias
+        }
+    }
+
+    func pauseSubscription(_ id: String, paused: Bool) {
+        updateSubscription(id, success: paused ? "订阅已暂停。" : "订阅已恢复。") { records, index, _ in
+            records[index]["paused"] = paused ? true : nil
+        }
+    }
+
+    func removeSubscription(_ id: String) {
+        updateSubscription(id, success: "订阅已移除。") { records, index, config in
+            let removed = Set(records.remove(at: index)["nodes"] as? [String] ?? [])
+            let shared = Set(records.flatMap { $0["nodes"] as? [String] ?? [] })
+            let orphaned = removed.subtracting(shared)
+            if let nodes = config["nodes"] as? [[String: Any]] {
+                config["nodes"] = nodes.filter { !orphaned.contains($0["name"] as? String ?? "") }
+            }
+            if let managed = config["subscriptionNodes"] as? [String] {
+                config["subscriptionNodes"] = managed.filter { !orphaned.contains($0) }
+            }
+        }
+    }
+
+    private func updateSubscription(
+        _ id: String, success: String,
+        edit: (inout [[String: Any]], Int, inout [String: Any]) -> Void
+    ) {
+        guard !saving, let executable else { return }
+        guard !changed else {
+            message = "请先保存配置草稿，再修改订阅。"
+            return
+        }
+        let originalName = subscriptions.first(where: { $0.id == id })?.originalName
+        guard var config = (try? JSONSerialization.jsonObject(with: Data(saved.utf8))) as? [String: Any],
+              var records = config["subscriptions"] as? [[String: Any]],
+              let index = records.firstIndex(where: {
+                  ($0["id"] as? String) == id ||
+                  ($0["id"] == nil && $0["name"] as? String == originalName)
+              }) else {
+            message = "找不到这份订阅，请刷新列表后重试。"
+            return
+        }
+        edit(&records, index, &config)
+        config["subscriptions"] = records
+        guard let json = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) else {
+            message = "无法保存订阅。"
+            return
+        }
+        let text = String(decoding: json, as: UTF8.self)
+        let destination = configURL
+        saving = true
+        Task {
+            defer { saving = false }
+            do {
+                try await Task.detached {
+                    try Self.validateAndSave(text, to: destination, with: executable)
+                }.value
+                draft = text
+                saved = text
+                reloadConfiguredNodes()
+                let applied = phase == .running ? " " + (await applyRunning()) : ""
+                message = success + applied
+            } catch {
+                message = "无法保存订阅 · " + error.localizedDescription
+            }
+        }
+    }
+
+    private func reloadTraffic() {
+        guard let modified = try? trafficURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+              modified != trafficModifiedAt,
+              let data = try? Data(contentsOf: trafficURL),
+              let history = try? JSONDecoder().decode(TrafficHistory.self, from: data) else { return }
+        trafficModifiedAt = modified
+        trafficHistory = history
+    }
+
+    private func retryUnavailableNodes() {
+        let now = Date()
+        guard probeProcess == nil, !saving,
+              lastRecoveryAttempt.map({ now.timeIntervalSince($0) >= 120 }) ?? true else { return }
+        let names = configuredNodes.map(\.name).filter { (probeFailures[$0] ?? 0) > 0 }
+        guard !names.isEmpty else { return }
+        lastRecoveryAttempt = now
+        runProbe(names, all: false, showSummary: false)
+    }
+
+    func testNodes(_ name: String? = nil) {
+        let names = configuredNodes.map(\.name).filter { name == nil || $0 == name }
+        runProbe(names, all: name == nil, showSummary: true)
+    }
+
+    private func runProbe(_ names: [String], all: Bool, showSummary: Bool) {
+        guard probeProcess == nil, !saving, !names.isEmpty, let executable else { return }
+        let child = Process()
+        child.executableURL = executable
+        child.arguments = ["-probe", "-config", configURL.path]
+        if !all {
+            for name in names { child.arguments?.append(contentsOf: ["-probe-node", name]) }
+        }
+        let output = Pipe()
+        child.standardOutput = output
+        child.standardError = FileHandle.nullDevice
+        do {
+            try child.run()
+        } catch {
+            message = "无法启动测速 · " + error.localizedDescription
+            return
+        }
+        probeProcess = child
+        probePending = Set(names)
+        probeTotal = names.count
+        if showSummary { message = nil }
+        Task {
+            var available = 0
+            var interrupted = false
+            do {
+                for try await result in Self.probeOutput(child, reader: output.fileHandleForReading) {
+                    guard probeProcess === child else { return }
+                    guard probePending.remove(result.name) != nil else { continue }
+                    probeResults[result.name] = result
+                    if result.failure == nil {
+                        available += 1
+                        probeFailures.removeValue(forKey: result.name)
+                        hiddenNodes.remove(result.name)
+                    } else {
+                        let failures = min(2, (probeFailures[result.name] ?? 0) + 1)
+                        probeFailures[result.name] = failures
+                        if failures == 2 { hiddenNodes.insert(result.name) }
+                    }
+                }
+            } catch {
+                interrupted = true
+            }
+            if probeProcess === child {
+                let remaining = probePending.count
+                let completed = probeTotal - remaining
+                if showSummary {
+                    if interrupted || remaining > 0 {
+                        message = "测速未完整结束 · 已完成 \(completed)/\(probeTotal)，剩余 \(remaining) 个。"
+                    } else {
+                        message = "测速完成 · \(completed) 个节点，\(available) 个可用，\(completed - available) 个失败或超时。"
+                    }
+                }
+                probeProcess = nil
+                probePending = []
+                probeTotal = 0
+            }
+        }
+    }
+
+    func cancelProbe() {
+        if let child = probeProcess, child.isRunning { child.terminate() }
+        probeProcess = nil
+        probePending = []
+        probeTotal = 0
+    }
+
+    nonisolated private static func probeOutput(_ child: Process, reader: FileHandle) -> AsyncThrowingStream<NodeProbeResult, Error> {
+        AsyncThrowingStream { continuation in
+            Task.detached {
+                do {
+                    var pending = Data()
+                    let decoder = JSONDecoder()
+                    while let chunk = try reader.read(upToCount: 4096), !chunk.isEmpty {
+                        pending.append(chunk)
+                        while let newline = pending.firstIndex(of: 10) {
+                            continuation.yield(try decoder.decode(NodeProbeResult.self, from: pending[..<newline]))
+                            pending.removeSubrange(...newline)
+                        }
+                    }
+                    child.waitUntilExit()
+                    guard child.terminationStatus == 0, pending.isEmpty else {
+                        throw CoreError(message: "测速进程退出。")
+                    }
+                    continuation.finish()
+                } catch {
+                    if child.isRunning { child.terminate() }
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func reloadConfiguredNodes() {
+        guard let executable else { return }
+        guard FileManager.default.fileExists(atPath: configURL.path) else { return }
+        let destination = configURL
+        let version = saved
+        Task {
+            guard let data = try? await Task.detached(operation: {
+                try Self.runProfileCommand("-inspect", at: destination, executable: executable)
+            }).value, version == saved else { return }
+            struct Profile: Decodable {
+                let nodes: [ProxyStatus.Node]?
+                let subscriptions: [SubscriptionSummary]?
+            }
+            guard let profile = try? JSONDecoder().decode(Profile.self, from: data) else { return }
+            configuredNodes = profile.nodes ?? []
+            subscriptions = profile.subscriptions ?? []
+            let names = Set(configuredNodes.map(\.name))
+            hiddenNodes.formIntersection(names)
+            probeResults = probeResults.filter { names.contains($0.key) }
+            probeFailures = probeFailures.filter { names.contains($0.key) }
+        }
+    }
+
+    func refreshUsage() { refreshSubscriptions(checkNodes: false) }
+    func refreshNodes() { refreshSubscriptions(checkNodes: true) }
+
+    func refreshSubscription(_ id: String) { refreshSubscriptions(checkNodes: false, id: id) }
+
+    private func refreshSubscriptions(checkNodes: Bool, id: String? = nil) {
+        guard !saving, let executable else { return }
+        if !subscriptions.contains(where: { !$0.isPaused && (id == nil || $0.id == id) }) {
+            if checkNodes { testNodes() }
+            return
+        }
+        if endpoint != nil {
+            let path = id.map { "subscriptions/" + $0 + "/refresh" } ?? "subscriptions/refresh"
+            trigger(path, done: "正在刷新订阅…")
+            return
+        }
+        saving = true
+        let destination = configURL
+        Task {
+            defer { saving = false }
+            do {
+                let data = try await Task.detached {
+                    try Self.runProfileCommand("-refresh-subscriptions", at: destination, executable: executable, subscriptionID: id)
+                }.value
+                let result = try JSONDecoder().decode([String: Int].self, from: data)
+                message = "已刷新 \(result["updated"] ?? 0) 份订阅 · \(result["failed"] ?? 0) 份失败"
+                reloadConfiguredNodes()
+            } catch {
+                message = "刷新失败 · " + error.localizedDescription
+            }
+        }
+    }
+
+    nonisolated private static func runProfileCommand(_ flag: String, at destination: URL, executable: URL, subscriptionID: String? = nil) throws -> Data {
+        let child = Process()
+        let output = Pipe()
+        child.executableURL = executable
+        child.arguments = [flag, "-config", destination.path]
+        if let subscriptionID { child.arguments?.append(contentsOf: ["-subscription-id", subscriptionID]) }
+        child.standardOutput = output
+        child.standardError = FileHandle.nullDevice
+        try child.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        child.waitUntilExit()
+        guard child.terminationStatus == 0 else { throw CoreError(message: "内核命令失败。") }
+        return data
+    }
+
     func importClipboard() {
+        importContent(NSPasteboard.general.string(forType: .string) ?? "")
+    }
+
+    func importContent(_ raw: String) {
         guard !saving, let executable else { return }
         guard !changed else {
             message = "请先保存配置草稿，再导入节点。"
             return
         }
-        guard let raw = NSPasteboard.general.string(forType: .string),
-              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             message = "请先复制订阅地址、节点链接或 Clash 配置。"
             return
         }
@@ -474,6 +851,8 @@ final class CoreModel: ObservableObject {
                 }.value
                 draft = text
                 saved = text
+                reloadConfiguredNodes()
+                importCount += 1
                 var next = "启动后可在概览切换出站。"
                 if phase == .running {
                     next = await applyRunning()
@@ -485,7 +864,40 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    struct ImportPreview: Decodable {
+        let added: Int
+        let skipped: Int
+        let notes: [String]
+    }
+
+    func previewImport(_ raw: String) async throws -> ImportPreview {
+        guard let executable, !changed else {
+            throw CoreError(message: "请先保存配置草稿，再预览导入。")
+        }
+        let destination = configURL
+        let data = try await Task.detached {
+            try Self.convert(raw, from: destination, with: executable, preview: true)
+        }.value
+        return try JSONDecoder().decode(ImportPreview.self, from: data)
+    }
+
     nonisolated private static func convertAndSave(_ raw: String, to destination: URL, with executable: URL) throws -> (String, String) {
+        let data = try convert(raw, from: destination, with: executable, preview: false)
+        guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let config = result["config"] as? [String: Any],
+              let added = result["added"] as? Int,
+              let skipped = result["skipped"] as? Int,
+              let notes = result["notes"] as? [String] else {
+            throw CoreError(message: "内核返回的导入结果无效。")
+        }
+        let json = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+        let text = String(decoding: json, as: UTF8.self)
+        try validateAndSave(text, to: destination, with: executable)
+        let summary = ["已导入 \(added) 个节点，跳过 \(skipped) 个。"] + notes
+        return (text, summary.joined(separator: " "))
+    }
+
+    nonisolated private static func convert(_ raw: String, from destination: URL, with executable: URL, preview: Bool) throws -> Data {
         guard raw.utf8.count <= 1_048_576 else { throw CoreError(message: "导入内容上限为 1 MB。") }
         let files = FileManager.default
         let directory = files.temporaryDirectory.appendingPathComponent("hopway-" + UUID().uuidString)
@@ -502,7 +914,7 @@ final class CoreModel: ObservableObject {
         child.executableURL = executable
         // Always name the config path, even before the file exists: the core
         // keeps subscription caches next to it.
-        child.arguments = ["-import", "-config", destination.path]
+        child.arguments = [preview ? "-preview-import" : "-import", "-config", destination.path]
         child.standardInput = input
         child.standardOutput = output
         child.standardError = output
@@ -513,18 +925,7 @@ final class CoreModel: ObservableObject {
             let explanation = String(decoding: data.prefix(2048), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
             throw CoreError(message: explanation.isEmpty ? "内核无法完成导入。" : explanation)
         }
-        guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let config = result["config"] as? [String: Any],
-              let added = result["added"] as? Int,
-              let skipped = result["skipped"] as? Int,
-              let notes = result["notes"] as? [String] else {
-            throw CoreError(message: "内核返回的导入结果无效。")
-        }
-        let json = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-        let text = String(decoding: json, as: UTF8.self)
-        try validateAndSave(text, to: destination, with: executable)
-        let summary = ["已导入 \(added) 个节点，跳过 \(skipped) 个。"] + notes
-        return (text, summary.joined(separator: " "))
+        return data
     }
 
     func importDraft() {
@@ -580,6 +981,7 @@ final class CoreModel: ObservableObject {
             do {
                 try await Task.detached { try Self.validateAndSave(candidate, to: destination, with: executable) }.value
                 saved = candidate
+                reloadConfiguredNodes()
                 if phase == .running {
                     let applied = await applyRunning()
                     message = "配置已保存，" + applied

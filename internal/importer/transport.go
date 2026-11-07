@@ -16,6 +16,7 @@ type spec struct {
 	network     string // tcp, ws, grpc, h2, httpupgrade
 	path        string
 	host        string
+	headers     map[string]string
 	serviceName string
 	earlyData   int
 	earlyHeader string
@@ -56,8 +57,15 @@ func (s *spec) apply(node *outbound.Node) error {
 		if path != "" {
 			transport["path"] = path
 		}
-		if s.host != "" {
-			transport["headers"] = map[string]any{"Host": s.host}
+		if s.host != "" || len(s.headers) != 0 {
+			headers := make(map[string]string, len(s.headers)+1)
+			for name, value := range s.headers {
+				headers[name] = value
+			}
+			if s.host != "" {
+				headers["Host"] = s.host
+			}
+			transport["headers"] = headers
 		}
 		if s.earlyData > 0 {
 			transport["max_early_data"] = s.earlyData
@@ -93,6 +101,9 @@ func (s *spec) apply(node *outbound.Node) error {
 		}
 		if s.host != "" {
 			transport["host"] = s.host
+		}
+		if len(s.headers) != 0 {
+			transport["headers"] = s.headers
 		}
 		options["transport"] = transport
 	default:

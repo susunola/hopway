@@ -43,6 +43,13 @@ func main() {
 	port := flag.Int("port", -1, "override the SOCKS5 listen port")
 	check := flag.Bool("check", false, "validate configuration and exit")
 	managed := flag.Bool("managed", false, "start the local control API and exit when stdin closes")
+	inspect := flag.Bool("inspect", false, "print the effective configuration's node and subscription summaries")
+	probe := flag.Bool("probe", false, "measure latency through configured nodes")
+	var probeNames []string
+	flag.Func("probe-node", "probe only this node (repeatable)", func(name string) error { probeNames = append(probeNames, name); return nil })
+	refreshID := flag.String("subscription-id", "", "refresh only this subscription")
+	refresh := flag.Bool("refresh-subscriptions", false, "refresh saved subscriptions without starting the proxy")
+	previewImport := flag.Bool("preview-import", false, "preview a subscription or profile from stdin without writing it")
 	importInput := flag.Bool("import", false, "read a subscription URL or profile from stdin and print converted JSON")
 	tunHelper := flag.String("tun-helper", "", "internal: create the TUN device as root and hand it to the core over this socket")
 	tunIPv6 := flag.Bool("tun-ipv6", false, "internal: give the helper's TUN device an IPv6 address and route")
@@ -74,10 +81,25 @@ func main() {
 		}
 		return
 	}
-	if *importInput {
-		result, err := runImport(*path)
+	if *inspect || *probe || *refresh {
+		if err := inspectProfile(*path, *inspect, *probe, *refresh, probeNames, *refreshID); err != nil {
+			log.SetFlags(0)
+			log.Fatal(err)
+		}
+		return
+	}
+	if *importInput || *previewImport {
+		result, err := runImport(*path, *previewImport)
 		if err == nil {
-			err = json.NewEncoder(os.Stdout).Encode(result)
+			if *previewImport {
+				err = json.NewEncoder(os.Stdout).Encode(struct {
+					Added   int      `json:"added"`
+					Skipped int      `json:"skipped"`
+					Notes   []string `json:"notes"`
+				}{Added: result.Added, Skipped: result.Skipped, Notes: result.Notes})
+			} else {
+				err = json.NewEncoder(os.Stdout).Encode(result)
+			}
 		}
 		if err != nil {
 			log.SetFlags(0)
@@ -97,7 +119,7 @@ func main() {
 // runImport converts pasted input. A subscription URL becomes a subscription
 // entry (its nodes are cached and refreshed automatically); anything else is
 // merged into the configuration as before.
-func runImport(path string) (importer.Result, error) {
+func runImport(path string, preview bool) (importer.Result, error) {
 	base, err := loadConfig(path)
 	if errors.Is(err, os.ErrNotExist) {
 		base, err = engine.Default(), nil
@@ -109,9 +131,19 @@ func runImport(path string) (importer.Result, error) {
 	if err != nil {
 		return importer.Result{}, err
 	}
+	if len(data) > importer.MaxSize {
+		return importer.Result{}, errors.New("导入内容过大")
+	}
 	raw := strings.TrimSpace(strings.TrimPrefix(string(data), "\ufeff"))
 	impl := backend.Default()
-	if !strings.ContainsAny(raw, " \r\n\t") && (strings.HasPrefix(raw, "https://") || strings.HasPrefix(raw, "http://")) {
+	source, _, _, err := importer.SubscriptionLink(raw)
+	if err != nil {
+		return importer.Result{}, err
+	}
+	if source != nil {
+		if preview {
+			return profile.PreviewSubscription(context.Background(), base, raw, dataDir(path), impl)
+		}
 		return profile.Subscribe(context.Background(), base, raw, dataDir(path), impl)
 	}
 	result, err := importer.Import(context.Background(), strings.NewReader(raw), base, impl)
@@ -255,16 +287,53 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 		writer.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(writer).Encode(supervisor.Status())
 	})
+	router.HandleFunc("GET /route", func(writer http.ResponseWriter, request *http.Request) {
+		decision, err := core().Explain(request.URL.Query().Get("target"))
+		if err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(decision)
+	})
+	router.HandleFunc("POST /verify", func(writer http.ResponseWriter, request *http.Request) {
+		transport := &http.Transport{
+			DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
+				return supervisor.Dial(ctx, "verification", address)
+			},
+			DisableKeepAlives: true,
+		}
+		defer transport.CloseIdleConnections()
+		client := http.Client{Transport: transport, Timeout: 6 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+		probe, err := http.NewRequestWithContext(request.Context(), http.MethodGet, "https://www.gstatic.com/generate_204", nil)
+		if err != nil {
+			http.Error(writer, "无法创建联网验证请求", http.StatusInternalServerError)
+			return
+		}
+		response, err := client.Do(probe)
+		if err != nil {
+			http.Error(writer, "当前路由无法访问测试地址", http.StatusBadGateway)
+			return
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusNoContent {
+			http.Error(writer, fmt.Sprintf("测试地址返回 HTTP %d", response.StatusCode), http.StatusBadGateway)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	})
 	router.HandleFunc("PUT /policy", func(writer http.ResponseWriter, request *http.Request) {
 		var policy engine.Policy
-		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 4096))
+		decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 64<<10))
 		decoder.DisallowUnknownFields()
 		err := decoder.Decode(&policy)
 		if err == nil && decoder.Decode(new(any)) != io.EOF {
 			err = errors.New("expected one policy object")
 		}
 		if err == nil {
-			err = core().SetPolicy(policy)
+			err = supervisor.SetPolicy(policy)
 		}
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
@@ -300,6 +369,11 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	})
 	router.HandleFunc("POST /subscriptions/refresh", func(writer http.ResponseWriter, request *http.Request) {
 		go supervisor.RefreshSubscriptions(context.Background(), true)
+		writer.WriteHeader(http.StatusAccepted)
+	})
+	router.HandleFunc("POST /subscriptions/{id}/refresh", func(writer http.ResponseWriter, request *http.Request) {
+		id := request.PathValue("id")
+		go supervisor.RefreshSubscription(context.Background(), id)
 		writer.WriteHeader(http.StatusAccepted)
 	})
 	// Reload applies a saved configuration without restarting: open
@@ -368,4 +442,58 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 		}
 		router.ServeHTTP(writer, request)
 	})
+}
+
+func inspectProfile(path string, inspect, probe, refresh bool, names []string, refreshID string) error {
+	impl := backend.Default()
+	validate := func(config engine.Config) error { return engine.Validate(config, impl) }
+	dir := dataDir(path)
+	loaded, err := profile.Check(path, dir, validate)
+	if err != nil {
+		return err
+	}
+	output := json.NewEncoder(os.Stdout)
+	if refresh {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		updated, failed := 0, 0
+		for _, sub := range loaded.User.Subscriptions {
+			if sub.Paused || (refreshID != "" && sub.Key() != refreshID) {
+				continue
+			}
+			_, err := profile.RefreshSnapshot(ctx, loaded.User, sub, dir, impl, nil)
+			if err != nil {
+				failed++
+			} else {
+				updated++
+			}
+		}
+		return output.Encode(map[string]int{"updated": updated, "failed": failed})
+	}
+	if inspect {
+		type summary struct {
+			Nodes []engine.NodeSummary  `json:"nodes"`
+			Subs  []engine.Subscription `json:"subscriptions"`
+		}
+		result := summary{Subs: loaded.Merged.Subscriptions}
+		for i := range result.Subs {
+			result.Subs[i].ID = result.Subs[i].Key()
+			result.Subs[i].URL = ""
+		}
+		for _, node := range loaded.Merged.Nodes {
+			result.Nodes = append(result.Nodes, engine.NodeSummary{Name: node.Name, Type: node.Type})
+		}
+		return output.Encode(result)
+	}
+	if probe {
+		core, err := engine.New(loaded.Merged, impl)
+		if err != nil {
+			return err
+		}
+		defer core.Close()
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return core.ProbeResults(ctx, names, func(result engine.ProbeResult) error { return output.Encode(result) })
+	}
+	return nil
 }

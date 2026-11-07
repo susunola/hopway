@@ -220,7 +220,7 @@ func TestProtocolsInterop(t *testing.T) {
 	defer core.Close()
 	for name := range nodes {
 		t.Run(name, func(t *testing.T) {
-			if err := core.SetPolicy(Policy{"global", name}); err != nil {
+			if err := core.SetPolicy(Policy{Mode: "global", Selected: name}); err != nil {
 				t.Fatal(err)
 			}
 			conn, err := core.Dial(context.Background(), "test", f.echo)
@@ -284,7 +284,7 @@ func TestDiagnosticsAndFailover(t *testing.T) {
 
 	expect := map[string]string{"dead": "connect", "bad-cert": "handshake", "no-dns": "dns", "wrong-password": "upstream"}
 	for name, stage := range expect {
-		core.SetPolicy(Policy{"global", name})
+		core.SetPolicy(Policy{Mode: "global", Selected: name})
 		conn, err := core.Dial(context.Background(), "test", f.echo)
 		if err == nil {
 			conn.SetDeadline(time.Now().Add(3 * time.Second))
@@ -364,16 +364,18 @@ func TestServerFirstTarget(t *testing.T) {
 	}
 	defer core.Close()
 	for _, node := range config.Nodes {
-		core.SetPolicy(Policy{"global", node.Name})
-		conn, err := core.Dial(context.Background(), "test", listener.Addr().String())
-		if err != nil {
-			t.Fatal(err)
-		}
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
-		banner := make([]byte, 14)
-		if _, err := io.ReadFull(conn, banner); err != nil || string(banner) != "SSH-2.0-test\r\n" {
-			t.Errorf("%s: banner %q, %v", node.Name, banner, err)
-		}
-		conn.Close()
+		t.Run(node.Name, func(t *testing.T) {
+			core.SetPolicy(Policy{Mode: "global", Selected: node.Name})
+			conn, err := core.Dial(context.Background(), "test", listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn.SetDeadline(time.Now().Add(3 * time.Second))
+			banner := make([]byte, 14)
+			if _, err := io.ReadFull(conn, banner); err != nil || string(banner) != "SSH-2.0-test\r\n" {
+				t.Errorf("%s: banner %q, %v", node.Name, banner, err)
+			}
+			conn.Close()
+		})
 	}
 }

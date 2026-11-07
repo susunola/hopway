@@ -2,15 +2,25 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+private final class HopWayAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard let iconFile = Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") as? String,
+              let iconURL = Bundle.main.url(forResource: iconFile, withExtension: nil),
+              let icon = NSImage(contentsOf: iconURL) else { return }
+        NSApplication.shared.applicationIconImage = icon
+    }
+}
+
 @main
 struct MacProxyApp: App {
+    @NSApplicationDelegateAdaptor(HopWayAppDelegate.self) private var appDelegate
     @StateObject private var core = CoreModel()
 
     var body: some Scene {
         Window("HopWay", id: "dashboard") {
             Dashboard(core: core)
         }
-        .defaultSize(width: 930, height: 620)
+        .defaultSize(width: 1040, height: 690)
 
         MenuBarExtra("HopWay", systemImage: core.phase == .running ? "point.3.connected.trianglepath.dotted" : "point.3.filled.connected.trianglepath.dotted") {
             StatusMenu(core: core)
@@ -26,9 +36,6 @@ private struct StatusMenu: View {
         Text("代理 · " + core.phase.rawValue)
         Button(core.phase == .running ? "停止代理" : "启动代理", action: core.toggle)
             .disabled(core.phase == .starting || core.phase == .stopping || core.saving)
-        if let proxy = core.status?.systemProxy, proxy.supported {
-            Button(proxy.enabled ? "关闭系统代理" : "设为系统代理") { core.setSystemProxy(!proxy.enabled) }
-        }
         Button("打开控制台") {
             openWindow(id: "dashboard")
             NSApp.activate(ignoringOtherApps: true)
@@ -38,136 +45,217 @@ private struct StatusMenu: View {
     }
 }
 
+private enum DashboardPage: String, CaseIterable {
+    case overview, nodes, policies, usage, connections, settings
+
+    var title: String {
+        switch self {
+        case .overview: "概览"
+        case .nodes: "节点"
+        case .usage: "用量"
+        case .policies: "策略"
+        case .connections: "连接"
+        case .settings: "设置"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .overview: "house"
+        case .nodes: "point.3.connected.trianglepath.dotted"
+        case .usage: "chart.bar.xaxis"
+        case .policies: "point.3.connected.trianglepath.dotted"
+        case .connections: "arrow.left.arrow.right"
+        case .settings: "gearshape"
+        }
+    }
+}
+
 private struct Dashboard: View {
     @ObservedObject var core: CoreModel
     @State private var filter = ""
-    @State private var selectedTab = "overview"
+    @State private var routeHost = ""
+    @State private var routeResult: String?
+    @State private var testingRoute = false
+    @State private var page: DashboardPage = .overview
+    @State private var showsLinkImport = false
+    @State private var importLink = ""
+    @State private var preview: CoreModel.ImportPreview?
+    @State private var importError: String?
+    @State private var previewing = false
+    @State private var showsConfigurationEditor = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 13) {
-                Image(systemName: "point.3.connected.trianglepath.dotted")
-                    .font(.title2.weight(.semibold))
-                    .foregroundStyle(Color.accentColor)
-                    .frame(width: 42, height: 42)
-                    .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 11))
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("HopWay").font(.title2.bold())
-                    Label(core.phase.rawValue, systemImage: "circle.fill")
-                        .font(.caption)
-                        .foregroundStyle(core.phase == .running ? Color.green : .secondary)
-                }
-                Spacer()
-                Button(action: core.toggle) {
-                    Label(core.phase == .running ? "停止代理" : "启动代理", systemImage: "power")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(core.phase == .starting || core.phase == .stopping || core.saving)
-            }
-            .padding(20)
+        HStack(spacing: 0) {
+            sidebar
             Divider()
-            TabView(selection: $selectedTab) {
-                overview.tabItem { Label("概览", systemImage: "gauge.with.dots.needle.33percent") }.tag("overview")
-                policies.tabItem { Label("策略", systemImage: "square.stack.3d.up") }.tag("policies")
-                connections.tabItem { Label("连接", systemImage: "arrow.left.arrow.right") }.tag("connections")
-                configuration.tabItem { Label("配置", systemImage: "slider.horizontal.3") }.tag("configuration")
+            VStack(spacing: 0) {
+                Group {
+                    switch page {
+                    case .overview:
+                        OverviewDashboard(core: core, showNodes: { page = .nodes }, importLink: { showsLinkImport = true })
+                    case .nodes:
+                        NodeDashboard(core: core) { showsLinkImport = true }
+                    case .policies:
+                        ScrollView { VStack(alignment: .leading, spacing: 16) { routeTester; policies } }
+                    case .usage:
+                        UsageDashboard(core: core) { showsLinkImport = true }
+                    case .connections:
+                        connections
+                    case .settings:
+                        configuration
+                    }
+                }
+                .padding(26)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                if let message = core.message {
+                    Divider()
+                    Label(message, systemImage: "info.circle")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 26)
+                        .padding(.vertical, 11)
+                }
             }
-            .padding(16)
-            if let message = core.message {
-                Text(message)
-                    .font(.callout)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 14)
-            }
+            .background(Color(nsColor: .controlBackgroundColor))
         }
-        .frame(minWidth: 810, minHeight: 490)
+        .tint(HopAppearance.accent)
+        .frame(minWidth: 880, minHeight: 525)
+        .onChange(of: core.importCount) { _, _ in page = .nodes }
+        .sheet(isPresented: $showsLinkImport, onDismiss: { importLink = ""; preview = nil; importError = nil }) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("导入链接").font(.headline)
+                Text("粘贴 Shadowrocket 或 Clash 的一键导入链接，也可直接填订阅地址。")
+                    .foregroundStyle(.secondary)
+                TextField("订阅或节点链接", text: $importLink)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                if let preview {
+                    Text("识别到 \(preview.added) 个节点 · 跳过 \(preview.skipped) 条")
+                        .font(.headline)
+                    ForEach(Array(preview.notes.enumerated()), id: \.offset) { _, note in
+                        Text(note).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if let importError {
+                    Label(importError, systemImage: "exclamationmark.circle")
+                        .font(.callout).foregroundStyle(.orange)
+                }
+                HStack {
+                    Spacer()
+                    Button("取消") { showsLinkImport = false }.keyboardShortcut(.cancelAction)
+                    Button(previewing ? "正在预览…" : preview == nil ? "预览" : "确认导入") {
+                        if preview != nil {
+                            core.importContent(importLink)
+                            showsLinkImport = false
+                        } else {
+                            let link = importLink
+                            previewing = true
+                            importError = nil
+                            Task {
+                                defer { previewing = false }
+                                do {
+                                    let result = try await core.previewImport(link)
+                                    if importLink == link && showsLinkImport { preview = result }
+                                } catch {
+                                    if importLink == link && showsLinkImport { importError = error.localizedDescription }
+                                }
+                            }
+                        }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(previewing || importLink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || core.saving)
+                }
+            }
+            .padding(22)
+            .frame(width: 490)
+            .onChange(of: importLink) { _, _ in preview = nil; importError = nil }
+        }
+        .sheet(isPresented: $showsConfigurationEditor) {
+            configurationEditor
+        }
     }
 
-    private var overview: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack(spacing: 12) {
-                    metric("SOCKS5", core.endpoint?.socks, icon: "point.topleft.down.to.point.bottomright.curvepath")
-                    metric("HTTP / CONNECT", core.endpoint?.http, icon: "globe")
-                    metric("活动连接", core.status.map { String($0.active) }, icon: "waveform", copyable: false)
-                }
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 12) {
-                        if let status = core.status {
-                            Picker("路由模式", selection: Binding(
-                                get: { status.policy.mode },
-                                set: { core.updatePolicy(Policy(mode: $0, selected: status.policy.selected)) }
-                            )) {
-                                Text("按规则").tag("rule")
-                                Text("全局").tag("global")
-                                Text("直连").tag("direct")
-                            }
-                            .pickerStyle(.segmented)
-                            Picker("选定出站", selection: Binding(
-                                get: { status.policy.selected },
-                                set: { core.updatePolicy(Policy(mode: status.policy.mode, selected: $0)) }
-                            )) {
-                                ForEach(status.nodes) { node in
-                                    Text(node.label).tag(node.name)
-                                }
-                            }
-                            Text("全局模式和规则中的 SELECT 使用选定出站。界面切换只对本次运行生效。")
-                                .font(.caption).foregroundStyle(.secondary)
-                            if let proxy = status.systemProxy, proxy.supported {
-                                Toggle("设为系统代理", isOn: Binding(
-                                    get: { proxy.enabled },
-                                    set: { core.setSystemProxy($0) }
-                                ))
-                                Text(proxy.error ?? "开启后，所有网络服务的 HTTP、HTTPS 和 SOCKS 代理都指向 HopWay；停止或退出时会还原原来的设置。")
-                                    .font(.caption).foregroundStyle(proxy.error == nil ? Color.secondary : .red)
-                            }
-                            if let tun = status.tun, tun.supported {
-                                Toggle("增强模式（TUN）", isOn: Binding(
-                                    get: { tun.enabled },
-                                    set: { core.setTUN($0) }
-                                ))
-                                Text(tun.error ?? (tun.enabled
-                                    ? "已接管全部流量（\(tun.device ?? "utun")）。不认系统代理的应用、命令行工具和 DNS 也会经过 HopWay。"
-                                    : (tun.service == true ? "接管所有应用的流量，包括不认系统代理的应用。" : "接管所有应用的流量，包括不认系统代理的应用。开启时需要输入一次管理员密码。")))
-                                    .font(.caption).foregroundStyle(tun.error == nil ? Color.secondary : .red)
-                                Button(tun.service == true ? "卸载免密服务" : "安装免密服务（开启 TUN 不再询问密码）") {
-                                    core.setTUNService(tun.service != true)
-                                }
-                                .buttonStyle(.link)
-                                .font(.caption)
-                            }
-                        } else {
-                            Text("启动内核后，可在这里切换路由模式和出站。")
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 9) {
+                Image(nsImage: NSApplication.shared.applicationIconImage)
+                    .resizable()
+                    .frame(width: 35, height: 35)
+                    .accessibilityHidden(true)
+                Text("HopWay").font(.system(size: 17, weight: .semibold))
+            }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 19)
+
+            ForEach(DashboardPage.allCases, id: \.self) { destination in
+                Button {
+                    page = destination
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: destination.icon).frame(width: 17)
+                        Text(destination.title)
+                        Spacer(minLength: 0)
+                        if destination == .nodes && !core.configuredNodes.isEmpty {
+                            Text(core.configuredNodes.count.formatted())
+                                .font(.caption.monospacedDigit())
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-                    .disabled(core.updatingPolicy)
-                } label: {
-                    Label("路由策略", systemImage: "arrow.triangle.branch")
+                    .font(.system(size: 13, weight: page == destination ? .semibold : .regular))
+                    .foregroundStyle(page == destination ? HopAppearance.accent : Color.primary)
+                    .padding(.horizontal, 10)
+                    .frame(height: 34)
+                    .background(page == destination ? HopAppearance.accent.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 8))
+                    .contentShape(Rectangle())
                 }
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("打开上方「设为系统代理」，大多数应用会自动经过 HopWay；不认系统代理的应用和命令行工具，可以打开增强模式（TUN），或者在应用里手动填写上方的代理地址。")
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        HStack {
-                            Button("一键导入", action: core.importClipboard).disabled(core.saving)
-                            Button("编辑节点与规则") { selectedTab = "configuration" }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(page == destination ? .isSelected : [])
+            }
+
+            Spacer()
+            Divider().padding(.bottom, 8)
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(core.phase == .running ? HopAppearance.accent : Color.secondary)
+                    .frame(width: 7, height: 7)
+                Text(core.phase.rawValue).font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 5)
+        }
+        .padding(14)
+        .frame(width: 172)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var routeTester: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HopPageHeading(title: "策略", detail: "试跑一个地址，查看内核当前会选择的出口。")
+            HStack {
+                TextField("域名或 IP", text: $routeHost)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("待测试地址")
+                Button(testingRoute ? "正在试跑…" : "试跑") {
+                    testingRoute = true
+                    let address = routeHost
+                    Task {
+                        defer { testingRoute = false }
+                        do {
+                            let result = try await core.explainRoute(address)
+                            routeResult = result.rule + " · " + ((result.path ?? []) + [result.outbound]).joined(separator: " → ")
+                        } catch {
+                            routeResult = error.localizedDescription
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-                } label: {
-                    Label("接入方式", systemImage: "network")
                 }
+                .disabled(core.phase != .running || routeHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || testingRoute)
             }
-            .padding(14)
+            if let routeResult { Text(routeResult).textSelection(.enabled) }
         }
+        .hopPanel()
     }
 
     private var policies: some View {
@@ -255,32 +343,10 @@ private struct Dashboard: View {
         .font(.callout)
     }
 
-    private func metric(_ title: String, _ value: String?, icon: String, copyable: Bool = true) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Label(title, systemImage: icon).font(.callout.weight(.medium)).foregroundStyle(.secondary)
-            HStack {
-                Text(value ?? "—").font(.system(.title3, design: .monospaced).weight(.medium))
-                Spacer()
-                if copyable, let value {
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(value, forType: .string)
-                    } label: { Image(systemName: "document.on.document") }
-                    .buttonStyle(.borderless)
-                    .help("复制代理地址")
-                    .accessibilityLabel("复制\(title)地址")
-                }
-            }
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: 10))
-    }
-
     private var rows: [ProxyStatus.Connection] {
         (core.status?.connections ?? [])
             .filter { row in
-                filter.isEmpty || [row.target, row.via, row.inbound, row.stateLabel, row.rule, row.process ?? ""]
+                filter.isEmpty || [row.target, row.via, row.inbound, row.stateLabel, row.rule]
                     .contains { $0.localizedCaseInsensitiveContains(filter) }
             }
             .sorted { lhs, rhs in
@@ -291,30 +357,32 @@ private struct Dashboard: View {
 
     private var connections: some View {
         VStack(alignment: .leading, spacing: 12) {
+            HopPageHeading(title: "连接", detail: "查看流量经过的节点和命中的规则。")
             HStack {
-                Text("连接记录").font(.headline)
+                HopSearchField(placeholder: "筛选目标、节点或规则", text: $filter)
+                    .frame(width: 235)
                 Spacer()
-                TextField("筛选目标、协议或规则", text: $filter).frame(width: 220)
+                Text("\(core.status?.active ?? 0) 个活动连接")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
             if rows.isEmpty {
-                VStack(spacing: 8) {
-                    Image(systemName: "arrow.left.arrow.right").font(.largeTitle)
-                    Text(filter.isEmpty ? "暂无连接" : "没有匹配的连接").font(.headline)
-                    Text("代理收到流量后，目标和规则会显示在这里。").font(.callout)
-                }
-                .foregroundStyle(.secondary)
+                ContentUnavailableView(
+                    filter.isEmpty ? "暂无连接" : "没有匹配的连接",
+                    systemImage: filter.isEmpty ? "arrow.left.arrow.right" : "magnifyingglass",
+                    description: Text(filter.isEmpty ? "代理收到流量后，连接会显示在这里。" : "试试其他关键词。")
+                )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 Table(rows) {
-                    TableColumn("目标") { Text($0.target).textSelection(.enabled).help($0.diagnosis) }.width(min: 135, ideal: 180)
-                    TableColumn("应用") { Text($0.process ?? "—").help($0.processPath ?? "") }.width(min: 80, ideal: 120)
-                    TableColumn("入站", value: \.inboundLabel).width(min: 80, ideal: 105)
-                    TableColumn("出站", value: \.via).width(min: 80, ideal: 100)
-                    TableColumn("规则", value: \.rule).width(min: 65, ideal: 130)
+                    TableColumn("目标") { Text($0.target).textSelection(.enabled).help($0.diagnosis) }.width(min: 120, ideal: 150)
+                    TableColumn("入站", value: \.inboundLabel).width(min: 68, ideal: 85)
+                    TableColumn("出站", value: \.via).width(min: 68, ideal: 95)
+                    TableColumn("规则", value: \.rule).width(min: 60, ideal: 95)
                     TableColumn("状态") { row in
                         Text(row.stateLabel)
                             .foregroundStyle(row.state == "active" ? Color.green : row.state == "failed" ? .red : .secondary)
-                            .help(row.diagnosis)
+                            .help(row.error ?? row.stateLabel)
                     }.width(66)
                     TableColumn("发送 / 接收") {
                         Text("\($0.sent.formatted()) / \($0.received.formatted()) B").monospacedDigit()
@@ -322,24 +390,82 @@ private struct Dashboard: View {
                 }
             }
         }
-        .padding(14)
     }
 
     private var configuration: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HopPageHeading(title: "设置", detail: "管理 macOS 接入方式和内核配置。")
+            VStack(alignment: .leading, spacing: 9) {
+                switch core.phase {
+                case .stopped:
+                    Text("启动代理后，即可在这里设置系统代理、TUN 增强模式和 TUN 助手。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Button("启动代理", action: core.toggle)
+                        .buttonStyle(HopPrimaryButton())
+                        .disabled(core.saving)
+                case .starting, .stopping:
+                    ProgressView(core.phase.rawValue)
+                        .controlSize(.small)
+                case .running:
+                    if core.status == nil {
+                        ProgressView("正在读取接入状态…")
+                            .controlSize(.small)
+                    } else {
+                        Toggle("系统代理", isOn: Binding(
+                            get: { core.status?.systemProxy?.enabled ?? false },
+                            set: core.setSystemProxy))
+                            .disabled(core.status?.systemProxy?.supported != true)
+                        Toggle("TUN 增强模式", isOn: Binding(
+                            get: { core.status?.tun?.enabled ?? false },
+                            set: core.setTUN))
+                            .disabled(core.status?.tun?.supported != true)
+                        Button(core.status?.tun?.service == true ? "移除 TUN 助手" : "安装 TUN 助手") {
+                            core.setTUNService(core.status?.tun?.service != true)
+                        }
+                        .disabled(core.status?.tun?.supported != true)
+                        if let error = core.status?.systemProxy?.error ?? core.status?.tun?.error {
+                            Text(error).font(.callout).foregroundStyle(.orange)
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .hopPanel()
+            HStack {
+                VStack(alignment: .leading, spacing: 5) {
+                    Label("高级配置", systemImage: "chevron.left.forwardslash.chevron.right")
+                        .font(.headline)
+                    Text(core.changed ? "有未保存的草稿" : "编辑内核的节点、规则和监听端口。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("编辑 JSON…") { showsConfigurationEditor = true }
+            }
+            .hopPanel()
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var configurationEditor: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("内核配置").font(.headline)
-                if core.changed { Text("有未保存修改").font(.caption).foregroundStyle(.orange) }
+                Text("高级配置").font(.headline)
+                if core.changed { Text("未保存").font(.caption).foregroundStyle(.orange) }
                 Spacer()
-                Button("一键导入", action: core.importClipboard).disabled(core.saving)
+                Button("关闭") { showsConfigurationEditor = false }.keyboardShortcut(.cancelAction)
+            }
+            HStack {
                 Button("打开 JSON", action: core.importDraft).disabled(core.saving)
                 Menu("插入节点模板") {
-                    ForEach(["socks5", "http", "https", "trojan", "shadowsocks", "vless", "vmess"], id: \.self) { type in
+                    ForEach(["socks5", "http", "https", "trojan", "shadowsocks", "anytls", "vless", "vmess"], id: \.self) { type in
                         Button(type) { core.insertTemplate(type) }
                     }
                 }.disabled(core.saving)
+                Spacer()
                 Button(core.saving ? "正在校验…" : "校验并保存", action: core.save)
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(HopPrimaryButton())
                     .disabled(core.saving || !core.changed)
             }
             TextEditor(text: $core.draft)
@@ -347,11 +473,15 @@ private struct Dashboard: View {
                 .font(.system(.body, design: .monospaced))
                 .autocorrectionDisabled()
                 .padding(6)
-                .border(.quaternary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary))
                 .accessibilityLabel("JSON 配置编辑器")
-            Text("一键导入读取剪贴板。支持订阅链接、Clash 内联节点和分享链接，保存后于下次启动生效。")
-                .font(.caption).foregroundStyle(.secondary)
+            Text(core.message ?? "保存后于下次启动生效。关闭会保留草稿。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
         }
-        .padding(14)
+        .padding(20)
+        .frame(width: 650, height: 395)
     }
 }
