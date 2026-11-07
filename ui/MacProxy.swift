@@ -123,7 +123,9 @@ private struct Dashboard: View {
                         configuration
                     }
                 }
-                .padding(26)
+                .padding(.horizontal, 26)
+                .padding(.top, 26)
+                .padding(.bottom, page == .overview ? 0 : 26)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 if let message = core.message {
                     Divider()

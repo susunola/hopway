@@ -31,7 +31,7 @@ struct OverviewDashboard: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 10) {
                 Text("概览")
                     .font(.system(size: 27, weight: .semibold))
                     .accessibilityAddTraits(.isHeader)
@@ -48,7 +48,7 @@ struct OverviewDashboard: View {
                 traffic
                 subscriptionsOverview
             }
-            .padding(.bottom, 12)
+            .padding(.bottom, 16)
         }
         .onChange(of: core.saved, initial: true) { _, text in
             configuration = try? JSONDecoder().decode(ConfigurationSummary.self, from: Data(text.utf8))
@@ -152,7 +152,7 @@ struct OverviewDashboard: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .hopPanel()
+        .hopPanel(verticalPadding: 12)
     }
 
     private func policyControls(_ status: ProxyStatus) -> some View {
@@ -226,7 +226,7 @@ struct OverviewDashboard: View {
                 address("HTTP / CONNECT", value: core.endpoint?.http ?? http)
             }
         }
-        .hopPanel()
+        .hopPanel(verticalPadding: 12)
     }
 
     private var verificationLabel: String {
@@ -319,7 +319,7 @@ struct OverviewDashboard: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .hopPanel()
+        .hopPanel(verticalPadding: 14)
     }
 
     private func trafficMetric(_ title: String, value: String) -> some View {
