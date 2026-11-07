@@ -19,7 +19,11 @@ import (
 	"mac-proxy/internal/wire"
 )
 
-var ErrRejected = errors.New("blocked by routing policy")
+var (
+	ErrRejected       = errors.New("blocked by routing policy")
+	ErrAuthentication = errors.New("upstream proxy authentication failed")
+	ErrTargetRefused  = errors.New("proxy target connection refused")
+)
 
 // PrepareNative validates a node for the built-in protocol implementation and
 // caches the state it needs. The built-in implementation has no third-party
@@ -136,7 +140,7 @@ func (node Node) socksConnect(conn net.Conn, target string) error {
 		return err
 	}
 	if response[0] != 5 || response[1] != method {
-		return errors.New("upstream SOCKS5 did not accept authentication method")
+		return ErrAuthentication
 	}
 	if method == 2 {
 		auth := append([]byte{1, byte(len(node.Username))}, node.Username...)
@@ -149,7 +153,7 @@ func (node Node) socksConnect(conn net.Conn, target string) error {
 			return err
 		}
 		if response[0] != 1 || response[1] != 0 {
-			return errors.New("upstream SOCKS5 authentication failed")
+			return ErrAuthentication
 		}
 	}
 	address, err := wire.EncodeAddress(target)
@@ -161,6 +165,9 @@ func (node Node) socksConnect(conn net.Conn, target string) error {
 	}
 	if _, err := io.ReadFull(conn, response[:]); err != nil {
 		return err
+	}
+	if response[0] == 5 && response[1] == 5 && response[2] == 0 {
+		return ErrTargetRefused
 	}
 	if response[0] != 5 || response[1] != 0 || response[2] != 0 {
 		return fmt.Errorf("upstream SOCKS5 CONNECT failed (code %d)", response[1])
@@ -185,6 +192,9 @@ func (node Node) httpConnect(conn net.Conn, target string) (net.Conn, error) {
 	response, err := http.ReadResponse(reader, request)
 	if err != nil {
 		return nil, errors.New("invalid upstream CONNECT response")
+	}
+	if response.StatusCode == http.StatusProxyAuthRequired {
+		return nil, ErrAuthentication
 	}
 	if response.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("upstream CONNECT returned HTTP %d", response.StatusCode)

@@ -5,19 +5,22 @@ struct NodeProbeResult: Decodable {
     let milliseconds: Int?
     let failure: String?
     var inconclusive: Bool?
+    var failureStage: String?
+    var failureCode: String?
     var target: String?
     var checkedAt: Double?
     var lastKnownLatency: Int?
     var receivedAt = Date.now
     var fromRuntime = false
 
-    private enum CodingKeys: String, CodingKey { case name, milliseconds, failure, inconclusive, target, checkedAt }
+    private enum CodingKeys: String, CodingKey { case name, milliseconds, failure, inconclusive, failureStage, failureCode, target, checkedAt }
 
     var isAvailable: Bool { failure == nil && inconclusive != true }
     var isFailure: Bool { failure != nil && inconclusive != true }
     var observedAt: Date { checkedAt.map { Date(timeIntervalSince1970: $0 / 1000) } ?? receivedAt }
 
     private var timedOut: Bool {
+        if failureCode == "timeout" || failureCode == "dns-timeout" { return true }
         guard let failure = failure?.lowercased() else { return false }
         return failure.contains("timeout") || failure.contains("timed out") || failure.contains("deadline exceeded")
     }
@@ -36,10 +39,11 @@ struct NodeProbeResult: Decodable {
         let source = fromRuntime ? "内核健康记录" : "手动测速"
         let time = observedAt.formatted(date: .abbreviated, time: .shortened)
         let context = [source, time, target].compactMap { $0 }.joined(separator: " · ")
-        let detail = failure ?? (isAvailable ? "节点可用" : "本次结果不足以判断节点是否可用")
+        let reason = DialDiagnostic.message(failureCode, fallback: failure)
+        let detail = [DialDiagnostic.stage(failureStage), reason].compactMap { $0 }.joined(separator: " · ")
         let previous = lastKnownLatency.map { "上次可用延迟 \($0) ms" }
         let age = isHistorical(at: date) ? "此记录已超过 15 分钟" : nil
-        return [context, detail, previous, age].compactMap { $0 }.joined(separator: "\n")
+        return [context, detail.isEmpty ? (isAvailable ? "节点可用" : "本次结果不足以判断节点是否可用") : detail, previous, age].compactMap { $0 }.joined(separator: "\n")
     }
 }
 
@@ -129,6 +133,9 @@ struct NodeDashboard: View {
             name: name,
             milliseconds: runtime.latencyMs,
             failure: alive ? nil : runtime.error ?? "内核报告节点不可用",
+            failureStage: runtime.failureStage,
+            failureCode: runtime.failureCode,
+            target: runtime.probeTarget,
             receivedAt: time,
             fromRuntime: true
         )

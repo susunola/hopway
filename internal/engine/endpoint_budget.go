@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"mac-proxy/internal/backend"
 	"mac-proxy/internal/wire"
@@ -21,13 +22,16 @@ type endpointBudget struct {
 	mu           sync.Mutex
 	entries      map[string]*endpointSlots
 	probeOpening chan struct{}
+	networkEpoch uint64
+	now          func() time.Time
 }
 
 type endpointSlots struct {
-	key     string
-	engines int
-	opening chan struct{}
-	probing chan struct{}
+	key      string
+	engines  int
+	opening  chan struct{}
+	probing  chan struct{}
+	tcp, udp endpointCircuit
 }
 
 func endpointKey(address string) string {
@@ -134,6 +138,6 @@ func (engine *Engine) limitProbeDial(name string, dialer backend.Dialer) backend
 		if slot != nil {
 			defer engine.budget.dials.finish(slot)
 		}
-		return dialer.DialContext(ctx, address)
+		return dialer.DialContext(engine.withEndpointGate(ctx, name), address)
 	})
 }

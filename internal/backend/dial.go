@@ -18,6 +18,16 @@ const (
 	addressAttemptTimeout = 3 * time.Second
 )
 
+var ErrEndpointCooling = errors.New("proxy endpoint is cooling down")
+
+type dialGateKey struct{}
+
+// WithDialGate applies admission to physical sockets opened by this dial.
+// The completion callback sees the actual failing DNS or socket stage.
+func WithDialGate(ctx context.Context, gate func(network, address string) (func(string, error), error)) context.Context {
+	return context.WithValue(ctx, dialGateKey{}, gate)
+}
+
 type socketDial func(context.Context, string, string) (net.Conn, error)
 
 type dialResult struct {
@@ -43,11 +53,27 @@ func NetDial(ctx context.Context, network, address string, guard Guard) (net.Con
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var result dialResult
+	if gate, ok := ctx.Value(dialGateKey{}).(func(string, string) (func(string, error), error)); ok {
+		finish, err := gate(network, address)
+		if err != nil {
+			trace.From(ctx).Dial(address, 0, 0, trace.StageConnect)
+			return nil, err
+		}
+		if finish != nil {
+			defer func() { finish(result.stage, result.err) }()
+		}
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stop := context.AfterFunc(view.ctx, cancel)
 	defer stop()
-	var result dialResult
+	if view.ctx.Err() != nil {
+		cancel()
+	}
 	if ip, err := netip.ParseAddr(host); err == nil {
 		result = dialAddresses(ctx, network, port, []netip.Addr{ip.Unmap()}, dialer.DialContext, guard)
 	} else {

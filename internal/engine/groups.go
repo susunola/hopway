@@ -10,10 +10,12 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"mac-proxy/internal/backend"
+	"mac-proxy/internal/trace"
 )
 
 // Group types.
@@ -60,6 +62,9 @@ type nodeHealth struct {
 	alive     bool
 	checked   time.Time
 	err       string
+	stage     string
+	code      string
+	target    string
 	succeeded time.Time // last real connection that worked through the node
 }
 
@@ -272,6 +277,8 @@ type ProbeResult struct {
 	Name         string `json:"name"`
 	Milliseconds int64  `json:"milliseconds,omitempty"`
 	Failure      string `json:"failure,omitempty"`
+	FailureStage string `json:"failureStage,omitempty"`
+	FailureCode  string `json:"failureCode,omitempty"`
 	Inconclusive bool   `json:"inconclusive,omitempty"`
 	Target       string `json:"target,omitempty"`
 	CheckedAt    int64  `json:"checkedAt,omitempty"`
@@ -391,7 +398,7 @@ func (engine *Engine) saveProbe(ctx context.Context, epoch uint64, result *Probe
 	}
 	if !result.Inconclusive {
 		h := &nodeHealth{latency: time.Duration(result.Milliseconds) * time.Millisecond,
-			alive: result.Failure == "", err: result.Failure, checked: checked}
+			alive: result.Failure == "", err: result.Failure, checked: checked, stage: result.FailureStage, code: result.FailureCode, target: result.Target}
 		if previous != nil {
 			h.succeeded = previous.succeeded
 		}
@@ -429,7 +436,7 @@ func (engine *Engine) probe(ctx context.Context, name string) ProbeResult {
 	dialer = engine.limitProbeDial(name, dialer)
 	latency, err := probeTarget(primary, dialer, target)
 	var primaryErr error
-	if err != nil && ctx.Err() == nil && engine.probeFallback != "" && !errors.Is(err, errEndpointBusy) {
+	if err != nil && ctx.Err() == nil && engine.probeFallback != "" && !errors.Is(err, errEndpointBusy) && !errors.Is(err, backend.ErrEndpointCooling) {
 		primaryErr = err
 		target = engine.probeFallback
 		latency, err = probeTarget(ctx, dialer, target)
@@ -443,7 +450,8 @@ func (engine *Engine) probe(ctx context.Context, name string) ProbeResult {
 		result.Milliseconds = max(latency.Milliseconds(), 1)
 		return result
 	}
-	result.Failure = err.Error()
+	failure := diagnoseDial(err, "")
+	result.Failure, result.FailureStage, result.FailureCode = failure.Message, failure.Stage, failure.Code
 	result.Inconclusive = inconclusiveProbe(err) || inconclusiveProbe(primaryErr)
 	return result
 }
@@ -452,17 +460,34 @@ type probeHTTPStatus int
 
 func (status probeHTTPStatus) Error() string { return fmt.Sprintf("probe returned HTTP %d", status) }
 
+type probeFailure struct {
+	stage string
+	cause error
+}
+
+func (err *probeFailure) Error() string { return err.cause.Error() }
+func (err *probeFailure) Unwrap() error { return err.cause }
+
 func inconclusiveProbe(err error) bool {
 	var status probeHTTPStatus
-	return errors.As(err, &status) || errors.Is(err, errEndpointBusy) || errors.Is(err, syscall.ENETDOWN) || errors.Is(err, syscall.ENETUNREACH)
+	var probe *probeFailure
+	return errors.As(err, &status) || errors.As(err, &probe) && probe.stage == trace.StageUpstream ||
+		errors.Is(err, errEndpointBusy) || errors.Is(err, backend.ErrEndpointCooling) ||
+		errors.Is(err, syscall.ENETDOWN) || errors.Is(err, syscall.ENETUNREACH)
 }
 
 func probeTarget(ctx context.Context, dialer backend.Dialer, target string) (time.Duration, error) {
+	ctx, timing := trace.With(ctx)
+	var reached atomic.Bool
 	transport := &http.Transport{
 		// Each transport handles one probe. Bind its dial to the request
 		// because the HTTP transport can otherwise keep the dial alive.
 		DialContext: func(_ context.Context, _, address string) (net.Conn, error) {
-			return dialer.DialContext(ctx, address)
+			conn, err := dialer.DialContext(ctx, address)
+			if err == nil {
+				reached.Store(true)
+			}
+			return conn, err
 		},
 		DisableKeepAlives: true, TLSHandshakeTimeout: probeTimeout, ResponseHeaderTimeout: probeTimeout,
 	}
@@ -480,11 +505,17 @@ func probeTarget(ctx context.Context, dialer backend.Dialer, target string) (tim
 		if errors.As(err, &urlErr) {
 			err = urlErr.Err
 		}
-		return 0, err
+		_, _, _, _, stage := timing.Snapshot()
+		if reached.Load() {
+			stage = trace.StageUpstream
+		} else if stage == "" {
+			stage = trace.StageHandshake
+		}
+		return 0, &probeFailure{stage: diagnoseDial(err, stage).Stage, cause: err}
 	}
 	response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return 0, probeHTTPStatus(response.StatusCode)
+		return 0, &probeFailure{stage: trace.StageUpstream, cause: probeHTTPStatus(response.StatusCode)}
 	}
 	return time.Since(start), nil
 }

@@ -26,6 +26,34 @@ struct Policy: Codable, Equatable {
     }
 }
 
+enum DialDiagnostic {
+    static func stage(_ key: String?) -> String? {
+        guard let key else { return nil }
+        let labels = ["route": "路由策略", "dns": "DNS 解析", "connect": "连接服务器",
+                      "handshake": "TLS / 协议握手", "upstream": "目标服务",
+                      "client-read": "读取客户端", "client-write": "写入客户端",
+                      "upstream-read": "读取出站", "upstream-write": "写入出站",
+                      "client-transfer": "上传转发", "upstream-transfer": "下载转发"]
+        return labels[key] ?? key
+    }
+
+    static func message(_ code: String?, fallback: String?) -> String? {
+        guard let code else { return fallback }
+        let labels = [
+            "dns-timeout": "DNS 查询超时", "dns-not-found": "DNS 未返回地址",
+            "dns-unavailable": "DNS 上游无法应答", "tls-expired": "TLS 证书已过期",
+            "tls-not-yet-valid": "TLS 证书尚未生效", "tls-hostname": "TLS 证书与服务器名称不匹配",
+            "tls-untrusted": "TLS 证书不受信任", "tls-certificate": "TLS 证书校验失败",
+            "proxy-auth": "上游代理认证失败", "endpoint-cooldown": "出站端点冷却中",
+            "endpoint-busy": "出站拨号槽已满", "connection-refused": "服务器拒绝连接",
+            "target-refused": "目标服务拒绝连接", "timeout": "连接超时",
+            "connection-reset": "连接被对端重置", "broken-pipe": "连接已断开",
+            "unreachable": "网络或主机不可达", "canceled": "已取消"
+        ]
+        return labels[code] ?? fallback
+    }
+}
+
 struct ProxyStatus: Decodable {
     struct Node: Decodable, Identifiable {
         let name: String
@@ -34,6 +62,9 @@ struct ProxyStatus: Decodable {
         let alive: Bool?
         let error: String?
         let healthAt: Double?
+        let failureStage: String?
+        let failureCode: String?
+        let probeTarget: String?
         var id: String { name }
 
         var label: String {
@@ -48,6 +79,18 @@ struct ProxyStatus: Decodable {
     }
 
     struct Connection: Decodable, Identifiable {
+        struct AttemptFailure: Decodable {
+            let via: String?
+            let stage: String
+            let code: String
+            let message: String
+
+            var label: String {
+                [via, DialDiagnostic.stage(stage), DialDiagnostic.message(code, fallback: message)]
+                    .compactMap { $0 }.joined(separator: " · ")
+            }
+        }
+
         let id: UInt64
         let start: Double?
         let inbound: String
@@ -59,6 +102,8 @@ struct ProxyStatus: Decodable {
         let received: Int64
         let error: String?
         let stage: String?
+        let failureCode: String?
+        let failures: [AttemptFailure]?
         let route: [String]?
         let server: String?
         let dnsMs: Int?
@@ -73,15 +118,8 @@ struct ProxyStatus: Decodable {
 
         var routeLabel: String { ((route ?? []) + [via]).joined(separator: " → ") }
 
-        var failureStage: String? {
-            guard let stage else { return nil }
-            let labels = ["route": "路由策略", "dns": "DNS 解析", "connect": "连接服务器",
-                          "handshake": "TLS / 协议握手", "upstream": "代理无响应",
-                          "client-read": "读取客户端", "client-write": "写入客户端",
-                          "upstream-read": "读取出站", "upstream-write": "写入出站",
-                          "client-transfer": "上传转发", "upstream-transfer": "下载转发"]
-            return labels[stage] ?? stage
-        }
+        var failureStage: String? { DialDiagnostic.stage(stage) }
+        var failureMessage: String? { DialDiagnostic.message(failureCode, fallback: error) }
 
         var timingLabel: String {
             [("DNS", dnsMs), ("连接", connectMs), ("握手", handshakeMs), ("首字节", firstByteMs)]
@@ -90,10 +128,10 @@ struct ProxyStatus: Decodable {
         }
 
         var diagnosis: String {
-            let lines = [error, failureStage.map { "失败阶段 · " + $0 },
+            let lines = [failureMessage, failureStage.map { "失败阶段 · " + $0 },
                          processPath.map { "应用 · " + $0 }, "路径 · " + routeLabel,
                          server.map { "服务器 · " + $0 }, timingLabel.isEmpty ? nil : timingLabel]
-            return lines.compactMap { $0 }.joined(separator: "\n")
+            return (lines.compactMap { $0 } + (failures ?? []).map(\.label)).joined(separator: "\n")
         }
 
         var stateLabel: String {

@@ -12,6 +12,7 @@ struct AdvancedSettingsDraft {
         var probeURL = ""
         var fallbackURL = ""
         var probeInterval = ""
+        var maxDialAttempts = ""
     }
 
     let source: String
@@ -34,7 +35,8 @@ struct AdvancedSettingsDraft {
             mtu: Self.nonzeroText(tun["mtu"]),
             probeURL: health["url"] as? String ?? "",
             fallbackURL: health["fallbackUrl"] as? String ?? "",
-            probeInterval: Self.nonzeroText(health["intervalSec"])
+            probeInterval: Self.nonzeroText(health["intervalSec"]),
+            maxDialAttempts: Self.nonzeroText(config["maxDialAttempts"])
         )
         self.source = source
         original = loaded
@@ -85,6 +87,11 @@ struct AdvancedSettingsDraft {
                 health["intervalSec"] = interval == 0 ? nil : interval
             }
             config["health"] = health.isEmpty ? nil : health
+        }
+
+        if values.maxDialAttempts != original.maxDialAttempts {
+            let attempts = try number(values.maxDialAttempts, in: 1...8, label: "出站尝试上限", blank: 0)
+            config["maxDialAttempts"] = attempts == 0 ? nil : attempts
         }
 
         var notes: [String] = []
@@ -190,6 +197,14 @@ struct AdvancedSettingsPanel: View {
                 }
                 .frame(maxWidth: 190)
                 Text("整组留空跟随订阅。自定义测速地址时可单独指定备用目标。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("出站恢复").fontWeight(.semibold)
+                field("出站尝试上限", text: values.maxDialAttempts, prompt: "3")
+                    .frame(maxWidth: 190)
+                Text("包含首次拨号。填 1 只尝试当前出站，留空使用默认值。")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Divider()

@@ -38,7 +38,7 @@ func NewResourceBudget() *ResourceBudget {
 
 func newResourceBudget(sessions, opening int) *ResourceBudget {
 	return &ResourceBudget{
-		dials:   endpointBudget{entries: make(map[string]*endpointSlots), probeOpening: make(chan struct{}, probeParallel)},
+		dials:   endpointBudget{entries: make(map[string]*endpointSlots), probeOpening: make(chan struct{}, probeParallel), now: time.Now},
 		started: time.Now(), maxSessions: sessions, opening: make(chan struct{}, opening),
 		sessions: make(map[*trackedPacket]struct{}), outbounds: make(map[string]*packetOutbound),
 	}

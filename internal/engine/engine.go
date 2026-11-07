@@ -43,7 +43,8 @@ type Config struct {
 	// SystemProxy points macOS's proxy settings at HopWay while it runs.
 	SystemProxy bool `json:"systemProxy,omitempty"`
 	// TUN captures all traffic through a virtual network device.
-	TUN *TUNConfig `json:"tun,omitempty"`
+	TUN             *TUNConfig `json:"tun,omitempty"`
+	MaxDialAttempts int        `json:"maxDialAttempts,omitempty"`
 
 	// DataDir holds caches (downloaded rule sets). Set by the caller, not saved.
 	DataDir string `json:"-"`
@@ -98,12 +99,15 @@ type Policy struct {
 }
 
 type NodeSummary struct {
-	Name      string `json:"name"`
-	Type      string `json:"type"`
-	LatencyMs int64  `json:"latencyMs,omitempty"`
-	Alive     *bool  `json:"alive,omitempty"`
-	Error     string `json:"error,omitempty"`
-	HealthAt  int64  `json:"healthAt,omitempty"`
+	Name         string `json:"name"`
+	Type         string `json:"type"`
+	LatencyMs    int64  `json:"latencyMs,omitempty"`
+	Alive        *bool  `json:"alive,omitempty"`
+	Error        string `json:"error,omitempty"`
+	HealthAt     int64  `json:"healthAt,omitempty"`
+	FailureStage string `json:"failureStage,omitempty"`
+	FailureCode  string `json:"failureCode,omitempty"`
+	ProbeTarget  string `json:"probeTarget,omitempty"`
 }
 
 type GroupStatus struct {
@@ -116,29 +120,31 @@ type GroupStatus struct {
 
 // Record describes one connection. Timings are milliseconds.
 type Record struct {
-	ID          uint64   `json:"id"`
-	Start       int64    `json:"start"`
-	Inbound     string   `json:"inbound"`
-	Target      string   `json:"target"`
-	Via         string   `json:"via"`
-	Route       []string `json:"route,omitempty"`
-	Rule        string   `json:"rule"`
-	State       string   `json:"state"`
-	Sent        uint64   `json:"sent"`
-	Recv        uint64   `json:"received"`
-	Error       string   `json:"error,omitempty"`
-	Stage       string   `json:"stage,omitempty"`
-	Server      string   `json:"server,omitempty"`
-	Shared      bool     `json:"shared,omitempty"`      // rode a multiplexed session, no socket of its own
-	Network     string   `json:"network,omitempty"`     // "udp" for datagram sessions
-	Process     string   `json:"process,omitempty"`     // app or executable name
-	ProcessPath string   `json:"processPath,omitempty"` // executable path
-	PID         uint32   `json:"pid,omitempty"`
-	Attempts    int      `json:"attempts,omitempty"`
-	DNSMs       int64    `json:"dnsMs,omitempty"`
-	ConnectMs   int64    `json:"connectMs,omitempty"`
-	HandshakeMs int64    `json:"handshakeMs,omitempty"`
-	FirstByteMs int64    `json:"firstByteMs,omitempty"`
+	ID          uint64        `json:"id"`
+	Start       int64         `json:"start"`
+	Inbound     string        `json:"inbound"`
+	Target      string        `json:"target"`
+	Via         string        `json:"via"`
+	Route       []string      `json:"route,omitempty"`
+	Rule        string        `json:"rule"`
+	State       string        `json:"state"`
+	Sent        uint64        `json:"sent"`
+	Recv        uint64        `json:"received"`
+	Error       string        `json:"error,omitempty"`
+	Stage       string        `json:"stage,omitempty"`
+	FailureCode string        `json:"failureCode,omitempty"`
+	Failures    []DialFailure `json:"failures,omitempty"`
+	Server      string        `json:"server,omitempty"`
+	Shared      bool          `json:"shared,omitempty"`      // rode a multiplexed session, no socket of its own
+	Network     string        `json:"network,omitempty"`     // "udp" for datagram sessions
+	Process     string        `json:"process,omitempty"`     // app or executable name
+	ProcessPath string        `json:"processPath,omitempty"` // executable path
+	PID         uint32        `json:"pid,omitempty"`
+	Attempts    int           `json:"attempts,omitempty"`
+	DNSMs       int64         `json:"dnsMs,omitempty"`
+	ConnectMs   int64         `json:"connectMs,omitempty"`
+	HandshakeMs int64         `json:"handshakeMs,omitempty"`
+	FirstByteMs int64         `json:"firstByteMs,omitempty"`
 }
 
 type Status struct {
@@ -171,6 +177,7 @@ type Engine struct {
 	groups        map[string]*group
 	health        map[string]*nodeHealth
 	rules         *matcher
+	attempts      int
 	probeURL      string
 	probeFallback string
 	sequence      uint64
@@ -196,10 +203,11 @@ type Engine struct {
 }
 
 const (
-	dialTimeout       = 10 * time.Second
-	attemptTimeout    = 5 * time.Second
-	maxAttempts       = 3
-	endpointDialLimit = 64
+	dialTimeout            = 10 * time.Second
+	attemptTimeout         = 5 * time.Second
+	defaultDialAttempts    = 3
+	maxAllowedDialAttempts = 8
+	endpointDialLimit      = 64
 )
 
 // New builds an engine; localPorts are HopWay's own listeners, which no
@@ -219,10 +227,17 @@ func NewWithResourceBudget(config Config, impl backend.Backend, budget *Resource
 			return nil, err
 		}
 	}
+	if config.MaxDialAttempts < 0 || config.MaxDialAttempts > maxAllowedDialAttempts {
+		return nil, fmt.Errorf("maxDialAttempts must be between 0 and %d", maxAllowedDialAttempts)
+	}
+	attempts := config.MaxDialAttempts
+	if attempts == 0 {
+		attempts = defaultDialAttempts
+	}
 	engine := &Engine{subscriptions: config.Subscriptions, autoWake: make(chan struct{}, 1), dialers: make(map[string]backend.Dialer), types: map[string]string{"DIRECT": "direct", "REJECT": "reject"}, servers: map[string]string{},
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL, probeFallback: defaultProbeFallback,
-		dialSlots: make(map[string]*endpointSlots), lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
+		dialSlots: make(map[string]*endpointSlots), attempts: attempts, lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
 	}
 	for _, port := range localPorts {
 		engine.ports[uint16(port)] = true
@@ -348,6 +363,9 @@ func (engine *Engine) NetworkChanged() {
 		engine.networkCtx, engine.cancelNetwork = context.WithCancel(engine.ctx)
 	}
 	backend.Resolver.Flush()
+	if engine.budget != nil {
+		engine.budget.dials.changeNetwork()
+	}
 	if engine.instance != nil {
 		engine.instance.ResetConnections()
 	}
@@ -580,8 +598,8 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 	engine.mu.Lock()
 	candidates := engine.choices(via)
 	engine.mu.Unlock()
-	if len(candidates) > maxAttempts {
-		candidates = candidates[:maxAttempts]
+	if len(candidates) > engine.attempts {
+		candidates = candidates[:engine.attempts]
 	}
 
 	var conn net.Conn
@@ -594,6 +612,9 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		}
 		conn, err = engine.dialOnce(attempt, candidate.via, target, &record)
 		cancelAttempt()
+		if err != nil {
+			record.recordAttemptFailure(err)
+		}
 		if err == nil || ctx.Err() != nil {
 			break
 		}
@@ -622,7 +643,8 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		err = ctxErr
 	}
 	if err != nil {
-		record.State, record.Error = "failed", describe(err)
+		record.State = "failed"
+		record.setFailure(diagnoseDial(err, record.Stage))
 		if errors.Is(err, outbound.ErrRejected) {
 			record.State, record.Stage = "blocked", trace.StageRoute
 		} else if errors.Is(err, context.Canceled) {
@@ -633,9 +655,9 @@ func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Con
 		if conn != nil {
 			_ = conn.Close()
 		}
-		return nil, err
+		return nil, reportedDialError{record.Error, err}
 	}
-	record.Stage, record.Error = "", ""
+	record.Stage, record.Error, record.FailureCode = "", "", ""
 	tracked := &tracked{Conn: conn, engine: engine, record: record, opened: time.Now()}
 	engine.live[record.ID] = tracked
 	engine.mu.Unlock()
@@ -733,15 +755,20 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 	engine.mu.Lock()
 	candidates := engine.choices(via)
 	engine.mu.Unlock()
-	if len(candidates) > maxAttempts {
-		candidates = candidates[:maxAttempts]
+	if len(candidates) > engine.attempts {
+		candidates = candidates[:engine.attempts]
 	}
 	var conn net.PacketConn
 	var exit *packetOutbound
 	for i, candidate := range candidates {
 		record.Via, record.Route, record.Attempts = candidate.via, candidate.route, i+1
-		conn, exit, err = engine.openPacket(ctx, candidate.via, target)
-		if err == nil || errors.Is(err, outbound.ErrRejected) || ctx.Err() != nil {
+		attempt, timing := trace.With(ctx)
+		conn, exit, err = engine.openPacket(attempt, candidate.via, target)
+		record.Server, _, _, _, record.Stage = timing.Snapshot()
+		if err != nil {
+			record.recordAttemptFailure(err)
+		}
+		if err == nil || errors.Is(err, outbound.ErrRejected) || ctx.Err() != nil || record.Stage == trace.StageUpstream {
 			break
 		}
 	}
@@ -756,7 +783,8 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 		err = ctx.Err()
 	}
 	if err != nil {
-		record.State, record.Error = "failed", describe(err)
+		record.State = "failed"
+		record.setFailure(diagnoseDial(err, record.Stage))
 		if errors.Is(err, outbound.ErrRejected) {
 			record.State, record.Stage = "blocked", trace.StageRoute
 		}
@@ -766,8 +794,9 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 			_ = conn.Close()
 			engine.budget.releaseOutbound(exit)
 		}
-		return nil, err
+		return nil, reportedDialError{record.Error, err}
 	}
+	record.Stage, record.Error, record.FailureCode = "", "", ""
 	tracked := &trackedPacket{PacketConn: conn, engine: engine, record: record, outbound: exit}
 	evicted := engine.budget.admit(tracked)
 	engine.livePackets[record.ID] = tracked
@@ -823,7 +852,7 @@ func (engine *Engine) dialPacketOnce(ctx context.Context, via, target string) (n
 	if slot != nil {
 		defer engine.budget.dials.finish(slot)
 	}
-	return dialer.ListenPacket(ctx, target)
+	return dialer.ListenPacket(engine.withEndpointGate(ctx, via), target)
 }
 
 type trackedPacket struct {
@@ -934,7 +963,7 @@ func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *
 		if dialer == nil {
 			err = errors.New("outbound is not available")
 		} else {
-			conn, err = dialer.DialContext(ctx, target)
+			conn, err = dialer.DialContext(engine.withEndpointGate(ctx, via), target)
 		}
 	}
 	total := time.Since(start)
@@ -960,40 +989,40 @@ func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *
 			// Reached the server (or reused a session) but the protocol failed.
 			record.Stage = trace.StageHandshake
 		}
+		record.setFailure(diagnoseDial(err, record.Stage))
 	}
-	if via != "DIRECT" && via != "REJECT" && !errors.Is(ctx.Err(), context.Canceled) {
+	if via != "DIRECT" && via != "REJECT" && !errors.Is(ctx.Err(), context.Canceled) && !errors.Is(err, backend.ErrEndpointCooling) {
 		engine.mu.Lock()
 		if engine.networkEpoch.Load() != epoch {
 			engine.mu.Unlock()
 			return conn, err
 		}
 		h := engine.health[via]
-		if err != nil && record.Stage != trace.StageRoute {
+		if err != nil && record.Stage != trace.StageRoute && record.Stage != trace.StageUpstream {
 			if h == nil {
 				h = &nodeHealth{}
 				engine.health[via] = h
 			}
-			h.alive, h.checked, h.err = false, time.Now(), describe(err)
+			h.alive, h.checked, h.err = false, time.Now(), record.Error
+			h.stage, h.code, h.target = record.Stage, record.FailureCode, ""
 		} else if err == nil {
 			if h == nil {
 				h = &nodeHealth{}
 				engine.health[via] = h
 			}
+			now := time.Now()
 			if !h.alive {
-				h.alive, h.err = true, ""
+				h.alive, h.err, h.stage, h.code, h.target = true, "", "", "", ""
+				h.latency = 0
 			}
-			h.succeeded = time.Now()
+			if h.target == "" {
+				h.checked = now
+			}
+			h.succeeded = now
 		}
 		engine.mu.Unlock()
 	}
 	return conn, err
-}
-
-func describe(err error) string {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return "timed out"
-	}
-	return err.Error()
 }
 
 func (engine *Engine) remember(record Record) {
@@ -1049,8 +1078,9 @@ func (engine *Engine) Status() Status {
 		if h := engine.health[name]; h != nil {
 			alive := h.alive
 			summary.Alive, summary.Error = &alive, h.err
+			summary.FailureStage, summary.FailureCode, summary.ProbeTarget = h.stage, h.code, h.target
 			observed := h.checked
-			if h.succeeded.After(observed) {
+			if observed.IsZero() {
 				observed = h.succeeded
 			}
 			if !observed.IsZero() {
@@ -1072,7 +1102,6 @@ type tracked struct {
 	opened     time.Time
 	sent, recv atomic.Uint64
 	firstByte  atomic.Int64
-	readErr    atomic.Value
 	relayErr   atomic.Pointer[wire.RelayError]
 	once       sync.Once
 }
@@ -1091,9 +1120,6 @@ func (conn *tracked) Read(data []byte) (int, error) {
 	}
 	if count > 0 && conn.recv.Add(uint64(count)) == uint64(count) {
 		conn.firstByte.Store(max(time.Since(conn.opened).Milliseconds(), 1))
-	}
-	if err != nil && conn.recv.Load() == 0 {
-		conn.readErr.CompareAndSwap(nil, err.Error())
 	}
 	return count, err
 }
@@ -1130,13 +1156,11 @@ func (conn *tracked) Close() error {
 		if failure := conn.relayErr.Load(); failure != nil {
 			record.State = "failed"
 			record.Stage = failure.Endpoint + "-" + failure.Operation
-			record.Error = describe(failure.Err)
+			record.setFailure(diagnoseDial(failure.Err, record.Stage))
 		} else if record.Sent > 0 && record.Recv == 0 && record.Via != "DIRECT" {
 			record.State, record.Stage = "failed", trace.StageUpstream
 			record.Error = "the proxy closed the connection without a response"
-			if text, ok := conn.readErr.Load().(string); ok && text != "EOF" {
-				record.Error += " (" + text + ")"
-			}
+			record.FailureCode = "upstream-no-response"
 		}
 		delete(conn.engine.live, record.ID)
 		conn.engine.remember(record)

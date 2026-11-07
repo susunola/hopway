@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"mac-proxy/internal/trace"
 )
 
 func serveDialTestDNS(t *testing.T, network, address string, handler dns.HandlerFunc) (string, error) {
@@ -294,4 +296,38 @@ func TestNetDialReResolvesEndpointAfterNetworkViewChangeAndExpiration(t *testing
 		t.Fatal("IPv6 answer was not cached")
 	}
 	check(1)
+}
+
+func TestDialTimingSeparatesDNSAndSocketStalls(t *testing.T) {
+	const timeout = 40 * time.Millisecond
+	for _, stage := range []string{trace.StageDNS, trace.StageConnect} {
+		t.Run(stage, func(t *testing.T) {
+			for range 10 {
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
+				result := dialFamilies(ctx, "tcp", "fixture.test", 443, func(ctx context.Context, family string) ([]netip.Addr, error) {
+					if stage == trace.StageDNS {
+						<-ctx.Done()
+						return nil, ctx.Err()
+					}
+					if family == "ip6" {
+						return nil, &net.DNSError{IsNotFound: true}
+					}
+					return []netip.Addr{netip.MustParseAddr("192.0.2.1")}, nil
+				}, func(ctx context.Context, _, _ string) (net.Conn, error) {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}, nil)
+				cancel()
+				if result.stage != stage || !errors.Is(result.err, context.DeadlineExceeded) {
+					t.Fatalf("stage %s reported %+v", stage, result)
+				}
+				if stage == trace.StageDNS && (result.dns < timeout/2 || result.connect != 0) {
+					t.Fatalf("DNS stall timing: dns=%s connect=%s", result.dns, result.connect)
+				}
+				if stage == trace.StageConnect && result.connect < timeout/2 {
+					t.Fatalf("socket stall timing: dns=%s connect=%s", result.dns, result.connect)
+				}
+			}
+		})
+	}
 }

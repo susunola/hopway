@@ -142,14 +142,23 @@ struct ConnectionsDashboard: View {
             if !row.timingLabel.isEmpty {
                 Text(row.timingLabel).font(.caption).monospacedDigit().foregroundStyle(.secondary)
             }
-            if let failure = row.failureStage ?? row.error {
-                let explanation = [row.failureStage, row.error].compactMap { $0 }.joined(separator: " · ")
+            if let failure = row.failureStage ?? row.failureMessage {
+                let explanation = [row.failureStage, row.failureMessage].compactMap { $0 }.joined(separator: " · ")
                 Label(explanation.isEmpty ? failure : explanation, systemImage: "exclamationmark.circle")
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .lineLimit(2)
                     .textSelection(.enabled)
                     .help(explanation)
+            }
+            if let failures = row.failures, failures.count > 1 || row.state == "active" || row.state == "closed" {
+                ForEach(Array(failures.enumerated()), id: \.offset) { _, failure in
+                    Text(failure.label)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help(failure.label)
+                }
             }
         }
         .font(.callout)
