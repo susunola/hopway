@@ -91,3 +91,5 @@ require (
 )
 
 replace github.com/sagernet/sing-quic => ./third_party/sing-quic
+
+replace github.com/sagernet/sing-tun => ./third_party/sing-tun
