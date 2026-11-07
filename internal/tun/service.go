@@ -9,7 +9,6 @@ package tun
 import (
 	"context"
 	"errors"
-	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -30,22 +29,22 @@ import (
 )
 
 type Service struct {
-	options Options
-	device  stun.Tun
-	stack   stun.Stack
-	network stun.NetworkUpdateMonitor
-	monitor stun.DefaultInterfaceMonitor
-	fake    *FakeIP
-	dial    Dial
-	decide  Decide
-	ctx     context.Context
-	cancel  context.CancelFunc
-	once    sync.Once
+	options    Options
+	device     stun.Tun
+	stack      stun.Stack
+	network    stun.NetworkUpdateMonitor
+	monitor    stun.DefaultInterfaceMonitor
+	fake       *FakeIP
+	dial       Dial
+	dialPacket DialPacket
+	ctx        context.Context
+	cancel     context.CancelFunc
+	once       sync.Once
 }
 
-func Start(options Options, dial Dial, decide Decide) (*Service, error) {
+func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) {
 	options.defaults()
-	s := &Service{options: options, fake: NewFakeIP(options.FakeRange), dial: dial, decide: decide}
+	s := &Service{options: options, fake: NewFakeIP(options.FakeRange), dial: dial, dialPacket: dialPacket}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	finder := control.NewDefaultInterfaceFinder()
 	var err error
@@ -214,47 +213,36 @@ func (s *Service) NewConnectionEx(ctx context.Context, conn net.Conn, source, de
 	done(onClose, nil)
 }
 
-// NewPacketConnectionEx relays UDP directly when the rules route it to
-// DIRECT and drops it otherwise. Dropping makes QUIC applications (browsers
-// on UDP 443) fall back to TCP, which then goes through the proxy.
+// NewPacketConnectionEx relays a UDP flow through whatever the rules pick:
+// DIRECT, or a node that carries UDP. If the route cannot carry UDP the
+// flow is dropped, and QUIC applications fall back to TCP.
 func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	if s.decide(s.target(destination)) != "DIRECT" {
+	if destination.IsIP() && s.fake.Contains(destination.Addr) {
+		if _, ok := s.fake.Lookup(destination.Addr); !ok {
+			conn.Close()
+			done(onClose, errors.New("unknown fake address"))
+			return
+		}
+	}
+	ctx = peer.WithAddrs(ctx, peer.Addrs{Client: source.AddrPort(), Server: destination.AddrPort(), Local: true})
+	remote, err := s.dialPacket(ctx, "TUN", s.target(destination))
+	if err != nil {
 		conn.Close()
-		done(onClose, nil)
+		done(onClose, err)
 		return
 	}
-	resolve := func(addr M.Socksaddr) (*net.UDPAddr, error) {
-		target := addr
-		if addr.IsIP() && s.fake.Contains(addr.Addr) {
-			name, ok := s.fake.Lookup(addr.Addr)
-			if !ok {
-				return nil, errors.New("unknown fake address")
-			}
-			target = M.ParseSocksaddrHostPort(name, addr.Port)
-		}
-		if target.IsFqdn() {
-			addrs, err := backend.Resolver.Lookup(ctx, target.Fqdn)
-			if err != nil || len(addrs) == 0 {
-				return nil, errors.New("cannot resolve " + target.Fqdn)
-			}
-			return net.UDPAddrFromAddrPort(netip.AddrPortFrom(addrs[0], target.Port)), nil
-		}
-		return net.UDPAddrFromAddrPort(target.AddrPort()), nil
-	}
 	var once sync.Once
-	var remote net.PacketConn
 	finish := func(err error) {
 		once.Do(func() {
 			conn.Close()
-			if remote != nil {
-				remote.Close()
-			}
+			remote.Close()
 			done(onClose, err)
 		})
 	}
-	replyTo := map[string]M.Socksaddr{} // real address -> what the app sent to (a fake IP)
+	// What the app sent to (often a fake IP), keyed by what was written.
 	var mu sync.Mutex
-	receive := func() {
+	replyTo := map[string]M.Socksaddr{}
+	go func() {
 		buffer := make([]byte, 65535)
 		for {
 			remote.SetReadDeadline(time.Now().Add(5 * time.Minute))
@@ -263,18 +251,25 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 				finish(nil)
 				return
 			}
+			key := M.SocksaddrFromNet(from)
+			if socks, ok := from.(M.Socksaddr); ok {
+				key = socks
+			}
 			mu.Lock()
-			original, ok := replyTo[from.String()]
+			original, ok := replyTo[key.String()]
 			mu.Unlock()
 			if !ok {
-				original = M.SocksaddrFromNet(from)
+				original = key
+				if !original.IsIP() { // a reply naming a host the app never asked for
+					continue
+				}
 			}
 			if err := conn.WritePacket(buf.As(append([]byte(nil), buffer[:n]...)), original); err != nil {
 				finish(err)
 				return
 			}
 		}
-	}
+	}()
 	for {
 		packet := buf.NewPacket()
 		to, err := conn.ReadPacket(packet)
@@ -283,25 +278,15 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 			finish(nil)
 			return
 		}
-		addr, err := resolve(to)
-		if err == nil && remote == nil {
-			// The socket is opened on the first datagram, once the peer is known.
-			if remote, err = backend.ListenPacket(ctx, addr.AddrPort().Addr()); err != nil {
-				packet.Release()
-				finish(err)
-				return
-			}
-			go receive()
+		written := M.ParseSocksaddr(s.target(to))
+		mu.Lock()
+		if len(replyTo) > 1024 {
+			replyTo = map[string]M.Socksaddr{}
 		}
-		if err == nil {
-			mu.Lock()
-			replyTo[addr.String()] = to
-			mu.Unlock()
-			_, err = remote.WriteTo(packet.Bytes(), addr)
-		}
+		replyTo[written.String()] = to
+		mu.Unlock()
+		_, err = remote.WriteTo(packet.Bytes(), written)
 		packet.Release()
-		if err != nil && !errors.Is(err, io.ErrShortWrite) {
-			continue // one bad datagram does not end the flow
-		}
+		_ = err // one undeliverable datagram does not end the flow
 	}
 }

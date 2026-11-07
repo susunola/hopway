@@ -31,7 +31,10 @@ func (o *Options) defaults() {
 
 // Dial and Decide connect the device to the engine.
 type Dial func(ctx context.Context, inbound, target string) (net.Conn, error)
-type Decide func(target string) string
+
+// DialPacket opens a UDP session routed by the engine; WriteTo takes
+// M.Socksaddr destinations and ReadFrom returns the address written to.
+type DialPacket func(ctx context.Context, inbound, target string) (net.PacketConn, error)
 
 // DNSAddress is the address the system DNS points at in TUN mode: the
 // device's peer address, so queries are routed into the tunnel.

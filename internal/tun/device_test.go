@@ -80,7 +80,7 @@ func TestDevice(t *testing.T) {
 	defer upstream.Shutdown()
 
 	service, err := Start(Options{Name: "hwtest0", AutoRoute: true, UpstreamDNS: []string{upstream.PacketConn.LocalAddr().String()},
-		RouteAddress: []netip.Prefix{DefaultFakeRange}}, core.Dial, core.Decide)
+		RouteAddress: []netip.Prefix{DefaultFakeRange}}, core.Dial, core.DialPacket)
 	if err != nil {
 		t.Skipf("cannot create a TUN device here: %v", err)
 	}

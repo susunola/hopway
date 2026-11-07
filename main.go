@@ -181,7 +181,7 @@ func run(path string, port int, check, managed bool) error {
 	}
 	defer supervisor.Close()
 	serverErrors := make(chan error, 3)
-	go func() { serverErrors <- serveSOCKS(socks, supervisor.Dial) }()
+	go func() { serverErrors <- serveSOCKS(socks, supervisor.Dial, supervisor.DialPacket) }()
 	httpServer := &http.Server{
 		Handler: httpproxy.Handler(supervisor.Dial), ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout: 30 * time.Second, MaxHeaderBytes: 64 << 10,
@@ -214,7 +214,7 @@ func run(path string, port int, check, managed bool) error {
 	return <-serverErrors
 }
 
-func serveSOCKS(listener *net.TCPListener, dial func(context.Context, string, string) (net.Conn, error)) error {
+func serveSOCKS(listener *net.TCPListener, dial socks5.DialFunc, dialPacket socks5.DialPacketFunc) error {
 	for {
 		client, err := listener.AcceptTCP()
 		if err != nil {
@@ -222,7 +222,7 @@ func serveSOCKS(listener *net.TCPListener, dial func(context.Context, string, st
 		}
 		go func() {
 			defer client.Close()
-			socks5.Handle(client, dial)
+			socks5.HandleWithUDP(client, dial, dialPacket)
 		}()
 	}
 }
