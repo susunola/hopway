@@ -121,7 +121,7 @@ func CommitRefresh(ctx context.Context, user engine.Config, sub engine.Subscript
 	snapshot := refresh.Snapshot
 	changed := !sameRouting(current, snapshot)
 	if changed {
-		if err := prepareSnapshot(user, sub, snapshot, dataDir, impl); err != nil {
+		if err := prepareSnapshot(ctx, user, sub, snapshot, dataDir, impl); err != nil {
 			return false, err
 		}
 	} else {
@@ -187,7 +187,7 @@ func updateUsage(sub engine.Subscription, snapshot, previous *Snapshot) {
 	snapshot.Samples = sub.UsageSamples
 }
 
-func prepareSnapshot(user engine.Config, sub engine.Subscription, snapshot *Snapshot, dataDir string, impl backend.Backend) error {
+func prepareSnapshot(ctx context.Context, user engine.Config, sub engine.Subscription, snapshot *Snapshot, dataDir string, impl backend.Backend) error {
 	snapshots := map[string]*Snapshot{sub.Name: snapshot}
 	var previous *Snapshot
 	for _, other := range user.Subscriptions {
@@ -204,7 +204,7 @@ func prepareSnapshot(user engine.Config, sub engine.Subscription, snapshot *Snap
 	updateUsage(sub, snapshot, previous)
 	merged, _ := Merge(user, snapshots)
 	merged.DataDir = dataDir
-	return engine.Validate(merged, impl)
+	return engine.ValidateContext(ctx, merged, impl, nil)
 }
 
 func checkRetry(sub engine.Subscription, dataDir string) error {
@@ -252,7 +252,7 @@ func Subscribe(ctx context.Context, user engine.Config, rawURL, dataDir string, 
 		return importer.Result{}, err
 	}
 	defer release()
-	if err := plan.prepare(dataDir, impl, &user); err != nil {
+	if err := plan.prepare(ctx, dataDir, impl, &user); err != nil {
 		return importer.Result{}, err
 	}
 	if _, err := plan.stage(ctx, dataDir); err != nil {
@@ -266,7 +266,7 @@ func PreviewSubscription(ctx context.Context, user engine.Config, rawURL, dataDi
 	if err != nil {
 		return importer.Result{}, err
 	}
-	if err := plan.prepare(dataDir, impl, &user); err != nil {
+	if err := plan.prepare(ctx, dataDir, impl, &user); err != nil {
 		return importer.Result{}, err
 	}
 	return plan.result, nil
@@ -280,7 +280,7 @@ type subscriptionImport struct {
 	preview  bool
 }
 
-func (plan *subscriptionImport) prepare(dataDir string, impl backend.Backend, baseline *engine.Config) error {
+func (plan *subscriptionImport) prepare(ctx context.Context, dataDir string, impl backend.Backend, baseline *engine.Config) error {
 	user := plan.result.Config
 	sub := user.Subscriptions[plan.index]
 	previous, _ := LoadSnapshot(dataDir, sub)
@@ -288,7 +288,7 @@ func (plan *subscriptionImport) prepare(dataDir string, impl backend.Backend, ba
 		return errors.New("订阅缓存已由其他操作更新，请重新导入")
 	}
 	updateUsage(sub, plan.snapshot, previous)
-	validate := func(config engine.Config) error { return engine.Validate(config, impl) }
+	validate := func(config engine.Config) error { return engine.ValidateContext(ctx, config, impl, nil) }
 	_, err := validateConfig(user, dataDir, validate, sub.Name, plan.snapshot, baseline)
 	return err
 }

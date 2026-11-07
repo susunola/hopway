@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"mac-proxy/internal/ruleset"
@@ -47,35 +48,65 @@ const (
 
 type ruleSetState struct {
 	RuleSet
-	set     *ruleset.Set
+	slot    int
 	format  string
+	digest  [sha256.Size]byte
+	content *ruleset.Content
 	updated time.Time
 	err     string
 }
 
-func (engine *Engine) openRuleSets(config Config) (map[string]*ruleset.Set, error) {
+type ruleSetKey struct {
+	digest           [sha256.Size]byte
+	format, behavior string
+}
+
+// RuleSetIndexes holds immutable indexes during one serial profile build.
+// It is discarded after validation and the replacement engine have used it.
+type RuleSetIndexes map[ruleSetKey]*ruleset.Content
+
+func (engine *Engine) RuleSetIndexes() RuleSetIndexes {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	indexes := make(RuleSetIndexes, len(engine.ruleSets))
+	for _, state := range engine.ruleSets {
+		if state.content != nil {
+			indexes[state.key(state.digest)] = state.content
+		}
+	}
+	return indexes
+}
+
+func (state *ruleSetState) key(digest [sha256.Size]byte) ruleSetKey {
+	return ruleSetKey{digest: digest, format: state.format, behavior: state.Behavior}
+}
+
+func (engine *Engine) openRuleSets(ctx context.Context, config Config, indexes RuleSetIndexes) error {
 	interval := defaultRuleSetInterval
 	if minutes := config.RuleSetRefreshMin; minutes != 0 {
 		if minutes < 10 || minutes > 10080 {
-			return nil, errors.New("ruleSetRefreshMin must be between 10 and 10080")
+			return errors.New("ruleSetRefreshMin must be between 10 and 10080")
 		}
 		interval = minutes * 60
 	}
-	sets := map[string]*ruleset.Set{}
+	names := make(map[string]bool, len(config.RuleSets))
 	for _, rs := range config.RuleSets {
-		if rs.Name == "" || sets[rs.Name] != nil {
-			return nil, fmt.Errorf("invalid or duplicate rule-set name %q", rs.Name)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if rs.Name == "" || names[rs.Name] {
+			return fmt.Errorf("invalid or duplicate rule-set name %q", rs.Name)
 		}
 		if (rs.URL == "") == (rs.Path == "") {
-			return nil, fmt.Errorf("rule-set %q needs exactly one of url or path", rs.Name)
+			return fmt.Errorf("rule-set %q needs exactly one of url or path", rs.Name)
 		}
 		if rs.URL != "" && !strings.HasPrefix(rs.URL, "https://") && !strings.HasPrefix(rs.URL, "http://") {
-			return nil, fmt.Errorf("rule-set %q url must be http or https", rs.Name)
+			return fmt.Errorf("rule-set %q url must be http or https", rs.Name)
 		}
 		if rs.Interval != 0 && rs.Interval < 600 {
-			return nil, fmt.Errorf("rule-set %q interval must be at least 600 seconds", rs.Name)
+			return fmt.Errorf("rule-set %q interval must be at least 600 seconds", rs.Name)
 		}
-		state := &ruleSetState{RuleSet: rs, set: ruleset.NewSet(rs.Name), format: rs.Format}
+		state := &ruleSetState{RuleSet: rs, slot: len(engine.ruleSets), format: rs.Format}
 		if state.format == "" {
 			state.format = ruleset.DetectFormat(rs.URL + rs.Path)
 		}
@@ -85,33 +116,99 @@ func (engine *Engine) openRuleSets(config Config) (map[string]*ruleset.Set, erro
 		switch state.format {
 		case ruleset.FormatSRS, ruleset.FormatYAML, ruleset.FormatText:
 		default:
-			return nil, fmt.Errorf("rule-set %q has unknown format %q", rs.Name, rs.Format)
+			return fmt.Errorf("rule-set %q has unknown format %q", rs.Name, rs.Format)
 		}
-		if rs.Path != "" {
-			data, err := os.ReadFile(rs.Path)
-			if err != nil {
-				return nil, fmt.Errorf("rule-set %q: %w", rs.Name, err)
-			}
-			content, err := ruleset.Parse(state.format, rs.Behavior, data)
-			if err != nil {
-				return nil, fmt.Errorf("rule-set %q: %w", rs.Name, err)
-			}
-			state.set.Store(content)
-			state.updated = time.Now()
-		} else if path := engine.cachePath(state); path != "" {
-			if data, err := os.ReadFile(path); err == nil {
-				if content, err := ruleset.Parse(state.format, rs.Behavior, data); err == nil {
-					state.set.Store(content)
-					if info, err := os.Stat(path); err == nil {
-						state.updated = info.ModTime()
+		path := rs.Path
+		if path == "" {
+			path = engine.cachePath(state)
+		}
+		if path != "" {
+			data, updated, err := readRuleSetFile(ctx, path)
+			if err == nil {
+				key := state.key(sha256.Sum256(data))
+				content := indexes[key]
+				if content == nil {
+					content, err = ruleset.ParseContext(ctx, state.format, state.Behavior, data)
+					if err == nil && indexes != nil {
+						indexes[key] = content
 					}
 				}
+				if err == nil {
+					state.digest, state.content, state.updated = key.digest, content, updated
+				}
+			}
+			if err != nil && rs.Path != "" {
+				return fmt.Errorf("rule-set %q: %w", rs.Name, err)
 			}
 		}
-		sets[rs.Name] = state.set
+		names[rs.Name] = true
 		engine.ruleSets = append(engine.ruleSets, state)
 	}
-	return sets, nil
+	return ctx.Err()
+}
+
+type ruleSetReader struct {
+	ctx context.Context
+	io.Reader
+}
+
+func (r ruleSetReader) Read(data []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.Reader.Read(data[:min(len(data), 64<<10)])
+}
+
+func readRuleSet(ctx context.Context, reader io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(ruleSetReader{ctx, reader}, maxRuleSetSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxRuleSetSize {
+		return nil, errors.New("rule set is larger than 32 MB")
+	}
+	return data, ctx.Err()
+}
+
+func readRuleSetFile(ctx context.Context, path string) ([]byte, time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, time.Time{}, err
+	}
+	// Opening a named pipe must never wait for a writer.
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, time.Time{}, errors.New("rule set must be a regular file")
+	}
+	if info.Size() > maxRuleSetSize {
+		return nil, time.Time{}, errors.New("rule set is larger than 32 MB")
+	}
+	data := make([]byte, int(info.Size()))
+	reader := ruleSetReader{ctx, file}
+	if _, err := io.ReadFull(reader, data); err != nil {
+		return nil, time.Time{}, err
+	}
+	var extra [1]byte
+	if n, err := reader.Read(extra[:]); n != 0 {
+		return nil, time.Time{}, errors.New("rule-set file changed while it was being read")
+	} else if err != io.EOF {
+		return nil, time.Time{}, err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	if after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
+		return nil, time.Time{}, errors.New("rule-set file changed while it was being read")
+	}
+	return data, info.ModTime(), ctx.Err()
 }
 
 func (engine *Engine) cachePath(state *ruleSetState) string {
@@ -142,7 +239,8 @@ type RefreshResult struct {
 	Canceled  bool `json:"canceled"`
 }
 
-// RefreshRuleSets downloads remote sets that are stale (or all, if force).
+// RefreshRuleSets downloads stale remote sets. A forced refresh also reloads
+// local files and rechecks every remote set.
 func (engine *Engine) RefreshRuleSets(ctx context.Context, force bool) (result RefreshResult) {
 	if engine.work == nil {
 		return RefreshResult{Canceled: true}
@@ -171,13 +269,13 @@ func (engine *Engine) RefreshRuleSets(ctx context.Context, force bool) (result R
 			return
 		}
 		engine.mu.Lock()
-		stale := state.URL != "" && (force || state.set.Load() == nil ||
+		stale := force || state.URL != "" && (state.content == nil ||
 			time.Since(state.updated) > time.Duration(state.Interval)*time.Second)
 		engine.mu.Unlock()
 		if !stale {
 			continue
 		}
-		err := engine.downloadRuleSet(ctx, state, epoch)
+		err := engine.refreshRuleSet(ctx, state, epoch)
 		engine.mu.Lock()
 		if ctx.Err() != nil || network.Err() != nil || engine.closed || engine.networkEpoch.Load() != epoch {
 			engine.mu.Unlock()
@@ -195,9 +293,7 @@ func (engine *Engine) RefreshRuleSets(ctx context.Context, force bool) (result R
 	return result
 }
 
-func (engine *Engine) downloadRuleSet(ctx context.Context, state *ruleSetState, epoch uint64) error {
-	ctx, cancel := context.WithTimeout(ctx, ruleSetDownloadDeadline)
-	defer cancel()
+func (engine *Engine) downloadRuleSet(ctx context.Context, url string) ([]byte, error) {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
 			return engine.Dial(ctx, "rule-set", address)
@@ -205,29 +301,50 @@ func (engine *Engine) downloadRuleSet(ctx context.Context, state *ruleSetState, 
 		ForceAttemptHTTP2: true,
 	}
 	defer transport.CloseIdleConnections()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, state.URL, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	request.Header.Set("User-Agent", "HopWay")
 	response, err := (&http.Client{Transport: transport}).Do(request)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d", response.StatusCode)
+		return nil, fmt.Errorf("HTTP %d", response.StatusCode)
 	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, maxRuleSetSize+1))
+	if response.ContentLength > maxRuleSetSize {
+		return nil, errors.New("rule set is larger than 32 MB")
+	}
+	return readRuleSet(ctx, response.Body)
+}
+
+func (engine *Engine) refreshRuleSet(ctx context.Context, state *ruleSetState, epoch uint64) error {
+	ctx, cancel := context.WithTimeout(ctx, ruleSetDownloadDeadline)
+	defer cancel()
+	var (
+		data    []byte
+		updated time.Time
+		err     error
+	)
+	if state.Path != "" {
+		data, updated, err = readRuleSetFile(ctx, state.Path)
+	} else {
+		data, err = engine.downloadRuleSet(ctx, state.URL)
+		updated = time.Now()
+	}
 	if err != nil {
 		return err
 	}
-	if len(data) > maxRuleSetSize {
-		return errors.New("rule set is larger than 32 MB")
-	}
-	content, err := ruleset.ParseContext(ctx, state.format, state.Behavior, data)
-	if err != nil {
-		return err
+	digest := sha256.Sum256(data)
+	// The refresh gate gives this call exclusive write access to the state.
+	content := state.content
+	if content == nil || digest != state.digest {
+		content, err = ruleset.ParseContext(ctx, state.format, state.Behavior, data)
+		if err != nil {
+			return err
+		}
 	}
 	if content.Entries == 0 {
 		return errors.New("rule set has no usable entries")
@@ -256,8 +373,11 @@ func (engine *Engine) downloadRuleSet(ctx context.Context, state *ruleSetState, 
 			return fmt.Errorf("cache: %w", err)
 		}
 	}
-	state.set.Store(content)
-	state.updated = time.Now()
+	if state.content != content {
+		engine.rules.replaceRuleSet(state.slot, content)
+		state.content, state.digest = content, digest
+	}
+	state.updated = updated
 	return nil
 }
 
@@ -316,7 +436,7 @@ func (engine *Engine) ruleSetStatus() []RuleSetStatus {
 	var list []RuleSetStatus
 	for _, state := range engine.ruleSets {
 		status := RuleSetStatus{Name: state.Name, Error: state.err}
-		if content := state.set.Load(); content != nil {
+		if content := state.content; content != nil {
 			status.Entries, status.Skipped = content.Entries, content.Skipped
 		}
 		if !state.updated.IsZero() {

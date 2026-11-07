@@ -228,6 +228,15 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 
 // NewWithResourceBudget shares opening and UDP limits across engine reloads.
 func NewWithResourceBudget(config Config, impl backend.Backend, budget *ResourceBudget, localPorts ...int) (*Engine, error) {
+	return NewContext(context.Background(), config, impl, budget, nil, localPorts...)
+}
+
+// NewContext builds a proxy with cancellable rule-set loading. A caller
+// building a replacement can provide indexes from the running proxy.
+func NewContext(ctx context.Context, config Config, impl backend.Backend, budget *ResourceBudget, indexes RuleSetIndexes, localPorts ...int) (*Engine, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if config.SOCKSPort < 0 || config.SOCKSPort > 65535 || config.HTTPPort < 0 || config.HTTPPort > 65535 ||
 		(config.SOCKSPort != 0 && config.SOCKSPort == config.HTTPPort) {
 		return nil, errors.New("proxy ports must be distinct or 0 for automatic assignment")
@@ -284,11 +293,10 @@ func NewWithResourceBudget(config Config, impl backend.Backend, budget *Resource
 		engine.order = append(engine.order, g.Name)
 	}
 	engine.dataDir = config.DataDir
-	sets, err := engine.openRuleSets(config)
-	if err != nil {
+	if err := engine.openRuleSets(ctx, config, indexes); err != nil {
 		return nil, err
 	}
-	engine.rules, err = newMatcher(config.Rules, func(via string) bool { return engine.valid(via) || via == "SELECT" }, sets)
+	engine.rules, err = newMatcher(config.Rules, func(via string) bool { return engine.valid(via) || via == "SELECT" }, engine.ruleSets)
 	if err != nil {
 		return nil, err
 	}
@@ -325,6 +333,9 @@ func NewWithResourceBudget(config Config, impl backend.Backend, budget *Resource
 	if err := engine.SetPolicy(Policy{Mode: config.Mode, Selected: config.Selected}); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if impl == nil {
 		return engine, nil // validation only
 	}
@@ -342,17 +353,16 @@ func NewWithResourceBudget(config Config, impl backend.Backend, budget *Resource
 		engine.dialSlots[node.Name] = budget.dials.retain(endpointKey(node.Server))
 	}
 	engine.work = lifetime.New()
-	ctx := engine.work.Context()
-	engine.ctx = ctx
-	engine.networkCtx, engine.cancelNetwork = context.WithCancel(ctx)
+	engine.ctx = engine.work.Context()
+	engine.networkCtx, engine.cancelNetwork = context.WithCancel(engine.ctx)
 	engine.ruleRefresh = make(chan struct{}, 1)
-	engine.work.Start(ctx, engine.MonitorAuto)
+	engine.work.Start(engine.ctx, engine.MonitorAuto)
 	if len(engine.autoMembers()) != 0 {
-		engine.work.Start(ctx, func(ctx context.Context) { engine.healthLoop(ctx, time.Duration(interval)*time.Second) })
+		engine.work.Start(engine.ctx, func(ctx context.Context) { engine.healthLoop(ctx, time.Duration(interval)*time.Second) })
 	}
 	for _, state := range engine.ruleSets {
 		if state.URL != "" {
-			engine.work.Start(ctx, engine.ruleSetLoop)
+			engine.work.Start(engine.ctx, engine.ruleSetLoop)
 			break
 		}
 	}
@@ -361,15 +371,22 @@ func NewWithResourceBudget(config Config, impl backend.Backend, budget *Resource
 
 // Validate checks a configuration without opening any node.
 func Validate(config Config, impl backend.Backend) error {
-	if _, err := New(config, nil); err != nil {
+	return ValidateContext(context.Background(), config, impl, nil)
+}
+
+func ValidateContext(ctx context.Context, config Config, impl backend.Backend, indexes RuleSetIndexes) error {
+	if _, err := NewContext(ctx, config, nil, nil, indexes); err != nil {
 		return err
 	}
 	for _, node := range config.Nodes {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := impl.Check(node); err != nil {
 			return fmt.Errorf("node %q: %w", node.Name, err)
 		}
 	}
-	return nil
+	return ctx.Err()
 }
 
 // NetworkChanged recovers from a network switch or a wake from sleep: cached

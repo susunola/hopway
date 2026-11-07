@@ -13,7 +13,6 @@ import (
 	"net/netip"
 	"regexp"
 	"strings"
-	"sync/atomic"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -202,20 +201,6 @@ func normalize(host string) string {
 	return host
 }
 
-// Set is a named list whose content can be replaced while it is in use.
-type Set struct {
-	Name    string
-	content atomic.Pointer[Content]
-}
-
-func NewSet(name string) *Set { return &Set{Name: name} }
-
-func (s *Set) Load() *Content            { return s.content.Load() }
-func (s *Set) Store(c *Content)          { s.content.Store(c) }
-func (s *Set) MatchDomain(h string) bool { return s.content.Load().MatchDomain(h) }
-func (s *Set) MatchIP(a netip.Addr) bool { return s.content.Load().MatchIP(a) }
-func (s *Set) HasIP() bool               { return s.content.Load().HasIP() }
-
 // Formats and behaviours, following Clash rule providers.
 const (
 	FormatSRS  = "srs"
@@ -264,7 +249,7 @@ func ParseContext(ctx context.Context, format, behavior string, data []byte) (*C
 	}
 	switch format {
 	case FormatSRS:
-		return parseSRS(ctx, contextReader{ctx, bytes.NewReader(data)})
+		return parseSRS(ctx, data)
 	case FormatYAML, FormatText, "":
 	default:
 		return nil, fmt.Errorf("unsupported rule-set format %q", format)

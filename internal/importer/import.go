@@ -393,7 +393,7 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 		return Result{}, errors.New("收到网页，无法作为订阅或节点配置导入")
 	}
 	if config, err := engine.Decode(strings.NewReader(raw)); strings.HasPrefix(raw, "{") && err == nil {
-		if err := engine.Validate(config, impl); err != nil {
+		if err := engine.ValidateContext(ctx, config, impl, nil); err != nil {
 			return Result{}, fmt.Errorf("HopWay 配置无效：%w", err)
 		}
 		return Result{Config: config, Usage: meter, Added: len(config.Nodes), Notes: []string{"已导入完整 JSON 配置"}, Validators: validators}, nil
@@ -473,7 +473,7 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 			result.Config.Selected = result.Config.Groups[0].Name
 		}
 	}
-	if err := engine.Validate(result.Config, impl); err != nil {
+	if err := engine.ValidateContext(ctx, result.Config, impl, nil); err != nil {
 		return Result{}, err
 	}
 	if source != nil {

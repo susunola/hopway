@@ -78,6 +78,7 @@ type Supervisor struct {
 
 	ledger           *engine.TrafficLedger
 	budget           *engine.ResourceBudget
+	startupIndexes   engine.RuleSetIndexes
 	refreshGate      chan struct{}
 	controlSlots     chan struct{}
 	current          atomic.Pointer[engine.Engine]
@@ -135,7 +136,8 @@ func OpenContext(ctx context.Context, path, dataDir string, impl backend.Backend
 	}
 	s := &Supervisor{path: path, dataDir: dataDir, impl: impl, lease: lease,
 		subErr: map[string]string{}, subMeta: map[string]SubscriptionStatus{},
-		refreshGate: make(chan struct{}, 1), controlSlots: make(chan struct{}, 8)}
+		refreshGate: make(chan struct{}, 1), controlSlots: make(chan struct{}, 8),
+		startupIndexes: make(engine.RuleSetIndexes)}
 	s.proxy = sysproxy.New(dataDir, nil)
 	var recoveryErr error
 	if SystemProxySupported {
@@ -146,7 +148,9 @@ func OpenContext(ctx context.Context, path, dataDir string, impl backend.Backend
 			s.proxyErr = "无法还原上次的系统代理设置：" + recoveryErr.Error()
 		}
 	}
-	loaded, err := profile.LoadContext(ctx, path, dataDir, s.validate)
+	loaded, err := profile.LoadContext(ctx, path, dataDir, func(config engine.Config) error {
+		return engine.ValidateContext(ctx, config, s.impl, s.startupIndexes)
+	})
 	if err != nil {
 		if lease != nil {
 			lease.Close()
@@ -175,18 +179,22 @@ func (s *Supervisor) readSnapshotMeta() {
 	}
 }
 
-func (s *Supervisor) validate(config engine.Config) error { return engine.Validate(config, s.impl) }
-
 func (s *Supervisor) Config() engine.Config { return s.loaded.Merged }
 
 // Start builds the engine; ports are HopWay's own listeners. target is
 // where the system proxy points when it is enabled.
 func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
+	return s.StartContext(s.ctx, target, ports...)
+}
+
+func (s *Supervisor) StartContext(ctx context.Context, target sysproxy.Target, ports ...int) error {
+	indexes := s.startupIndexes
+	s.startupIndexes = nil
 	budget, err := engine.NewResourceBudget(s.loaded.Merged.Resources)
 	if err != nil {
 		return err
 	}
-	core, err := engine.NewWithResourceBudget(s.loaded.Merged, s.impl, budget, ports...)
+	core, err := engine.NewContext(ctx, s.loaded.Merged, s.impl, budget, indexes, ports...)
 	if err != nil {
 		return err
 	}
@@ -547,14 +555,20 @@ func (s *Supervisor) reloadLocked(ctx context.Context, expected string) error {
 		}
 		defer release()
 	}
-	loaded, err := profile.CheckReplacement(s.path, s.dataDir, s.loaded, s.validate)
+	old := s.current.Load()
+	indexes := make(engine.RuleSetIndexes)
+	if old != nil {
+		indexes = old.RuleSetIndexes()
+	}
+	loaded, err := profile.CheckReplacement(s.path, s.dataDir, s.loaded, func(config engine.Config) error {
+		return engine.ValidateContext(ctx, config, s.impl, indexes)
+	})
 	if err != nil {
 		return err
 	}
 	if expected != "" && expected != loaded.Revision {
 		return profile.ErrConfigurationChanged
 	}
-	old := s.current.Load()
 	running := s.loaded.Merged
 	if loaded.Merged.SOCKSPort != running.SOCKSPort || loaded.Merged.HTTPPort != running.HTTPPort {
 		return ErrPortsChanged
@@ -562,7 +576,7 @@ func (s *Supervisor) reloadLocked(ctx context.Context, expected string) error {
 	if s.budget != nil && !s.budget.Matches(loaded.Merged.Resources) {
 		return ErrResourcesChanged
 	}
-	core, err := engine.NewWithResourceBudget(loaded.Merged, s.impl, s.budget, s.ports...)
+	core, err := engine.NewContext(ctx, loaded.Merged, s.impl, s.budget, indexes, s.ports...)
 	if err != nil {
 		return err
 	}

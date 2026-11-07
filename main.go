@@ -321,7 +321,7 @@ func run(path string, port int, check, managed bool) error {
 		info.Control = "http://" + control.Addr().String()
 		info.Token = hex.EncodeToString(token[:])
 	}
-	if err := supervisor.Start(sysproxy.Target{HTTP: info.HTTP, SOCKS: info.SOCKS}, ports...); err != nil {
+	if err := supervisor.StartContext(lifetime, sysproxy.Target{HTTP: info.HTTP, SOCKS: info.SOCKS}, ports...); err != nil {
 		return err
 	}
 	if lifetime.Err() != nil {
@@ -683,7 +683,7 @@ func flushControlStream(writer http.ResponseWriter, write func() error) error {
 
 func inspectProfile(ctx context.Context, path string, inspect, probe, refresh bool, names []string, refreshID string) error {
 	impl := backend.Default()
-	validate := func(config engine.Config) error { return engine.Validate(config, impl) }
+	validate := func(config engine.Config) error { return engine.ValidateContext(ctx, config, impl, nil) }
 	dir := dataDir(path)
 	loaded, err := profile.Check(path, dir, validate)
 	if err != nil {

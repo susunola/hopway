@@ -3,12 +3,14 @@ package engine
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,17 +19,133 @@ import (
 	"mac-proxy/internal/ruleset"
 )
 
+func TestRuleSetRequestsKeepSnapshotAcrossDNS(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.list")
+	write := func(content string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("IP-CIDR,192.0.2.0/24\n")
+	config := Default()
+	config.RuleSets = []RuleSet{{Name: "mixed", Path: path}}
+	config.Rules = []Rule{{Type: RuleRuleSet, Value: "mixed", Via: "REJECT"}, {Type: RuleMatch, Via: "DIRECT"}}
+	core, err := New(config, backend.Native{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+
+	// Both versions reject sample.test. Mixing the old domain evaluation
+	// with the new IP index would fall through to DIRECT.
+	const requests = 256
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entered := make(chan struct{}, requests)
+	decisions := make(chan int, requests)
+	release := make(chan struct{})
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	defer func() {
+		if release != nil {
+			close(release)
+		}
+	}()
+	blocked := release
+	address := []netip.Addr{netip.MustParseAddr("192.0.2.12")}
+	for range requests {
+		workers.Go(func() {
+			decisions <- core.rules.match("sample.test", func(string) []netip.Addr {
+				entered <- struct{}{}
+				<-blocked
+				return address
+			}, nil)
+		})
+	}
+	for range requests {
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			t.Fatal("routes did not reach DNS")
+		}
+	}
+	write("DOMAIN,sample.test\n")
+	if result := core.RefreshRuleSets(ctx, true); result.Succeeded != 1 || result.Canceled {
+		t.Fatalf("rule-set refresh: %+v", result)
+	}
+	if index := core.rules.match("sample.test", nil, nil); index != 0 {
+		t.Fatalf("new request did not see updated domain index: %d", index)
+	}
+	close(release)
+	release = nil
+	for range requests {
+		if index := <-decisions; index != 0 {
+			t.Fatalf("in-flight request mixed rule-set generations: %d", index)
+		}
+	}
+}
+
+func TestRuleSetIndexesReuseOnlyMatchingContent(t *testing.T) {
+	config := Default()
+	for _, name := range []string{"alpha", "beta"} {
+		path := filepath.Join(t.TempDir(), name+".list")
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("DOMAIN,%s.test\n", name)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		config.RuleSets = append(config.RuleSets, RuleSet{Name: name, Path: path})
+	}
+	core, err := New(config, backend.Native{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Close()
+	first, second := core.ruleSets[0].content, core.ruleSets[1].content
+	snapshot := core.rules.snapshot.Load()
+	ctx := context.Background()
+	if result := core.RefreshRuleSets(ctx, true); result.Succeeded != 2 || core.rules.snapshot.Load() != snapshot {
+		t.Fatalf("identical contents changed the snapshot: %+v", result)
+	}
+	if err := os.WriteFile(config.RuleSets[0].Path, []byte("DOMAIN,new.test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if result := core.RefreshRuleSets(ctx, true); result.Succeeded != 2 {
+		t.Fatalf("refresh: %+v", result)
+	}
+	latest := core.rules.snapshot.Load()
+	if latest == snapshot || (*latest)[0] == first || (*latest)[1] != second ||
+		!(*snapshot)[0].MatchDomain("alpha.test") || !(*latest)[0].MatchDomain("new.test") {
+		t.Fatal("refresh must replace the changed index and preserve the unchanged index")
+	}
+	reloaded, err := NewContext(ctx, config, nil, nil, core.RuleSetIndexes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for slot, state := range reloaded.ruleSets {
+		if state.content != (*latest)[slot] {
+			t.Fatalf("unchanged digest rebuilt rule set %q", state.Name)
+		}
+	}
+	config.RuleSets[0].Behavior = ruleset.BehaviorDomain
+	reloaded, err = NewContext(ctx, config, nil, nil, core.RuleSetIndexes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ruleSets[0].content == (*latest)[0] || reloaded.ruleSets[1].content != second {
+		t.Fatal("digest reuse must respect parser behavior")
+	}
+}
+
 func TestRuleSetMatching(t *testing.T) {
-	set := ruleset.NewSet("s")
 	content, _ := ruleset.Parse(ruleset.FormatText, ruleset.BehaviorClassical,
 		[]byte("DOMAIN-SUFFIX,listed.test\nIP-CIDR,198.51.100.0/24\n"))
-	set.Store(content)
+	sets := []*ruleSetState{{RuleSet: RuleSet{Name: "s"}, content: content}}
 	rules := []Rule{
 		{Type: RuleDomain, Value: "first.listed.test", Via: "A"},
 		{Type: RuleRuleSet, Value: "s", Via: "B"},
 		{Type: RuleMatch, Via: "C"},
 	}
-	m, err := newMatcher(rules, func(string) bool { return true }, map[string]*ruleset.Set{"s": set})
+	m, err := newMatcher(rules, func(string) bool { return true }, sets)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +162,7 @@ func TestRuleSetMatching(t *testing.T) {
 		}
 	}
 	rules[1].NoResolve = true
-	m, _ = newMatcher(rules, func(string) bool { return true }, map[string]*ruleset.Set{"s": set})
+	m, _ = newMatcher(rules, func(string) bool { return true }, sets)
 	if got := rules[m.match("via-ip.test", resolve, nil)].Via; got != "C" {
 		t.Errorf("no-resolve rule set matched a resolved name: %s", got)
 	}

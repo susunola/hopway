@@ -3,7 +3,9 @@ package engine
 import (
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
+	"sync/atomic"
 
 	"mac-proxy/internal/process"
 	"mac-proxy/internal/ruleset"
@@ -51,14 +53,17 @@ type matcher struct {
 	procDirs []indexed
 	procMin  int
 	sets     []setRule // rule-set rules in order
+	snapshot atomic.Pointer[ruleSetContents]
 	final    int
 }
 
 type setRule struct {
 	index     int
-	set       *ruleset.Set
+	slot      int
 	noResolve bool
 }
+
+type ruleSetContents []*ruleset.Content
 
 type indexed struct {
 	value string
@@ -116,10 +121,18 @@ func (set *prefixSet) lookup(addr netip.Addr) int {
 	return best
 }
 
-func newMatcher(rules []Rule, valid func(string) bool, sets map[string]*ruleset.Set) (*matcher, error) {
+func newMatcher(rules []Rule, valid func(string) bool, sets []*ruleSetState) (*matcher, error) {
 	m := &matcher{exact: make(map[string]int), suffix: make(map[string]int), final: none,
 		procName: make(map[string]int), procPath: make(map[string]int), procMin: none,
 		ip: prefixSet{first: none}, resolved: prefixSet{first: none}}
+	slots := make(map[string]int, len(sets))
+	contents := make(ruleSetContents, len(sets))
+	for slot, state := range sets {
+		slots[state.Name], contents[slot] = slot, state.content
+	}
+	if len(contents) != 0 {
+		m.snapshot.Store(&contents)
+	}
 	for index, rule := range rules {
 		if !valid(rule.Via) {
 			return nil, fmt.Errorf("rule %d refers to unknown outbound %q", index+1, rule.Via)
@@ -180,11 +193,11 @@ func newMatcher(rules []Rule, valid func(string) bool, sets map[string]*ruleset.
 			}
 			m.procMin = min(m.procMin, index)
 		case RuleRuleSet:
-			set := sets[rule.Value]
-			if set == nil {
+			slot, ok := slots[rule.Value]
+			if !ok {
 				return nil, fmt.Errorf("rule %d refers to unknown rule-set %q", index+1, rule.Value)
 			}
-			m.sets = append(m.sets, setRule{index, set, rule.NoResolve})
+			m.sets = append(m.sets, setRule{index, slot, rule.NoResolve})
 		case RuleMatch:
 			if rule.Value != "" || index != len(rules)-1 {
 				return nil, fmt.Errorf("rule %d: match must be the last rule and have no value", index+1)
@@ -198,16 +211,28 @@ func newMatcher(rules []Rule, valid func(string) bool, sets map[string]*ruleset.
 	return m, nil
 }
 
+// replaceRuleSet is serialized by the engine. It copies only pointers, so
+// requests already matching can keep using the snapshot they started with.
+func (m *matcher) replaceRuleSet(slot int, content *ruleset.Content) {
+	contents := slices.Clone(*m.snapshot.Load())
+	contents[slot] = content
+	m.snapshot.Store(&contents)
+}
+
 // match returns the index of the first matching rule, or -1. resolve is
 // called at most once, and only if an IP rule could beat every domain match;
 // owner likewise only if a process rule could.
 func (m *matcher) match(host string, resolve func(string) []netip.Addr, owner func() *process.Owner) int {
 	host = normalizeHost(host)
+	var contents ruleSetContents
+	if len(m.sets) != 0 {
+		contents = *m.snapshot.Load()
+	}
 	best := m.final
 	if addr, err := netip.ParseAddr(host); err == nil {
 		addr = addr.WithZone("")
 		best = min(best, m.ip.lookup(addr))
-		best = m.matchSetIP(best, addr, false)
+		best = m.matchSetIP(contents, best, addr, false)
 		return found(m.matchProcess(best, owner))
 	}
 	if index, ok := m.exact[host]; ok {
@@ -235,23 +260,23 @@ func (m *matcher) match(host string, resolve func(string) []netip.Addr, owner fu
 		if rule.index >= best {
 			break
 		}
-		if rule.set.MatchDomain(host) {
+		if contents[rule.slot].MatchDomain(host) {
 			best = rule.index
 			break
 		}
 	}
 	best = m.matchProcess(best, owner)
-	if m.resolveCould(best) && resolve != nil {
+	if resolve != nil && m.resolveCould(contents, best) {
 		for _, addr := range resolve(host) {
 			best = min(best, m.resolved.lookup(addr))
-			best = m.matchSetIP(best, addr, true)
+			best = m.matchSetIP(contents, best, addr, true)
 		}
 	}
 	return found(best)
 }
 
 // resolveCould reports whether an IP rule that may resolve names sits before best.
-func (m *matcher) resolveCould(best int) bool {
+func (m *matcher) resolveCould(contents ruleSetContents, best int) bool {
 	if m.resolved.first < best {
 		return true
 	}
@@ -259,14 +284,14 @@ func (m *matcher) resolveCould(best int) bool {
 		if rule.index >= best {
 			return false
 		}
-		if !rule.noResolve && rule.set.HasIP() {
+		if !rule.noResolve && contents[rule.slot].HasIP() {
 			return true
 		}
 	}
 	return false
 }
 
-func (m *matcher) matchSetIP(best int, addr netip.Addr, resolved bool) int {
+func (m *matcher) matchSetIP(contents ruleSetContents, best int, addr netip.Addr, resolved bool) int {
 	for _, rule := range m.sets {
 		if rule.index >= best {
 			break
@@ -274,7 +299,7 @@ func (m *matcher) matchSetIP(best int, addr netip.Addr, resolved bool) int {
 		if resolved && rule.noResolve {
 			continue
 		}
-		if rule.set.MatchIP(addr) {
+		if contents[rule.slot].MatchIP(addr) {
 			return rule.index
 		}
 	}

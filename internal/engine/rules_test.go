@@ -75,6 +75,33 @@ func TestRuleValidation(t *testing.T) {
 	}
 }
 
+func TestOverlappingCIDRsRespectConfiguredOrder(t *testing.T) {
+	for _, family := range []struct{ broad, narrow, inside, outside string }{
+		{"192.0.0.0/16", "192.0.2.0/24", "192.0.2.42", "192.0.3.42"},
+		{"2001:db8::/32", "2001:db8:2::/48", "2001:db8:2::42", "2001:db8:3::42"},
+	} {
+		for _, broadFirst := range []bool{false, true} {
+			broad := Rule{Type: RuleIPCIDR, Value: family.broad, Via: "broad"}
+			narrow := Rule{Type: RuleIPCIDR, Value: family.narrow, Via: "narrow"}
+			rules := []Rule{narrow, broad}
+			if broadFirst {
+				rules[0], rules[1] = rules[1], rules[0]
+			}
+			m, err := newMatcher(rules, func(string) bool { return true }, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, test := range []struct{ addr, want string }{{family.inside, rules[0].Via}, {family.outside, "broad"}} {
+				resolve := func(string) []netip.Addr { return []netip.Addr{netip.MustParseAddr(test.addr)} }
+				literal, resolved := m.match(test.addr, nil, nil), m.match("resolved.test", resolve, nil)
+				if literal < 0 || resolved != literal || rules[literal].Via != test.want {
+					t.Errorf("%s broadFirst=%t: literal index %d, resolved index %d, want %s", test.addr, broadFirst, literal, resolved, test.want)
+				}
+			}
+		}
+	}
+}
+
 func bigRuleSet(n int) []Rule {
 	rules := make([]Rule, 0, n+1)
 	for i := 0; i < n; i++ {
@@ -92,15 +119,22 @@ func bigRuleSet(n int) []Rule {
 	return append(rules, Rule{Type: RuleMatch, Via: "DIRECT"})
 }
 
-func BenchmarkMatch100k(b *testing.B) {
-	m, err := newMatcher(bigRuleSet(100_000), func(string) bool { return true }, nil)
-	if err != nil {
-		b.Fatal(err)
-	}
-	hosts := []string{"www.site99996.example", "host50001.example", "unknown.example.org", "10.1.2.3", "2001:db8:42::1"}
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		m.match(hosts[i%len(hosts)], nil, nil)
+func BenchmarkMatchRuleCounts(b *testing.B) {
+	for _, count := range []int{10_000, 100_000, 500_000} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			m, err := newMatcher(bigRuleSet(count), func(string) bool { return true }, nil)
+			if err != nil {
+				b.Fatal(err)
+			}
+			hosts := []string{fmt.Sprintf("www.site%d.example", count-4), "host5001.example",
+				"unknown.example.org", "10.1.2.3", "2001:db8:42::1"}
+			b.ReportAllocs()
+			i := 0
+			for b.Loop() {
+				m.match(hosts[i%len(hosts)], nil, nil)
+				i++
+			}
+		})
 	}
 }
 

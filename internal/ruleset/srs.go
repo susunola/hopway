@@ -3,7 +3,11 @@
 package ruleset
 
 import (
+	"bufio"
+	"bytes"
+	"compress/zlib"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -11,11 +15,42 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 )
 
+const maxSRSExpandedSize = 32 << 20
+
+// The sing-box decoder takes compressed input and does not expose its
+// decompressor. Bound expansion before handing it any rule records.
+func checkSRSExpansion(ctx context.Context, reader io.Reader) error {
+	var header [len(srs.MagicBytes) + 1]byte
+	if _, err := io.ReadFull(reader, header[:]); err != nil {
+		return err
+	}
+	if !bytes.Equal(header[:len(srs.MagicBytes)], srs.MagicBytes[:]) {
+		return errors.New("invalid sing-box rule-set file")
+	}
+	// A buffered source avoids one-byte calls into the underlying reader.
+	expanded, err := zlib.NewReader(bufio.NewReader(reader))
+	if err != nil {
+		return err
+	}
+	defer expanded.Close()
+	size, err := io.Copy(io.Discard, io.LimitReader(contextReader{ctx, expanded}, maxSRSExpandedSize+1))
+	if err != nil {
+		return err
+	}
+	if size > maxSRSExpandedSize {
+		return errors.New("expanded .srs rule set is larger than 32 MB")
+	}
+	return ctx.Err()
+}
+
 // parseSRS reads a sing-box binary rule set (GeoIP, GeoSite and friends).
 // Only default rules are used; logical rules and port/process fields are
 // counted as skipped.
-func parseSRS(ctx context.Context, reader io.Reader) (*Content, error) {
-	compat, err := srs.Read(reader, false) // keep compact matchers
+func parseSRS(ctx context.Context, data []byte) (*Content, error) {
+	if err := checkSRSExpansion(ctx, contextReader{ctx, bytes.NewReader(data)}); err != nil {
+		return nil, fmt.Errorf("invalid .srs rule set: %w", err)
+	}
+	compat, err := srs.Read(contextReader{ctx, bytes.NewReader(data)}, false) // keep compact matchers
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()

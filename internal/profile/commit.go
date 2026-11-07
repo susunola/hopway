@@ -94,7 +94,7 @@ func CommitConfig(ctx context.Context, path, dataDir, expected string, data []by
 	if err != nil {
 		return "", err
 	}
-	validate := func(config engine.Config) error { return engine.Validate(config, impl) }
+	validate := func(config engine.Config) error { return engine.ValidateContext(ctx, config, impl, nil) }
 	if _, err := validateConfig(config, dataDir, validate, "", nil, &previous); err != nil {
 		return "", err
 	}
@@ -151,7 +151,7 @@ func CommitImport(ctx context.Context, path, dataDir, expected, raw string, impl
 	}
 	var stagedPath string
 	if plan != nil {
-		if err := plan.prepare(dataDir, impl, &base); err != nil {
+		if err := plan.prepare(ctx, dataDir, impl, &base); err != nil {
 			return ImportReceipt{}, err
 		}
 		stagedPath, err = plan.stage(ctx, dataDir)
@@ -160,7 +160,7 @@ func CommitImport(ctx context.Context, path, dataDir, expected, raw string, impl
 		}
 		result = plan.result
 	} else {
-		validate := func(config engine.Config) error { return engine.Validate(config, impl) }
+		validate := func(config engine.Config) error { return engine.ValidateContext(ctx, config, impl, nil) }
 		if _, err := validateConfig(result.Config, dataDir, validate, "", nil, &base); err != nil {
 			return ImportReceipt{}, err
 		}

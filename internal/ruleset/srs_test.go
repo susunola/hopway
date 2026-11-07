@@ -4,13 +4,37 @@ package ruleset
 
 import (
 	"bytes"
+	"compress/zlib"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/sagernet/sing-box/common/srs"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 )
+
+func TestSRSRejectsExpansionBeyondLimit(t *testing.T) {
+	var buffer bytes.Buffer
+	buffer.Write(srs.MagicBytes[:])
+	buffer.WriteByte(C.RuleSetVersionCurrent)
+	expanded := zlib.NewWriter(&buffer)
+	block := make([]byte, 64<<10)
+	for range maxSRSExpandedSize / len(block) {
+		if _, err := expanded.Write(block); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := expanded.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := expanded.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if content, err := Parse(FormatSRS, "", buffer.Bytes()); content != nil || err == nil || !strings.Contains(err.Error(), "expanded .srs") {
+		t.Fatalf("expanded %d-byte SRS must be rejected: %v, %v", buffer.Len(), content, err)
+	}
+}
 
 func TestSRS(t *testing.T) {
 	plain := option.PlainRuleSet{Rules: []option.HeadlessRule{
