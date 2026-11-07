@@ -70,6 +70,7 @@ type Supervisor struct {
 	lease         *os.File
 
 	ledger        *engine.TrafficLedger
+	packetBudget  *engine.PacketBudget
 	refreshMu     sync.Mutex
 	current       atomic.Pointer[engine.Engine]
 	mu            sync.Mutex // serializes reloads; guards the fields below
@@ -121,7 +122,7 @@ func Open(path, dataDir string, impl backend.Backend) (*Supervisor, error) {
 		return nil, err
 	}
 	s := &Supervisor{path: path, dataDir: dataDir, impl: impl, lease: lease,
-		subErr: map[string]string{}, subMeta: map[string]SubscriptionStatus{}}
+		packetBudget: engine.NewPacketBudget(), subErr: map[string]string{}, subMeta: map[string]SubscriptionStatus{}}
 	s.proxy = sysproxy.New(dataDir, nil)
 	var recoveryErr error
 	if SystemProxySupported {
@@ -166,7 +167,7 @@ func (s *Supervisor) Config() engine.Config { return s.loaded.Merged }
 // Start builds the engine; ports are HopWay's own listeners. target is
 // where the system proxy points when it is enabled.
 func (s *Supervisor) Start(target sysproxy.Target, ports ...int) error {
-	core, err := engine.New(s.loaded.Merged, s.impl, ports...)
+	core, err := engine.NewWithPacketBudget(s.loaded.Merged, s.impl, s.packetBudget, ports...)
 	if err != nil {
 		return err
 	}
@@ -487,7 +488,7 @@ func (s *Supervisor) reloadLocked() error {
 		(loaded.Merged.HTTPPort != running.HTTPPort && loaded.Merged.HTTPPort != 0) {
 		return ErrPortsChanged
 	}
-	core, err := engine.New(loaded.Merged, s.impl, s.ports...)
+	core, err := engine.NewWithPacketBudget(loaded.Merged, s.impl, s.packetBudget, s.ports...)
 	if err != nil {
 		return err
 	}

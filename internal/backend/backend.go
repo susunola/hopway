@@ -127,10 +127,15 @@ func BoundDial(ctx context.Context, network, address string) (net.Conn, error) {
 // SocketControl applied unless peer is a loopback address.
 func ListenPacket(ctx context.Context, peer netip.Addr) (net.PacketConn, error) {
 	config := net.ListenConfig{}
-	if control := socketControl.Load(); control != nil && !peer.Unmap().IsLoopback() {
+	peer = peer.Unmap()
+	if control := socketControl.Load(); control != nil && !peer.IsLoopback() {
 		config.Control = *control
 	}
-	return config.ListenPacket(ctx, "udp", "")
+	network := "udp6"
+	if peer.Is4() {
+		network = "udp4"
+	}
+	return config.ListenPacket(ctx, network, "")
 }
 
 // Resolver is the DNS cache shared by DIRECT connections and node servers.

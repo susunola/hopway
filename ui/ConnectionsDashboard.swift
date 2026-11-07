@@ -49,6 +49,21 @@ struct ConnectionsDashboard: View {
             HopPageHeading(title: "连接", detail: core.status == nil
                            ? "查看应用、出站和匹配规则。"
                            : "\(core.status?.active ?? 0) 个活动 · \(all.filter(Scope.failed.includes).count) 个失败 · \(all.filter(Scope.blocked.includes).count) 个拦截")
+            if let drops = core.status?.udpDrops, !drops.isEmpty {
+                HStack(spacing: 12) {
+                    Label("本机 UDP 丢弃", systemImage: "exclamationmark.circle")
+                    ForEach(drops.keys.sorted(), id: \.self) { inbound in
+                        if let counts = drops[inbound] {
+                            Text("\(inbound) \(counts.total.formatted()) 包")
+                                .monospacedDigit()
+                                .help(counts.detail)
+                                .accessibilityLabel("\(inbound) · \(counts.detail)")
+                        }
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
             HStack(spacing: 12) {
                 HopSearchField(placeholder: "筛选目标、应用、节点或规则", text: $query)
                     .frame(minWidth: 180, idealWidth: 255, maxWidth: 290)

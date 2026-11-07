@@ -44,6 +44,8 @@ type Service struct {
 	once           sync.Once
 }
 
+const tunUDPIdle = 5 * time.Minute
+
 func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) {
 	options.defaults()
 	fd := options.FD
@@ -104,7 +106,7 @@ func Start(options Options, dial Dial, dialPacket DialPacket) (*Service, error) 
 	}
 	fd = 0 // the TUN device now owns the descriptor
 	s.stack, err = stun.NewStack("system", stun.StackOptions{
-		Context: s.ctx, Tun: s.device, TunOptions: tunOptions, UDPTimeout: 5 * time.Minute,
+		Context: s.ctx, Tun: s.device, TunOptions: tunOptions, UDPTimeout: tunUDPIdle,
 		// The first packet selects the outbound. Separate destinations
 		// must not share that choice even if the app uses one UDP socket.
 		UDPMapping: stun.NATMappingAddressAndPortDependent, UDPNATMax: 1024,
@@ -243,6 +245,7 @@ func (s *Service) NewConnectionEx(ctx context.Context, conn net.Conn, source, de
 func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	target := s.target(destination)
 	if destination.IsIP() && s.fake.Contains(destination.Addr) && target == destination.String() {
+		wire.TUNUDPDrops.Add(wire.UDPInvalid, 1)
 		conn.Close()
 		done(onClose, errors.New("unknown fake address"))
 		return
@@ -250,6 +253,9 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	ctx = peer.WithAddrs(ctx, peer.Addrs{Client: source.AddrPort(), Server: destination.AddrPort(), Local: true})
 	remote, err := s.dialPacket(ctx, "TUN", target)
 	if err != nil {
+		if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+			wire.TUNUDPDrops.Add(backend.PacketDropReason(err), 1)
+		}
 		conn.Close()
 		done(onClose, err)
 		return
@@ -263,10 +269,10 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 		})
 	}
 	written := M.ParseSocksaddr(target)
+	lifetime, _ := conn.(interface{ SetTimeout(time.Duration) bool })
 	go func() {
 		buffer := make([]byte, 65535)
 		for {
-			remote.SetReadDeadline(time.Now().Add(5 * time.Minute))
 			n, from, err := remote.ReadFrom(buffer)
 			if err != nil {
 				finish(nil)
@@ -286,6 +292,12 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 				finish(err)
 				return
 			}
+			// The NAT table already refreshes uploads. Refresh downloads
+			// here and let the table, rather than a second timer, own expiry.
+			if lifetime != nil && !lifetime.SetTimeout(tunUDPIdle) {
+				finish(nil)
+				return
+			}
 		}
 	}()
 	for {
@@ -297,7 +309,12 @@ func (s *Service) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 			return
 		}
 		if to == destination {
-			_, _ = remote.WriteTo(packet.Bytes(), written)
+			_, err := remote.WriteTo(packet.Bytes(), written)
+			if err != nil && ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+				wire.TUNUDPDrops.Add(backend.PacketDropReason(err), 1)
+			}
+		} else {
+			wire.TUNUDPDrops.Add(wire.UDPInvalid, 1)
 		}
 		packet.Release()
 	}

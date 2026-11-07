@@ -9,8 +9,24 @@ import (
 
 	M "github.com/sagernet/sing/common/metadata"
 
+	"mac-proxy/internal/outbound"
 	"mac-proxy/internal/wire"
 )
+
+// ErrPacketCongested reports a dropped datagram or refused session when
+// there is no capacity. An existing session can be used again after a drop.
+var ErrPacketCongested = errors.New("UDP outbound is congested")
+
+func PacketDropReason(err error) wire.UDPDropReason {
+	switch {
+	case errors.Is(err, ErrPacketCongested):
+		return wire.UDPQueueFull
+	case errors.Is(err, outbound.ErrRejected):
+		return wire.UDPPolicy
+	default:
+		return wire.UDPUpstream
+	}
+}
 
 // DirectPacket opens a UDP socket for DIRECT traffic. WriteTo accepts
 // M.Socksaddr destinations, names included, and ReadFrom reports replies

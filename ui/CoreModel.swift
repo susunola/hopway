@@ -153,6 +153,19 @@ struct ProxyStatus: Decodable {
         var id: String { name }
     }
 
+    struct UDPDropCounts: Decodable {
+        let invalid: UInt64
+        let fragmented: UInt64
+        let queueFull: UInt64
+        let upstream: UInt64
+        let policy: UInt64
+
+        var total: UInt64 { invalid + fragmented + queueFull + upstream + policy }
+        var detail: String {
+            "队列满 \(queueFull) · 出站错误 \(upstream) · 规则拒绝 \(policy) · 分片 \(fragmented) · 无效包 \(invalid)"
+        }
+    }
+
     let policy: Policy
     let auto: AutoRoutingStatus?
     let warnings: [String]?
@@ -165,6 +178,7 @@ struct ProxyStatus: Decodable {
     let connections: [Connection]
     let active: Int
     let sessionTraffic: TrafficHistory.Count?
+    let udpDrops: [String: UDPDropCounts]?
     let reloaded: Double?
 }
 

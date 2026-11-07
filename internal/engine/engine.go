@@ -141,15 +141,16 @@ type Record struct {
 }
 
 type Status struct {
-	Auto           *AutoStatus     `json:"auto,omitempty"`
-	Backend        string          `json:"backend"`
-	Policy         Policy          `json:"policy"`
-	Nodes          []NodeSummary   `json:"nodes"`
-	Groups         []GroupStatus   `json:"groups,omitempty"`
-	RuleSets       []RuleSetStatus `json:"ruleSets,omitempty"`
-	Connections    []Record        `json:"connections"`
-	Active         int             `json:"active"`
-	SessionTraffic *trafficCount   `json:"sessionTraffic,omitempty"`
+	Auto           *AutoStatus                   `json:"auto,omitempty"`
+	Backend        string                        `json:"backend"`
+	Policy         Policy                        `json:"policy"`
+	Nodes          []NodeSummary                 `json:"nodes"`
+	Groups         []GroupStatus                 `json:"groups,omitempty"`
+	RuleSets       []RuleSetStatus               `json:"ruleSets,omitempty"`
+	Connections    []Record                      `json:"connections"`
+	Active         int                           `json:"active"`
+	SessionTraffic *trafficCount                 `json:"sessionTraffic,omitempty"`
+	UDPDrops       map[string]wire.UDPDropCounts `json:"udpDrops,omitempty"`
 }
 
 type Engine struct {
@@ -174,6 +175,7 @@ type Engine struct {
 	sequence      uint64
 	live          map[uint64]*tracked
 	livePackets   map[uint64]*trackedPacket
+	packetBudget  *PacketBudget
 	recent        []Record
 	ports         map[uint16]bool
 	ctx           context.Context
@@ -202,6 +204,11 @@ const (
 // New builds an engine; localPorts are HopWay's own listeners, which no
 // connection may be sent back to.
 func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error) {
+	return NewWithPacketBudget(config, impl, nil, localPorts...)
+}
+
+// NewWithPacketBudget shares UDP resources with the previous engine on reload.
+func NewWithPacketBudget(config Config, impl backend.Backend, budget *PacketBudget, localPorts ...int) (*Engine, error) {
 	if config.SOCKSPort < 0 || config.SOCKSPort > 65535 || config.HTTPPort < 0 || config.HTTPPort > 65535 ||
 		(config.SOCKSPort != 0 && config.SOCKSPort == config.HTTPPort) {
 		return nil, errors.New("proxy ports must be distinct or 0 for automatic assignment")
@@ -275,6 +282,10 @@ func New(config Config, impl backend.Backend, localPorts ...int) (*Engine, error
 	if impl == nil {
 		return engine, nil // validation only
 	}
+	if budget == nil {
+		budget = NewPacketBudget()
+	}
+	engine.packetBudget = budget
 	engine.backend = impl.Name()
 	engine.instance, err = impl.Open(config.Nodes, engine.guard)
 	if err != nil {
@@ -619,6 +630,12 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 	if err != nil {
 		return nil, err
 	}
+	select {
+	case engine.packetBudget.opening <- struct{}{}:
+		defer func() { <-engine.packetBudget.opening }()
+	default:
+		return nil, backend.ErrPacketCongested
+	}
 	engine.mu.Lock()
 	if engine.closed {
 		engine.mu.Unlock()
@@ -649,10 +666,13 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 	}
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
+	stop := context.AfterFunc(engine.ctx, cancel)
+	defer stop()
 	var conn net.PacketConn
+	var exit *packetOutbound
 	for i, candidate := range candidates {
 		record.Via, record.Route, record.Attempts = candidate.via, candidate.route, i+1
-		conn, err = engine.dialPacketOnce(ctx, candidate.via, target)
+		conn, exit, err = engine.openPacket(ctx, candidate.via, target)
 		if err == nil || errors.Is(err, outbound.ErrRejected) || ctx.Err() != nil {
 			break
 		}
@@ -663,24 +683,58 @@ func (engine *Engine) DialPacket(ctx context.Context, inbound, target string) (n
 	record.setOwner(owner)
 	engine.mu.Lock()
 	if engine.closed {
-		engine.mu.Unlock()
-		if conn != nil {
-			_ = conn.Close()
-		}
-		return nil, net.ErrClosed
+		err = net.ErrClosed
+	} else if err == nil {
+		err = ctx.Err()
 	}
-	defer engine.mu.Unlock()
 	if err != nil {
 		record.State, record.Error = "failed", describe(err)
 		if errors.Is(err, outbound.ErrRejected) {
 			record.State, record.Stage = "blocked", trace.StageRoute
 		}
 		engine.remember(record)
+		engine.mu.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+			engine.packetBudget.releaseOutbound(exit)
+		}
 		return nil, err
 	}
-	tracked := &trackedPacket{PacketConn: conn, engine: engine, record: record}
+	tracked := &trackedPacket{PacketConn: conn, engine: engine, record: record, outbound: exit}
+	evicted := engine.packetBudget.admit(tracked)
 	engine.livePackets[record.ID] = tracked
+	engine.mu.Unlock()
+	if evicted != nil {
+		_ = evicted.Close()
+	}
 	return tracked, nil
+}
+
+func (engine *Engine) openPacket(ctx context.Context, via, target string) (net.PacketConn, *packetOutbound, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if via == "REJECT" {
+		return nil, nil, outbound.ErrRejected
+	}
+	key := strings.ToLower(engine.servers[via])
+	if key == "" {
+		key = via
+	}
+	exit := engine.packetBudget.retainOutbound(key)
+	select {
+	case exit.opening <- struct{}{}:
+		defer func() { <-exit.opening }()
+	default:
+		engine.packetBudget.releaseOutbound(exit)
+		return nil, nil, backend.ErrPacketCongested
+	}
+	conn, err := engine.dialPacketOnce(ctx, via, target)
+	if err != nil {
+		engine.packetBudget.releaseOutbound(exit)
+		return nil, nil, err
+	}
+	return conn, exit, nil
 }
 
 func (engine *Engine) dialPacketOnce(ctx context.Context, via, target string) (net.PacketConn, error) {
@@ -725,12 +779,24 @@ type trackedPacket struct {
 	engine     *Engine
 	record     Record
 	sent, recv atomic.Uint64
+	outbound   *packetOutbound
+	lastActive atomic.Int64
+	closed     atomic.Bool
 	once       sync.Once
 }
 
 func (conn *trackedPacket) ReadFrom(data []byte) (int, net.Addr, error) {
+	if conn.closed.Load() {
+		return 0, nil, net.ErrClosed
+	}
 	n, addr, err := conn.PacketConn.ReadFrom(data)
+	if conn.closed.Load() {
+		return 0, nil, net.ErrClosed
+	}
 	conn.recv.Add(uint64(max(n, 0)))
+	if err == nil {
+		conn.touch()
+	}
 	if n > 0 {
 		conn.engine.traffic.add(time.Now(), conn.record.Via, 0, uint64(n))
 	}
@@ -738,12 +804,36 @@ func (conn *trackedPacket) ReadFrom(data []byte) (int, net.Addr, error) {
 }
 
 func (conn *trackedPacket) WriteTo(data []byte, addr net.Addr) (int, error) {
+	if conn.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	select {
+	case conn.outbound.sending <- struct{}{}:
+		defer func() {
+			<-conn.outbound.sending
+			if conn.outbound.refs.Load() == 0 {
+				conn.engine.packetBudget.pruneOutbound(conn.outbound)
+			}
+		}()
+	default:
+		return 0, backend.ErrPacketCongested
+	}
+	if conn.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	n, err := conn.PacketConn.WriteTo(data, addr)
+	if err == nil {
+		conn.touch()
+	}
 	conn.sent.Add(uint64(max(n, 0)))
 	if n > 0 {
 		conn.engine.traffic.add(time.Now(), conn.record.Via, uint64(n), 0)
 	}
 	return n, err
+}
+
+func (conn *trackedPacket) touch() {
+	conn.lastActive.Store(time.Since(conn.engine.packetBudget.started).Nanoseconds())
 }
 
 func (conn *trackedPacket) snapshot() Record {
@@ -755,7 +845,9 @@ func (conn *trackedPacket) snapshot() Record {
 func (conn *trackedPacket) Close() error {
 	var err error
 	conn.once.Do(func() {
+		conn.closed.Store(true)
 		err = conn.PacketConn.Close()
+		conn.engine.packetBudget.remove(conn)
 		conn.engine.mu.Lock()
 		defer conn.engine.mu.Unlock()
 		record := conn.snapshot()
@@ -875,6 +967,17 @@ func (engine *Engine) Status() Status {
 	records = append(records, engine.recent...)
 	status := Status{Backend: engine.backend, Policy: engine.policy, Connections: records, Active: len(engine.live) + len(engine.livePackets),
 		RuleSets: engine.ruleSetStatus(), SessionTraffic: engine.traffic.sessionTotals()}
+	for _, inbound := range [...]struct {
+		name  string
+		drops wire.UDPDropCounts
+	}{{"SOCKS5", wire.SOCKSUDPDrops.Snapshot()}, {"TUN", wire.TUNUDPDrops.Snapshot()}} {
+		if inbound.drops != (wire.UDPDropCounts{}) {
+			if status.UDPDrops == nil {
+				status.UDPDrops = make(map[string]wire.UDPDropCounts, 2)
+			}
+			status.UDPDrops[inbound.name] = inbound.drops
+		}
+	}
 	if state := engine.auto; state != nil {
 		status.Auto = &AutoStatus{Node: state.activeNode, Probing: state.probing}
 		if state.activeGroup >= 0 {

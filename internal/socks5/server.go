@@ -44,6 +44,10 @@ func Handle(client *net.TCPConn, dial DialFunc) error { return HandleWithUDP(cli
 
 // HandleWithUDP serves one client; dialPacket enables UDP ASSOCIATE.
 func HandleWithUDP(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc) error {
+	return handleWithUDP(client, dial, dialPacket, udpSessionIdle)
+}
+
+func handleWithUDP(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc, idle time.Duration) error {
 	if err := client.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return err
 	}
@@ -53,7 +57,7 @@ func HandleWithUDP(client *net.TCPConn, dial DialFunc, dialPacket DialPacketFunc
 
 	command, target, reply, err := readRequest(client, dialPacket != nil)
 	if err == nil && command == udpAssociate {
-		return associate(client, target, dialPacket)
+		return associate(client, target, dialPacket, idle)
 	}
 	if err != nil {
 		if reply != replySuccess {

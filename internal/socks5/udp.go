@@ -13,6 +13,7 @@ import (
 
 	M "github.com/sagernet/sing/common/metadata"
 
+	"mac-proxy/internal/backend"
 	"mac-proxy/internal/peer"
 	"mac-proxy/internal/wire"
 )
@@ -22,12 +23,25 @@ const (
 	udpSendQueue             = 8
 	udpSessionIdle           = 5 * time.Minute
 	udpWriteTimeout          = 2 * time.Second
+	maxUDPQueuedBytes        = 8 << 20
+	udpQueueOverhead         = 32
+	maxUDPAssociations       = 256
 )
+
+var udpQueuedBytes atomic.Int64
+var udpAssociations = make(chan struct{}, maxUDPAssociations)
+var errFragmentedDatagram = errors.New("fragmented datagrams are not supported")
 
 // associate serves UDP ASSOCIATE: a UDP relay socket lives as long as the
 // TCP control connection. Datagrams are accepted only from the client's IP,
 // fragments are dropped, and each flow is routed by the engine like TCP.
-func associate(client *net.TCPConn, requested string, dialPacket DialPacketFunc) error {
+func associate(client *net.TCPConn, requested string, dialPacket DialPacketFunc, idle time.Duration) error {
+	select {
+	case udpAssociations <- struct{}{}:
+		defer func() { <-udpAssociations }()
+	default:
+		return errors.Join(backend.ErrPacketCongested, writeReply(client, replyFailure, nil))
+	}
 	requestedPort := M.ParseSocksaddr(requested).Port // Zero means the client has no bound port yet.
 	local := client.LocalAddr().(*net.TCPAddr)
 	relay, err := net.ListenUDP("udp", &net.UDPAddr{IP: local.IP})
@@ -69,10 +83,16 @@ func associate(client *net.TCPConn, requested string, dialPacket DialPacketFunc)
 		from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
 		if from.Addr() != allowed || (requestedPort != 0 && from.Port() != requestedPort) ||
 			(source.IsValid() && from != source) {
+			wire.SOCKSUDPDrops.Add(wire.UDPInvalid, 1)
 			continue
 		}
 		target, payload, err := parseDatagram(buffer[:n])
 		if err != nil {
+			reason := wire.UDPInvalid
+			if errors.Is(err, errFragmentedDatagram) {
+				reason = wire.UDPFragment
+			}
+			wire.SOCKSUDPDrops.Add(reason, 1)
 			continue
 		}
 		source = from
@@ -84,6 +104,16 @@ func associate(client *net.TCPConn, requested string, dialPacket DialPacketFunc)
 			select {
 			case workerSlots <- struct{}{}:
 			default:
+				wire.SOCKSUDPDrops.Add(wire.UDPQueueFull, 1)
+				mu.Unlock()
+				continue
+			}
+			flowCtx := peer.WithAddrs(ctx, peer.Addrs{Client: from, Server: bound.AddrPort(), Local: allowed.IsLoopback()})
+			sessionCtx, stop := context.WithCancel(flowCtx)
+			session = &udpSession{ctx: sessionCtx, cancel: stop, started: started, idle: idle, queue: make(chan []byte, udpSendQueue)}
+			if !session.enqueue(payload) {
+				stop()
+				<-workerSlots
 				mu.Unlock()
 				continue
 			}
@@ -98,29 +128,24 @@ func associate(client *net.TCPConn, requested string, dialPacket DialPacketFunc)
 				oldest.cancel()
 				delete(sessions, oldestTarget)
 			}
-			flowCtx := peer.WithAddrs(ctx, peer.Addrs{Client: from, Server: bound.AddrPort(), Local: allowed.IsLoopback()})
-			sessionCtx, stop := context.WithCancel(flowCtx)
-			session = &udpSession{ctx: sessionCtx, cancel: stop, started: started, queue: make(chan []byte, udpSendQueue)}
 			session.touch()
 			sessions[target] = session
 			workers.Add(1)
 			go func(session *udpSession, target string, from netip.AddrPort) {
 				defer workers.Done()
 				defer func() { <-workerSlots }()
-				session.run(relay, from, target, dialPacket)
+				err := session.run(relay, from, target, dialPacket)
 				mu.Lock()
 				if sessions[target] == session {
 					delete(sessions, target)
 				}
+				session.discard(err)
 				mu.Unlock()
 			}(session, target, from)
+		} else {
+			session.enqueue(payload)
 		}
 		mu.Unlock()
-		// The relay loop is the only producer. A slow outbound can fill
-		// its own queue but does not block other targets on the association.
-		if len(session.queue) < cap(session.queue) {
-			session.queue <- bytes.Clone(payload)
-		}
 	}
 }
 
@@ -128,6 +153,7 @@ type udpSession struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	started    time.Time
+	idle       time.Duration
 	lastActive atomic.Int64
 	queue      chan []byte
 }
@@ -136,11 +162,44 @@ func (s *udpSession) touch() {
 	s.lastActive.Store(time.Since(s.started).Nanoseconds())
 }
 
-func (s *udpSession) run(relay *net.UDPConn, client netip.AddrPort, target string, dial DialPacketFunc) {
+func (s *udpSession) enqueue(payload []byte) bool {
+	if len(s.queue) == cap(s.queue) {
+		wire.SOCKSUDPDrops.Add(wire.UDPQueueFull, 1)
+		return false
+	}
+	cost := int64(len(payload) + udpQueueOverhead)
+	for {
+		used := udpQueuedBytes.Load()
+		if used+cost > maxUDPQueuedBytes {
+			wire.SOCKSUDPDrops.Add(wire.UDPQueueFull, 1)
+			return false
+		}
+		if udpQueuedBytes.CompareAndSwap(used, used+cost) {
+			s.queue <- bytes.Clone(payload)
+			return true
+		}
+	}
+}
+
+// discard runs with the association lock, after the only consumer exits.
+func (s *udpSession) discard(err error) {
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, net.ErrClosed) {
+		wire.SOCKSUDPDrops.Add(backend.PacketDropReason(err), len(s.queue))
+	}
+	for len(s.queue) > 0 {
+		releaseUDPData(<-s.queue)
+	}
+}
+
+func releaseUDPData(data []byte) {
+	udpQueuedBytes.Add(-int64(len(data) + udpQueueOverhead))
+}
+
+func (s *udpSession) run(relay *net.UDPConn, client netip.AddrPort, target string, dial DialPacketFunc) error {
 	defer s.cancel()
 	upstream, err := dial(s.ctx, "SOCKS5 UDP", target)
 	if err != nil {
-		return
+		return err
 	}
 	closeUpstream := sync.OnceFunc(func() { _ = upstream.Close() })
 	stop := context.AfterFunc(s.ctx, closeUpstream)
@@ -159,14 +218,24 @@ func (s *udpSession) run(relay *net.UDPConn, client netip.AddrPort, target strin
 	for {
 		select {
 		case <-s.ctx.Done():
-			return
+			return s.ctx.Err()
 		case data := <-s.queue:
 			if s.ctx.Err() != nil {
-				return
+				releaseUDPData(data)
+				return s.ctx.Err()
 			}
 			_ = upstream.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
-			if _, err := upstream.WriteTo(data, destination); err != nil {
-				return
+			_, err := upstream.WriteTo(data, destination)
+			releaseUDPData(data)
+			if err != nil {
+				if s.ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+					return err
+				}
+				wire.SOCKSUDPDrops.Add(backend.PacketDropReason(err), 1)
+				if errors.Is(err, backend.ErrPacketCongested) {
+					continue
+				}
+				return err
 			}
 			s.touch()
 		}
@@ -176,7 +245,7 @@ func (s *udpSession) run(relay *net.UDPConn, client netip.AddrPort, target strin
 func (s *udpSession) replies(session net.PacketConn, relay *net.UDPConn, client netip.AddrPort) {
 	buffer := make([]byte, 65535)
 	for s.ctx.Err() == nil {
-		remaining := udpSessionIdle - (time.Since(s.started) - time.Duration(s.lastActive.Load()))
+		remaining := s.idle - (time.Since(s.started) - time.Duration(s.lastActive.Load()))
 		if remaining <= 0 {
 			return
 		}
@@ -213,7 +282,7 @@ func parseDatagram(data []byte) (string, []byte, error) {
 		return "", nil, errors.New("bad header")
 	}
 	if data[2] != 0 {
-		return "", nil, errors.New("fragmented datagrams are not supported")
+		return "", nil, errFragmentedDatagram
 	}
 	reader := bytes.NewReader(data[4:])
 	target, err := wire.ReadAddress(reader, data[3])
