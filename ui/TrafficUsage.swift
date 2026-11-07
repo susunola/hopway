@@ -286,11 +286,10 @@ struct LocalTrafficView: View {
             Text("按节点").font(.callout.weight(.semibold)).foregroundStyle(.secondary)
             ForEach(nodes.prefix(5)) { usageRow($0, total: total) }
             if nodes.count > 5 {
-                DisclosureGroup("还有 \(nodes.count - 5) 个节点") {
+                HopDisclosure("还有 \(nodes.count - 5) 个节点") {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(nodes.dropFirst(5)) { usageRow($0, total: total) }
                     }
-                    .padding(.top, 6)
                 }
                 .font(.callout)
             }
