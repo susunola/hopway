@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"mac-proxy/internal/lifetime"
 	"mac-proxy/internal/outbound"
 	"mac-proxy/internal/peer"
 	"mac-proxy/internal/wire"
@@ -96,11 +97,20 @@ func forward(writer http.ResponseWriter, request *http.Request, dial Dial) {
 	outgoing.Host = outgoing.URL.Host
 	outgoing.Close = false
 	removeHopHeaders(outgoing.Header)
+	dials := lifetime.New()
+	defer func() {
+		dials.Stop()
+		dials.Wait()
+	}()
 	transport := &http.Transport{
-		// The transport is per request. Do not keep its dial running
-		// after this client's request has been canceled.
+		// Keep the transport's asynchronous dial within the request lifetime.
 		DialContext: func(_ context.Context, _, target string) (net.Conn, error) {
-			return dial(outgoing.Context(), "HTTP", target)
+			ctx, done, ok := dials.Enter(outgoing.Context())
+			if !ok {
+				return nil, context.Canceled
+			}
+			defer done()
+			return dial(ctx, "HTTP", target)
 		},
 		DisableKeepAlives:     true,
 		DisableCompression:    true,

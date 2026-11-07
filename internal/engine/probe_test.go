@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -183,5 +184,50 @@ func TestCancelLargeProbeBatchReleasesInFlightDials(t *testing.T) {
 		t.Logf("released %d dials and canceled 1,000-node batch in %s", endpointProbeLimit, time.Since(stoppedAt))
 	case <-released.C:
 		t.Fatal("probe batch did not stop after cancellation")
+	}
+}
+
+func TestCanceledProbeWaitsForDialCleanup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started, canceled, cleanup := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	defer release.Do(func() { close(cleanup) })
+	dialer := backend.DialerFunc(func(ctx context.Context, _ string) (net.Conn, error) {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		<-cleanup
+		return nil, ctx.Err()
+	})
+	result := make(chan error, 1)
+	go func() {
+		_, err := probeTarget(ctx, dialer, "http://127.0.0.1:80")
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("probe did not enter the dialer")
+	}
+	cancel()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dialer did not receive cancellation")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("probe returned before its dialer finished cleanup: %v", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+	release.Do(func() { close(cleanup) })
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected cancellation after cleanup, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("probe did not return after its dialer finished cleanup")
 	}
 }

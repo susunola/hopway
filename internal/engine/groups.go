@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"mac-proxy/internal/backend"
+	"mac-proxy/internal/lifetime"
 	"mac-proxy/internal/trace"
 	"mac-proxy/internal/wire"
 )
@@ -489,11 +490,21 @@ func inconclusiveProbe(err error) bool {
 func probeTarget(ctx context.Context, dialer backend.Dialer, target string) (time.Duration, error) {
 	ctx, timing := trace.With(ctx)
 	var reached atomic.Bool
+	dials := lifetime.New()
+	defer func() {
+		dials.Stop()
+		dials.Wait()
+	}()
 	transport := &http.Transport{
-		// Each transport handles one probe. Bind its dial to the request
-		// because the HTTP transport can otherwise keep the dial alive.
+		// The transport may return cancellation before its dial goroutine.
+		// Join that goroutine so probe permits cover the entire operation.
 		DialContext: func(_ context.Context, _, address string) (net.Conn, error) {
-			conn, err := dialer.DialContext(ctx, address)
+			dialCtx, done, ok := dials.Enter(ctx)
+			if !ok {
+				return nil, context.Canceled
+			}
+			defer done()
+			conn, err := dialer.DialContext(dialCtx, address)
 			if err == nil {
 				reached.Store(true)
 			}

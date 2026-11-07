@@ -32,6 +32,7 @@ func CloseWrite(conn net.Conn) error {
 const (
 	relayBufferSize     = 32 * 1024
 	relayBufferCacheCap = 128 // at most 4 MiB of idle relay buffers
+	tcpFailureInterval  = 200 * time.Millisecond
 )
 
 var relayBuffers = make(chan *[relayBufferSize]byte, relayBufferCacheCap)
@@ -119,10 +120,17 @@ type relayWriter struct {
 	io.Writer
 	err      error
 	activity *relayActivity
+	watch    *relayWriteWatch
 }
 
 func (w *relayWriter) Write(data []byte) (int, error) {
+	if w.watch != nil {
+		w.watch.start()
+	}
 	n, err := w.Writer.Write(data)
+	if w.watch != nil {
+		w.watch.state.And(^relayWritePending)
+	}
 	if w.activity != nil && n > 0 {
 		w.activity.touch()
 	}
@@ -133,10 +141,10 @@ func (w *relayWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 
-func transfer(destination, source net.Conn, to, from string, activity *relayActivity) *RelayError {
+func transfer(destination, source net.Conn, to, from string, activity *relayActivity, watch *relayWriteWatch) *RelayError {
 	_, directSource := source.(*net.TCPConn)
 	_, directDestination := destination.(*net.TCPConn)
-	if directSource && directDestination && activity == nil {
+	if directSource && directDestination && activity == nil && watch == nil {
 		// Preserve native TCP copy optimizations when neither side is
 		// wrapped. Socket errors identify the operation themselves.
 		if _, err := copyRelay(destination, source); err != nil {
@@ -152,7 +160,7 @@ func transfer(destination, source net.Conn, to, from string, activity *relayActi
 			return &RelayError{from, "transfer", err}
 		}
 	} else {
-		reader, writer := relayReader{Reader: source}, relayWriter{Writer: destination, activity: activity}
+		reader, writer := relayReader{Reader: source}, relayWriter{Writer: destination, activity: activity, watch: watch}
 		if _, err := copyRelay(&writer, &reader); err != nil {
 			if writer.err != nil {
 				return &RelayError{to, "write", err}
@@ -164,6 +172,38 @@ func transfer(destination, source net.Conn, to, from string, activity *relayActi
 		return &RelayError{to, "write", err}
 	}
 	return nil
+}
+
+const (
+	relayWatchArmed uint32 = 1 << iota
+	relayWritePending
+)
+
+// Watch only the upload. A stalled upstream Write prevents the uploader
+// from reading a client reset, even though the download may also be idle.
+type relayWriteWatch struct {
+	client *net.TCPConn
+	wake   chan struct{}
+	state  atomic.Uint32
+}
+
+func (w *relayWriteWatch) start() {
+	if previous := w.state.Or(relayWatchArmed | relayWritePending); previous&relayWatchArmed == 0 {
+		// Only the transition from disarmed schedules a check. The relay
+		// reads this signal before it can disarm the watcher again.
+		w.wake <- struct{}{}
+	}
+}
+
+func pollableTCP(conn net.Conn) *net.TCPConn {
+	if !tcpSocketErrorSupported {
+		return nil
+	}
+	if buffered, ok := conn.(*BufferedConn); ok {
+		conn = buffered.Conn
+	}
+	tcp, _ := conn.(*net.TCPConn)
+	return tcp
 }
 
 func Relay(client, upstream net.Conn) {
@@ -180,9 +220,17 @@ func Relay(client, upstream net.Conn) {
 			expiry = timer.C
 		}
 	}
+	var watch *relayWriteWatch
+	var wake <-chan struct{}
+	if tcp := pollableTCP(client); tcp != nil {
+		watch = &relayWriteWatch{client: tcp, wake: make(chan struct{}, 1)}
+		wake = watch.wake
+	}
 	results := make(chan *RelayError, 2)
-	go func() { results <- transfer(upstream, client, "upstream", "client", activity) }()
-	go func() { results <- transfer(client, upstream, "client", "upstream", activity) }()
+	go func() { results <- transfer(upstream, client, "upstream", "client", activity, watch) }()
+	go func() { results <- transfer(client, upstream, "client", "upstream", activity, nil) }()
+	var watchTimer *time.Timer
+	var checkWrite <-chan time.Time
 	var stopped bool
 	for finished := 0; finished < 2; {
 		var failure *RelayError
@@ -195,10 +243,33 @@ func Relay(client, upstream net.Conn) {
 				continue
 			}
 			failure = &RelayError{Operation: "idle", Err: ErrRelayIdle}
+		case <-wake:
+			if watchTimer == nil {
+				watchTimer = time.NewTimer(tcpFailureInterval)
+				defer watchTimer.Stop()
+			} else {
+				watchTimer.Reset(tcpFailureInterval)
+			}
+			checkWrite = watchTimer.C
+		case <-checkWrite:
+			// A writer starting during this transition either prevents the
+			// disarm or sends a new wake after it. Neither case loses a reset.
+			if watch.state.CompareAndSwap(relayWatchArmed, 0) {
+				checkWrite = nil
+				continue
+			}
+			if watch.state.Load()&relayWritePending != 0 {
+				if err := pendingTCPError(watch.client); err != nil {
+					failure = &RelayError{Endpoint: "client", Operation: "read", Err: err}
+					break
+				}
+			}
+			watchTimer.Reset(tcpFailureInterval)
 		}
 		if failure != nil && !stopped {
 			stopped = true
 			expiry = nil
+			wake, checkWrite = nil, nil
 			reportRelayFailure(upstream, failure)
 			client.Close()
 			upstream.Close()

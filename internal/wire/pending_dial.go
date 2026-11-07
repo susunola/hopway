@@ -26,6 +26,7 @@ func DialWithClient(ctx context.Context, client net.Conn, reader *bufio.Reader, 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	done := make(chan struct{})
+	dialFinished := make(chan struct{})
 	go func() {
 		defer close(done)
 		for reader.Buffered() < reader.Size() {
@@ -44,8 +45,28 @@ func DialWithClient(ctx context.Context, client net.Conn, reader *bufio.Reader, 
 			}
 			return
 		}
+		if tcp := pollableTCP(client); tcp != nil {
+			// The read-ahead buffer must stay bounded and its payload
+			// cannot be discarded. Check for a reset without reading it.
+			ticker := time.NewTicker(tcpFailureInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-dialFinished:
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if pendingTCPError(tcp) != nil {
+						cancel()
+						return
+					}
+				}
+			}
+		}
 	}()
 	conn, err := dial(ctx)
+	close(dialFinished)
 	interruptErr := client.SetReadDeadline(time.Now())
 	if interruptErr != nil {
 		_ = client.Close()
