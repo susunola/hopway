@@ -24,14 +24,14 @@ struct TrafficHistory: Decodable {
     let since: String
     let days: [String: [String: Count]]
 
-    func series(from start: Date, through end: Date, calendar: Calendar) -> [Day] {
+    func series(from start: Date, through end: Date, calendar: Calendar, includeLeadingDays: Bool = false) -> [Day] {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.calendar = calendar
         formatter.timeZone = calendar.timeZone
         formatter.dateFormat = "yyyy-MM-dd"
         guard let since = formatter.date(from: since) else { return [] }
-        var date = max(since, start)
+        var date = includeLeadingDays ? start : max(since, start)
         var result: [Day] = []
         while date <= end {
             let nodes = days[formatter.string(from: date)] ?? [:]
@@ -322,18 +322,21 @@ struct LocalTrafficView: View {
 struct TrafficTrendChart: View {
     let days: [TrafficHistory.Day]
     let height: CGFloat
+    var barWidth: MarkDimension = .automatic
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Chart(days) { day in
                 BarMark(
                     x: .value("日期", day.date, unit: .day),
-                    y: .value("下载", Double(day.count.download))
+                    y: .value("下载", Double(day.count.download)),
+                    width: barWidth
                 )
                 .foregroundStyle(by: .value("方向", "下载"))
                 BarMark(
                     x: .value("日期", day.date, unit: .day),
-                    y: .value("上传", Double(day.count.upload))
+                    y: .value("上传", Double(day.count.upload)),
+                    width: barWidth
                 )
                 .foregroundStyle(by: .value("方向", "上传"))
             }

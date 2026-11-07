@@ -96,6 +96,7 @@ private struct Dashboard: View {
     @State private var showsConfigurationEditor = false
     @State private var confirmsDiskVersion = false
     @State private var advancedDraft: AdvancedSettingsDraft?
+    @State private var hoveredPreset: RoutingPreset?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -373,7 +374,10 @@ private struct Dashboard: View {
         let ready = core.phase == .stopped ? !core.profileReadFailed && core.configuredProfile != nil :
             core.phase == .running && !core.statusReadFailed && core.status != nil
         return VStack(alignment: .leading, spacing: 10) {
-            Text("策略模板").font(.headline)
+            HStack(spacing: 8) {
+                Text("策略模板").font(.headline)
+                Text("双击卡片切换").font(.caption).foregroundStyle(.secondary)
+            }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible())], spacing: 10) {
                 ForEach(RoutingPreset.allCases) { preset in
                     presetCard(preset, selected: preset.rawValue == mode, ready: ready)
@@ -386,35 +390,60 @@ private struct Dashboard: View {
 
     private func presetCard(_ preset: RoutingPreset, selected: Bool, ready: Bool) -> some View {
         let title = Policy.label(preset.rawValue)
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Label(title, systemImage: preset.icon).font(.callout.weight(.semibold))
-                Spacer(minLength: 8)
-                if preset == .auto {
-                    Button(selected ? "调整…" : "配置…") { showsAutoRouting = true }
-                        .accessibilityLabel("配置按地区自动")
-                        .disabled(core.phase != .running || !ready)
-                        .help(core.phase == .stopped ? "启动代理后可配置地区与服务商。" : "设置地区与首选服务商")
-                        .sheet(isPresented: $showsAutoRouting) { AutoRoutingSheet(core: core) }
-                } else if !selected {
-                    Button("使用") { core.selectRoutingPreset(preset.rawValue) }
-                        .accessibilityLabel("使用" + title)
-                        .disabled(!ready || core.saving || core.updatingPolicy)
-                }
-                if selected {
-                    Label(core.phase == .stopped ? "启动时使用" : "已启用", systemImage: "checkmark.circle.fill")
-                        .font(.caption)
-                        .foregroundStyle(HopAppearance.accent)
-                        .fixedSize()
-                }
+        let canActivate = ready && !core.saving && !core.updatingPolicy &&
+            (preset == .auto ? core.phase == .running : !selected)
+        let activate = {
+            guard canActivate else { return }
+            if preset == .auto {
+                showsAutoRouting = true
+            } else {
+                core.selectRoutingPreset(preset.rawValue)
             }
-            .frame(minHeight: 25)
-            Text(preset.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
         }
-        .frame(maxWidth: .infinity, minHeight: 49, alignment: .topLeading)
-        .padding(10)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(selected ? HopAppearance.accent.opacity(0.45) : .clear))
+        return HStack(alignment: .center, spacing: 11) {
+            Image(systemName: preset.icon)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(selected ? HopAppearance.accent : .secondary)
+                .frame(width: 31, height: 31)
+                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.callout.weight(.semibold))
+                Text(preset.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+            Spacer(minLength: 6)
+            if selected {
+                Label(core.phase == .stopped ? "启动时使用" : "已启用", systemImage: "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(HopAppearance.accent)
+                    .fixedSize()
+            }
+            if preset == .auto {
+                Button(selected ? "调整…" : "配置…", action: activate)
+                    .accessibilityLabel("配置按地区自动")
+                    .disabled(!canActivate)
+                    .help(core.phase == .stopped ? "启动代理后可配置地区与服务商。" : "设置地区与首选服务商")
+                    .sheet(isPresented: $showsAutoRouting) { AutoRoutingSheet(core: core) }
+            } else if !selected {
+                Button("使用", action: activate)
+                    .accessibilityLabel("使用" + title)
+                    .disabled(!canActivate)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
+        .padding(11)
+        .background(
+            selected ? HopAppearance.accent.opacity(0.08) : Color.primary.opacity(hoveredPreset == preset ? 0.075 : 0.035),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
+        .overlay(RoundedRectangle(cornerRadius: 8)
+            .strokeBorder(selected ? HopAppearance.accent.opacity(0.52) : .clear))
+        .contentShape(Rectangle())
+        .onHover { hovered in
+            if hovered { hoveredPreset = preset }
+            else if hoveredPreset == preset { hoveredPreset = nil }
+        }
+        .onTapGesture(count: 2, perform: activate)
     }
 
     private var policySummary: some View {

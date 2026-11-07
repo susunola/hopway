@@ -29,9 +29,9 @@ struct OverviewDashboard: View {
 
     var body: some View {
         ViewThatFits(in: .vertical) {
-            content(chartHeight: 120)
+            content(chartHeight: 96)
                 .fixedSize(horizontal: false, vertical: true)
-            content(chartHeight: 80)
+            content(chartHeight: 68)
                 .fixedSize(horizontal: false, vertical: true)
             content(chartHeight: 46)
                 .fixedSize(horizontal: false, vertical: true)
@@ -359,15 +359,14 @@ struct OverviewDashboard: View {
         calendar.timeZone = .current
         let today = calendar.startOfDay(for: .now)
         let start = calendar.date(byAdding: .day, value: -6, to: today) ?? today
-        let days = core.trafficHistory?.series(from: start, through: today, calendar: calendar) ?? []
+        let days = core.trafficHistory?.series(from: start, through: today, calendar: calendar, includeLeadingDays: true) ?? []
         let todayCount = days.last?.count
         let rates = running ? core.liveTraffic : nil
-        let ratePlaceholder = running ? "等待采样" : core.phase.rawValue
+        let ratePlaceholder = "等待采样"
 
         return VStack(alignment: .leading, spacing: 11) {
             HStack(spacing: 8) {
                 Label("流量概况", systemImage: "chart.bar.xaxis").font(.headline)
-                Text("经过 HopWay").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 overviewLink("查看用量", action: showUsage)
             }
@@ -378,9 +377,11 @@ struct OverviewDashboard: View {
                         trafficMetric("今日下载", value: todayCount.map { trafficBytes($0.download) } ?? "无记录")
                         trafficMetric("今日上传", value: todayCount.map { trafficBytes($0.upload) } ?? "无记录")
                     }
-                    GridRow {
-                        trafficMetric("实时下载", value: rates.map { TrafficRate.label($0.download) } ?? ratePlaceholder)
-                        trafficMetric("实时上传", value: rates.map { TrafficRate.label($0.upload) } ?? ratePlaceholder)
+                    if running {
+                        GridRow {
+                            trafficMetric("实时下载", value: rates.map { TrafficRate.label($0.download) } ?? ratePlaceholder)
+                            trafficMetric("实时上传", value: rates.map { TrafficRate.label($0.upload) } ?? ratePlaceholder)
+                        }
                     }
                 }
                 .frame(width: 244, alignment: .leading)
@@ -390,7 +391,7 @@ struct OverviewDashboard: View {
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
                     if days.contains(where: { $0.count.total > 0 }) {
-                        TrafficTrendChart(days: days, height: chartHeight)
+                        TrafficTrendChart(days: days, height: chartHeight, barWidth: .fixed(26))
                     } else {
                         Text("近 7 天暂无流量记录")
                             .font(.callout)
@@ -423,19 +424,20 @@ struct OverviewDashboard: View {
         let selected = running && !core.statusReadFailed ? core.status?.currentOutbound.flatMap(subscription(for:)) : nil
         let visible = ([selected].compactMap { $0 }
                        + enabled.filter { $0.id != selected?.id }
-                       + subscriptions.filter(\.isPaused)).prefix(3)
+                       + subscriptions.filter(\.isPaused)).prefix(4)
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Label("订阅速览", systemImage: "tray.full").font(.headline)
                 if !subscriptions.isEmpty {
-                    Text("\(subscriptions.count) 份 · \(enabled.count) 份启用")
+                    Text("\(enabled.count)/\(subscriptions.count) 份启用")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
                 Spacer()
-                overviewLink("管理订阅", action: showSubscriptions)
+                let more = subscriptions.count - visible.count
+                overviewLink(more > 0 ? "查看其余 \(more) 份" : "管理订阅", action: showSubscriptions)
             }
             if visible.isEmpty {
                 Text(core.profileReadFailed ? "暂时无法读取订阅" :
