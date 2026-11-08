@@ -12,7 +12,9 @@ env:
 
 jobs:
   macos:
-    runs-on: macos-15
+    # The app uses the macOS 26 SDK (glassEffect) with an availability
+    # fallback; the macOS 15 image cannot compile that symbol at all.
+    runs-on: macos-26
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
