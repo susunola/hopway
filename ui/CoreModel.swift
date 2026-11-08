@@ -19,11 +19,11 @@ struct Policy: Codable, Equatable {
 
     static func label(_ mode: String) -> String {
         switch mode {
-        case "rule": "按规则"
-        case "global": "手动"
-        case "direct": "直连"
-        case "auto": "按地区自动"
-        case "fastest": "自动最快"
+        case "rule": L("按规则")
+        case "global": L("手动")
+        case "direct": L("直连")
+        case "auto": L("按地区自动")
+        case "fastest": L("自动最快")
         default: mode
         }
     }
@@ -32,28 +32,28 @@ struct Policy: Codable, Equatable {
 enum DialDiagnostic {
     static func stage(_ key: String?) -> String? {
         guard let key else { return nil }
-        let labels = ["route": "路由策略", "dns": "DNS 解析", "connect": "连接服务器",
-                      "handshake": "TLS / 协议握手", "upstream": "目标服务",
-                      "client-read": "读取客户端", "client-write": "写入客户端",
-                      "upstream-read": "读取出站", "upstream-write": "写入出站",
-                      "client-transfer": "上传转发", "upstream-transfer": "下载转发", "idle": "空闲回收"]
+        let labels = ["route": L("路由策略"), "dns": L("DNS 解析"), "connect": L("连接服务器"),
+                      "handshake": L("TLS / 协议握手"), "upstream": L("目标服务"),
+                      "client-read": L("读取客户端"), "client-write": L("写入客户端"),
+                      "upstream-read": L("读取出站"), "upstream-write": L("写入出站"),
+                      "client-transfer": L("上传转发"), "upstream-transfer": L("下载转发"), "idle": L("空闲回收")]
         return labels[key] ?? key
     }
 
     static func message(_ code: String?, fallback: String?) -> String? {
         guard let code else { return fallback }
         let labels = [
-            "dns-timeout": "DNS 查询超时", "dns-not-found": "DNS 未返回地址",
-            "dns-unavailable": "DNS 上游无法应答", "tls-expired": "TLS 证书已过期",
-            "tls-not-yet-valid": "TLS 证书尚未生效", "tls-hostname": "TLS 证书与服务器名称不匹配",
-            "tls-untrusted": "TLS 证书不受信任", "tls-certificate": "TLS 证书校验失败",
-            "proxy-auth": "上游代理认证失败", "endpoint-cooldown": "出站端点冷却中",
-            "endpoint-busy": "出站拨号槽已满", "connection-refused": "服务器拒绝连接",
-            "fd-exhausted": "本机文件描述符额度用尽",
-            "tcp-idle-timeout": "隧道达到空闲回收时限",
-            "target-refused": "目标服务拒绝连接", "timeout": "连接超时",
-            "connection-reset": "连接被对端重置", "broken-pipe": "连接已断开",
-            "unreachable": "网络或主机不可达", "canceled": "已取消"
+            "dns-timeout": L("DNS 查询超时"), "dns-not-found": L("DNS 未返回地址"),
+            "dns-unavailable": L("DNS 上游无法应答"), "tls-expired": L("TLS 证书已过期"),
+            "tls-not-yet-valid": L("TLS 证书尚未生效"), "tls-hostname": L("TLS 证书与服务器名称不匹配"),
+            "tls-untrusted": L("TLS 证书不受信任"), "tls-certificate": L("TLS 证书校验失败"),
+            "proxy-auth": L("上游代理认证失败"), "endpoint-cooldown": L("出站端点冷却中"),
+            "endpoint-busy": L("出站拨号槽已满"), "connection-refused": L("服务器拒绝连接"),
+            "fd-exhausted": L("本机文件描述符额度用尽"),
+            "tcp-idle-timeout": L("隧道达到空闲回收时限"),
+            "target-refused": L("目标服务拒绝连接"), "timeout": L("连接超时"),
+            "connection-reset": L("连接被对端重置"), "broken-pipe": L("连接已断开"),
+            "unreachable": L("网络或主机不可达"), "canceled": L("已取消")
         ]
         return labels[code] ?? fallback
     }
@@ -75,9 +75,9 @@ struct ProxyStatus: Decodable, Equatable {
         var probeIdentity: String { probeKey ?? "legacy:" + name }
 
         var label: String {
-            var parts = [name, type == "group" ? "策略组" : type]
+            var parts = [name, type == "group" ? L("策略组") : type]
             if alive == false {
-                parts.append("不可用")
+                parts.append(L("不可用"))
             } else if let latencyMs {
                 parts.append("\(latencyMs) ms")
             }
@@ -129,10 +129,10 @@ struct ProxyStatus: Decodable, Equatable {
 
         var targetSourceLabel: String? {
             switch targetSource {
-            case "fake-ip": "DNS 映射（Fake IP）"
+            case "fake-ip": L("DNS 映射（Fake IP）")
             case "tls-sni": "TLS SNI"
             case "http-host": "HTTP Host"
-            case "ip": "原始 IP"
+            case "ip": L("原始 IP")
             default: nil
             }
         }
@@ -141,26 +141,26 @@ struct ProxyStatus: Decodable, Equatable {
         var failureMessage: String? { DialDiagnostic.message(failureCode, fallback: error) }
 
         var timingLabel: String {
-            [("DNS", dnsMs), ("连接", connectMs), ("握手", handshakeMs), ("首字节", firstByteMs)]
+            [("DNS", dnsMs), (L("连接"), connectMs), (L("握手"), handshakeMs), (L("首字节"), firstByteMs)]
                 .compactMap { name, value in value.map { "\(name) \($0) ms" } }
                 .joined(separator: " · ")
         }
 
         var diagnosis: String {
-            let lines = [failureMessage, failureStage.map { "失败阶段 · " + $0 },
-                         processPath.map { "应用 · " + $0 }, processBundleId.map { "应用标识 · " + $0 }, "路径 · " + routeLabel,
-                         targetSourceLabel.map { "目标来源 · " + $0 },
-                         server.map { "服务器 · " + $0 }, timingLabel.isEmpty ? nil : timingLabel]
+            let lines = [failureMessage, failureStage.map { L("失败阶段 · ") + $0 },
+                         processPath.map { L("应用 · ") + $0 }, processBundleId.map { L("应用标识 · ") + $0 }, L("路径 · ") + routeLabel,
+                         targetSourceLabel.map { L("目标来源 · ") + $0 },
+                         server.map { L("服务器 · ") + $0 }, timingLabel.isEmpty ? nil : timingLabel]
             return (lines.compactMap { $0 } + (failures ?? []).map(\.label)).joined(separator: "\n")
         }
 
         var stateLabel: String {
             switch state {
-            case "active": "传输中"
-            case "closed": "已结束"
-            case "blocked": "已拦截"
-            case "canceled": "已取消"
-            default: "失败"
+            case "active": L("传输中")
+            case "closed": L("已结束")
+            case "blocked": L("已拦截")
+            case "canceled": L("已取消")
+            default: L("失败")
             }
         }
     }
@@ -212,9 +212,9 @@ struct ProxyStatus: Decodable, Equatable {
 
         var typeLabel: String {
             switch type {
-            case "select": "手动选择"
-            case "url-test": "自动选最快"
-            case "fallback": "故障转移"
+            case "select": L("手动选择")
+            case "url-test": L("自动选最快")
+            case "fallback": L("故障转移")
             default: type
             }
         }
@@ -252,7 +252,7 @@ struct ProxyStatus: Decodable, Equatable {
 
         var total: UInt64 { invalid + fragmented + queueFull + upstream + policy }
         var detail: String {
-            "队列满 \(queueFull) · 出站错误 \(upstream) · 规则拒绝 \(policy) · 分片 \(fragmented) · 无效包 \(invalid)"
+            L("队列满 <1> · 出站错误 <2> · 规则拒绝 <3> · 分片 <4> · 无效包 <5>", queueFull, upstream, policy, fragmented, invalid)
         }
     }
 
@@ -337,6 +337,10 @@ struct ProfileInspection: Decodable {
     let nodes: [ProxyStatus.Node]?
     let subscriptions: [SubscriptionSummary]?
     let groups: [Group]?
+    let outboundIds: [String: String]?
+    let groupAliases: [String: String]?
+    let groupRuleRefs: [String: Int]?
+    let localGroups: [String]?
     let ruleSets: [String]?
     let ruleCount: Int?
     let mode: String?
@@ -358,7 +362,7 @@ struct CoreError: LocalizedError {
 }
 
 private struct ProfileWriteConflict: LocalizedError {
-    var errorDescription: String? { "磁盘配置已有新版本，请核对后再保存。" }
+    var errorDescription: String? { L("磁盘配置已有新版本，请核对后再保存。") }
 }
 
 @MainActor
@@ -369,14 +373,14 @@ final class CoreModel: ObservableObject {
 
         var title: String {
             switch self {
-            case .reachable: "联网正常"
-            case .failed: "联网失败"
+            case .reachable: L("联网正常")
+            case .failed: L("联网失败")
             }
         }
 
         var detail: String {
             switch self {
-            case .reachable: "当前出站已通过 HTTPS 联网验证"
+            case .reachable: L("当前出站已通过 HTTPS 联网验证")
             case .failed(let reason): reason
             }
         }
@@ -454,7 +458,8 @@ final class CoreModel: ObservableObject {
 
     private var inspectionID: UUID?
     private var statusFailureMessage: String?
-    private var trafficModifiedAt: Date?
+    private var trafficStamp: TrafficHistory.DiskStamp?
+    private var trafficReadTask: Task<Void, Never>?
     private var lastTrafficSample: (totals: TrafficHistory.Count, time: ContinuousClock.Instant)?
     private var quotaRefreshTask: Task<Void, Never>?
     private var probeFailures: [String: Int] = [:]
@@ -565,7 +570,7 @@ final class CoreModel: ObservableObject {
         do {
             let document = try Self.readDiskConfiguration(configURL)
             acceptSavedConfiguration(document.text, revision: document.revision)
-            message = "已读取磁盘配置。"
+            message = L("已读取磁盘配置。")
         } catch {
             message = error.localizedDescription
         }
@@ -575,7 +580,7 @@ final class CoreModel: ObservableObject {
         do {
             let data = try Data(contentsOf: path)
             guard let text = String(data: data, encoding: .utf8) else {
-                throw CoreError(message: "配置文件须使用 UTF-8 编码。")
+                throw CoreError(message: L("配置文件须使用 UTF-8 编码。"))
             }
             let revision = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             return (text, revision)
@@ -615,7 +620,7 @@ final class CoreModel: ObservableObject {
 
     func selectNode(_ node: ProxyStatus.Node, mode: String) {
         guard let current = status?.nodes.first(where: { $0.probeIdentity == node.probeIdentity }) else {
-            message = "节点配置已变化，请刷新后重试。"
+            message = L("节点配置已变化，请刷新后重试。")
             return
         }
         updatePolicy(Policy(mode: mode, selected: current.name, expectedProbeKey: current.probeKey))
@@ -623,7 +628,7 @@ final class CoreModel: ObservableObject {
 
     private func start(policy: Policy? = nil) {
         guard !saving, let executable else {
-            if self.executable == nil { message = "App 内缺少代理内核。" }
+            if self.executable == nil { message = L("App 内缺少代理内核。") }
             return
         }
         cancelProbe()
@@ -678,7 +683,7 @@ final class CoreModel: ObservableObject {
                 }
             } catch {
                 if process === child || (process == nil && phase == .stopped) {
-                    message = "启动失败 · " + error.localizedDescription
+                    message = L("启动失败 · ") + error.localizedDescription
                     if process === child { stop() }
                 }
             }
@@ -691,7 +696,7 @@ final class CoreModel: ObservableObject {
             if byte == Data([10]) { return result }
             result.append(byte)
         }
-        throw CoreError(message: "内核退出或未返回启动信息。")
+        throw CoreError(message: L("内核退出或未返回启动信息。"))
     }
 
     private func stop() {
@@ -709,7 +714,7 @@ final class CoreModel: ObservableObject {
 
     private func terminated(_ child: Process) {
         guard process === child else { return }
-        if phase == .running { message = "内核已退出（退出码 \(child.terminationStatus)）。" }
+        if phase == .running { message = L("内核已退出（退出码 <1>）。", child.terminationStatus) }
         polling?.cancel()
         polling = nil
         cancelStatusRequest()
@@ -739,7 +744,7 @@ final class CoreModel: ObservableObject {
         if !query.isEmpty {
             var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
             components?.queryItems = query
-            guard let target = components?.url else { throw CoreError(message: "控制请求地址无效。") }
+            guard let target = components?.url else { throw CoreError(message: L("控制请求地址无效。")) }
             request.url = target
         }
         if path == "verify" { request.timeoutInterval = 8 }
@@ -759,19 +764,19 @@ final class CoreModel: ObservableObject {
 
     /// Applies the saved configuration to the running core without a restart.
     private func applyRunning() async -> String {
-        guard let info = endpoint else { return "重启内核后生效。" }
+        guard let info = endpoint else { return L("重启内核后生效。") }
         do {
             _ = try await call(info, path: "reload", method: "POST", revision: savedRevision)
             configurationNotice = nil
             await refresh(info)
-            return "已生效，无需重启。"
+            return L("已生效，无需重启。")
         } catch let error as CoreError where error.requiresRestart {
-            configurationNotice = "本次配置将在重启代理后生效。"
-            return "重启代理后生效。"
+            configurationNotice = L("本次配置将在重启代理后生效。")
+            return L("重启代理后生效。")
         } catch {
-            configurationNotice = "当前内核仍在使用上次成功应用的配置。"
+            configurationNotice = L("当前内核仍在使用上次成功应用的配置。")
             let reason = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-            return "未能热加载（" + reason + "），重启内核后生效。"
+            return L("未能热加载（") + reason + L("），重启内核后生效。")
         }
     }
 
@@ -812,23 +817,23 @@ final class CoreModel: ObservableObject {
     }
 
     var accessLabel: String {
-        guard phase == .running else { return "未接管" }
-        guard let status, !statusReadFailed else { return "读取中" }
+        guard phase == .running else { return L("未接管") }
+        guard let status, !statusReadFailed else { return L("读取中") }
         return switch (status.tun?.enabled == true, status.systemProxy?.enabled == true) {
-        case (true, true): "TUN + 系统代理"
+        case (true, true): L("TUN + 系统代理")
         case (true, false): "TUN"
-        case (false, true): "系统代理"
-        case (false, false): "手动接入"
+        case (false, true): L("系统代理")
+        case (false, false): L("手动接入")
         }
     }
 
     var reachabilityLabel: String {
-        if phase != .running { return "启动后自动验证" }
-        if statusReadFailed { return "状态待确认" }
-        if verifying { return "正在验证…" }
-        if status?.currentOutbound == "REJECT" { return "已阻断" }
-        if verificationRoute?.canVerify == false { return "等待可用出站" }
-        return verification?.title ?? "等待验证"
+        if phase != .running { return L("启动后自动验证") }
+        if statusReadFailed { return L("状态待确认") }
+        if verifying { return L("正在验证…") }
+        if status?.currentOutbound == "REJECT" { return L("已阻断") }
+        if verificationRoute?.canVerify == false { return L("等待可用出站") }
+        return verification?.title ?? L("等待验证")
     }
 
     func dismissMessage() {
@@ -839,16 +844,16 @@ final class CoreModel: ObservableObject {
         guard !exportingDiagnostics else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.zip]
-        panel.nameFieldStringValue = "HopWay-诊断.zip"
+        panel.nameFieldStringValue = L("HopWay-诊断.zip")
         guard panel.runModal() == .OK, let destination = panel.url else { return }
         exportingDiagnostics = true
         Task {
             defer { exportingDiagnostics = false }
             do {
                 try await writeDiagnostics(to: destination)
-                message = "已导出诊断文件。"
+                message = L("已导出诊断文件。")
             } catch {
-                message = "导出诊断失败 · " + error.localizedDescription
+                message = L("导出诊断失败 · ") + error.localizedDescription
             }
         }
     }
@@ -858,19 +863,19 @@ final class CoreModel: ObservableObject {
         var files: [String: Data] = [:]
         if let info = endpoint, isRunning(info) {
             for kind in ["cpu", "heap"] {
-                let label = kind == "cpu" ? "CPU 样本" : "堆快照"
+                let label = kind == "cpu" ? L("CPU 样本") : L("堆快照")
                 do {
                     var query = [URLQueryItem(name: "kind", value: kind)]
                     if kind == "cpu" { query.append(URLQueryItem(name: "seconds", value: "3")) }
                     guard isRunning(info) else { throw CancellationError() }
                     files[kind + ".pprof"] = try await call(info, path: "diagnostics/profile", method: "POST", query: query)
-                    report += "\n\(label) · 已采集"
+                    report += L("\n<1> · 已采集", label)
                 } catch {
-                    report += "\n\(label) · 采集失败"
+                    report += L("\n<1> · 采集失败", label)
                 }
             }
         } else {
-            report += "\n性能样本 · 内核停止"
+            report += L("\n性能样本 · 内核停止")
         }
         files["report.txt"] = Data((report + "\n").utf8)
         let archive = files
@@ -889,64 +894,64 @@ final class CoreModel: ObservableObject {
             child.standardError = FileHandle.nullDevice
             try child.run()
             child.waitUntilExit()
-            guard child.terminationStatus == 0 else { throw CoreError(message: "无法打包诊断文件。") }
+            guard child.terminationStatus == 0 else { throw CoreError(message: L("无法打包诊断文件。")) }
             try Data(contentsOf: zipped).write(to: destination, options: .atomic)
         }.value
     }
 
     private func diagnosticSummary() -> String {
         let profile = configuredProfile
-        let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知"
+        let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? L("未知")
         let backend = [profile?.backend, profile?.backendVersion].compactMap { $0 }.joined(separator: " ")
         let mode = status?.policy.mode ?? profile?.mode
         let diskVersion = profile?.revision ?? savedRevision
         var lines = [
-            "HopWay 诊断",
-            "采集时间 · " + Date.now.ISO8601Format(),
+            L("HopWay 诊断"),
+            L("采集时间 · ") + Date.now.ISO8601Format(),
             "App · " + appVersion,
-            "系统 · " + ProcessInfo.processInfo.operatingSystemVersionString,
-            "内核后端 · " + (backend.isEmpty ? "未知" : backend),
-            "内核 · " + phase.rawValue,
-            "接入 · " + accessLabel,
-            "出口可达 · " + reachabilityLabel,
-            "路由模式 · " + (mode.map(Policy.label) ?? "未知"),
-            "磁盘配置版本 · " + String(diskVersion.prefix(12)),
-            "节点 · \(configuredNodes.count) 个",
-            "订阅 · \(subscriptions.count) 份",
+            L("系统 · ") + ProcessInfo.processInfo.operatingSystemVersionString,
+            L("内核后端 · ") + (backend.isEmpty ? L("未知") : backend),
+            L("内核 · ") + L(phase.rawValue),
+            L("接入 · ") + accessLabel,
+            L("出口可达 · ") + reachabilityLabel,
+            L("路由模式 · ") + (mode.map(Policy.label) ?? L("未知")),
+            L("磁盘配置版本 · ") + String(diskVersion.prefix(12)),
+            L("节点 · <1> 个", configuredNodes.count),
+            L("订阅 · <1> 份", subscriptions.count),
         ]
         if let status {
-            lines.append("运行配置版本 · " + (status.revision.map { String($0.prefix(12)) } ?? "未知"))
-            lines.append("内核代次 · \(status.generation)")
-            lines.append("活动连接 · \(status.active)")
-            lines.append("配置告警 · \(status.warnings?.count ?? 0) 条")
+            lines.append(L("运行配置版本 · ") + (status.revision.map { String($0.prefix(12)) } ?? L("未知")))
+            lines.append(L("内核代次 · <1>", status.generation))
+            lines.append(L("活动连接 · <1>", status.active))
+            lines.append(L("配置告警 · <1> 条", status.warnings?.count ?? 0))
             if let applied = status.reloaded {
-                lines.append("配置应用时间 · " + Date(timeIntervalSince1970: applied / 1000).ISO8601Format())
+                lines.append(L("配置应用时间 · ") + Date(timeIntervalSince1970: applied / 1000).ISO8601Format())
             }
             if let resources = status.resources {
                 if let used = resources.connections, let limit = resources.connectionLimit {
-                    lines.append("连接额度 · \(used) / \(limit) · 拒绝 \(resources.connectionsRefused ?? 0)")
+                    lines.append(L("连接额度 · <1> / <2> · 拒绝 <3>", used, limit, resources.connectionsRefused ?? 0))
                 }
-                lines.append("UDP 会话 · \(resources.udpSessions) / \(resources.udpSessionLimit)")
-                lines.append("UDP 建连 · \(resources.udpOpening) / \(resources.udpOpenLimit)")
-                lines.append("端点拨号并发 · \(resources.endpointDialLimit)")
-                if let idle = resources.udpIdleTimeoutSec { lines.append("UDP 空闲回收 · \(idle) 秒") }
+                lines.append(L("UDP 会话 · <1> / <2>", resources.udpSessions, resources.udpSessionLimit))
+                lines.append(L("UDP 建连 · <1> / <2>", resources.udpOpening, resources.udpOpenLimit))
+                lines.append(L("端点拨号并发 · <1>", resources.endpointDialLimit))
+                if let idle = resources.udpIdleTimeoutSec { lines.append(L("UDP 空闲回收 · <1> 秒", idle)) }
                 if let used = resources.udpQueuedBytes, let limit = resources.udpQueueLimitBytes {
-                    lines.append("UDP 暂存 · \(used) / \(limit) B")
+                    lines.append(L("UDP 暂存 · <1> / <2> B", used, limit))
                 }
             }
             if let retirement = status.retirement {
-                lines.append("旧内核回收 · 处理中 \(retirement.pending) · 强制关闭 \(retirement.forced) · 清理超时 \(retirement.slow)")
+                lines.append(L("旧内核回收 · 处理中 <1> · 强制关闭 <2> · 清理超时 <3>", retirement.pending, retirement.forced, retirement.slow))
             }
             if let tun = status.tun {
-                lines.append("TUN 助手 · " + (tun.service == true ? "已安装" : "未安装"))
+                lines.append(L("TUN 助手 · ") + (tun.service == true ? L("已安装") : L("未安装")))
                 if let pools = tun.fakeIP {
-                    lines.append("Fake IP IPv4 · \(pools.ipv4.mapped) / \(pools.ipv4.capacity) · 暂缓 \(pools.ipv4.refused)")
+                    lines.append(L("Fake IP IPv4 · <1> / <2> · 暂缓 <3>", pools.ipv4.mapped, pools.ipv4.capacity, pools.ipv4.refused))
                     if let ipv6 = pools.ipv6 {
-                        lines.append("Fake IP IPv6 · \(ipv6.mapped) / \(ipv6.capacity) · 暂缓 \(ipv6.refused)")
+                        lines.append(L("Fake IP IPv6 · <1> / <2> · 暂缓 <3>", ipv6.mapped, ipv6.capacity, ipv6.refused))
                     }
                 }
                 if let dns = tun.dns {
-                    lines.append("TUN DNS · 转发时限 \(dns.timeoutMs) 毫秒 · 例外 \(dns.exceptionCount) 条 · 嗅探 \(dns.sniffingEnabled ? "开启" : "关闭")")
+                    lines.append(L("TUN DNS · 转发时限 <1> 毫秒 · 例外 <2> 条 · 嗅探 <3>", dns.timeoutMs, dns.exceptionCount, dns.sniffingEnabled ? L("开启") : L("关闭")))
                 }
             }
             for (name, drops) in (status.udpDrops ?? [:]).sorted(by: { $0.key < $1.key }) {
@@ -963,7 +968,7 @@ final class CoreModel: ObservableObject {
     }
 
     func explainRoute(_ host: String) async throws -> RouteDecision {
-        guard let info = endpoint else { throw CoreError(message: "请先启动内核。") }
+        guard let info = endpoint else { throw CoreError(message: L("请先启动内核。")) }
         var address = host.trimmingCharacters(in: .whitespacesAndNewlines)
         if address.hasPrefix("[") && address.hasSuffix("]") {
             address += ":443"
@@ -974,12 +979,12 @@ final class CoreModel: ObservableObject {
         }
         var url = URLComponents(url: info.control.appendingPathComponent("route"), resolvingAgainstBaseURL: false)
         url?.queryItems = [URLQueryItem(name: "target", value: address)]
-        guard let target = url?.url else { throw CoreError(message: "地址无效。") }
+        guard let target = url?.url else { throw CoreError(message: L("地址无效。")) }
         var request = URLRequest(url: target)
         request.setValue("Bearer " + info.token, forHTTPHeaderField: "Authorization")
         let (data, response) = try await session.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw CoreError(message: "请输入域名、IP 或主机与端口。")
+            throw CoreError(message: L("请输入域名、IP 或主机与端口。"))
         }
         return try JSONDecoder().decode(RouteDecision.self, from: data)
     }
@@ -1060,7 +1065,7 @@ final class CoreModel: ObservableObject {
             }
             if message == nil, status?.systemProxy?.recovered == true, !announcedRecovery {
                 announcedRecovery = true
-                message = "上次异常退出时留下的系统代理设置已自动还原。"
+                message = L("上次异常退出时留下的系统代理设置已自动还原。")
             }
             requestConnectionFeed(info, generation: snapshot.generation)
         } catch {
@@ -1070,7 +1075,7 @@ final class CoreModel: ObservableObject {
                 resetVerification()
             }
             updateTrafficRate(nil)
-            let failure = "读取内核状态失败 · " + error.localizedDescription
+            let failure = L("读取内核状态失败 · ") + error.localizedDescription
             if message == nil || message == statusFailureMessage { message = failure }
             statusFailureMessage = failure
         }
@@ -1140,10 +1145,11 @@ final class CoreModel: ObservableObject {
         }
     }
 
-    func selectRoutingPreset(_ mode: String) {
+    func selectRoutingPreset(_ mode: String, fallbackGroup: String? = nil) {
         guard !saving, !updatingPolicy else { return }
         if phase == .running, let status, !statusReadFailed {
-            updatePolicy(Policy(mode: mode, selected: mode == "direct" ? "DIRECT" : status.policy.selected))
+            let selected = fallbackGroup ?? (mode == "direct" ? "DIRECT" : status.policy.selected)
+            updatePolicy(Policy(mode: mode, selected: selected))
         } else if phase == .stopped, let executable {
             saving = true
             message = nil
@@ -1152,12 +1158,13 @@ final class CoreModel: ObservableObject {
                 defer { saving = false }
                 do {
                     _ = try await Task.detached {
-                        try Self.runProfileCommand("-save-desktop-mode=" + mode, at: destination, executable: executable)
+                        try Self.runProfileCommand("-save-desktop-mode=" + mode, at: destination,
+                                                   executable: executable, desktopSelected: fallbackGroup)
                     }.value
-                    message = "下次启动使用「" + Policy.label(mode) + "」。"
+                    message = L("下次启动使用「<1>」。", fallbackGroup.map(groupLabel) ?? Policy.label(mode))
                     reloadConfiguredNodes()
                 } catch {
-                    message = "保存策略预设失败 · " + error.localizedDescription
+                    message = L("保存策略预设失败 · ") + error.localizedDescription
                 }
             }
         }
@@ -1177,7 +1184,7 @@ final class CoreModel: ObservableObject {
                 _ = try await call(info, path: "system-proxy", method: "PUT", body: JSONEncoder().encode(Body(enabled: enabled)))
                 await refresh(info)
             } catch {
-                if endpoint?.token == info.token { message = "系统代理设置失败 · " + error.localizedDescription }
+                if endpoint?.token == info.token { message = L("系统代理设置失败 · ") + error.localizedDescription }
             }
         }
     }
@@ -1191,10 +1198,10 @@ final class CoreModel: ObservableObject {
 
     var tunProgress: String? {
         switch tunOperation {
-        case "enable": status?.tun?.service == true ? "正在开启增强模式…" : "正在开启增强模式，如有系统弹窗请完成授权。"
-        case "disable": "正在关闭增强模式…"
-        case "install-helper": "正在安装 TUN 助手，请在系统弹窗中完成授权。"
-        case "remove-helper": "正在移除 TUN 助手，请在系统弹窗中完成授权。"
+        case "enable": status?.tun?.service == true ? L("正在开启增强模式…") : L("正在开启增强模式，如有系统弹窗请完成授权。")
+        case "disable": L("正在关闭增强模式…")
+        case "install-helper": L("正在安装 TUN 助手，请在系统弹窗中完成授权。")
+        case "remove-helper": L("正在移除 TUN 助手，请在系统弹窗中完成授权。")
         default: nil
         }
     }
@@ -1222,7 +1229,7 @@ final class CoreModel: ObservableObject {
                 await refresh(info)
             } catch {
                 if phase == .running, endpoint?.token == info.token {
-                    message = "增强模式操作失败 · " + error.localizedDescription
+                    message = L("增强模式操作失败 · ") + error.localizedDescription
                 }
             }
         }
@@ -1237,7 +1244,7 @@ final class CoreModel: ObservableObject {
                 _ = try await call(info, path: "groups/" + group, method: "PUT", body: JSONEncoder().encode(Body(selected: member)))
                 await refresh(info)
             } catch {
-                if endpoint?.token == info.token { message = "切换失败 · " + error.localizedDescription }
+                if endpoint?.token == info.token { message = L("切换失败 · ") + error.localizedDescription }
             }
         }
     }
@@ -1288,26 +1295,26 @@ final class CoreModel: ObservableObject {
                 request.setValue("Bearer " + info.token, forHTTPHeaderField: "Authorization")
                 let (bytes, response) = try await session.bytes(for: request)
                 guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                    throw CoreError(message: "内核未接受刷新请求。")
+                    throw CoreError(message: L("内核未接受刷新请求。"))
                 }
                 for try await line in bytes.lines where !line.isEmpty {
                     let receipt = try JSONDecoder().decode(RefreshReceipt.self, from: Data(line.utf8))
                     guard refreshID == id, isRunning(info) else { return }
                     await refresh(info)
                     guard refreshID == id, isRunning(info) else { return }
-                    message = receipt.canceled ? "刷新已中止。" : "已刷新 \(receipt.succeeded) 项 · \(receipt.failed) 项失败"
+                    message = receipt.canceled ? L("刷新已中止。") : L("已刷新 <1> 项 · <2> 项失败", receipt.succeeded, receipt.failed)
                     return
                 }
-                throw CoreError(message: "刷新连接在返回结果前断开。")
+                throw CoreError(message: L("刷新连接在返回结果前断开。"))
             } catch {
-                if refreshID == id, isRunning(info) { message = "刷新失败 · " + error.localizedDescription }
+                if refreshID == id, isRunning(info) { message = L("刷新失败 · ") + error.localizedDescription }
             }
         }
     }
 
     func cancelRefresh() {
         cancelControlRefresh()
-        message = "刷新已取消。"
+        message = L("刷新已取消。")
     }
 
     private func cancelControlRefresh() {
@@ -1317,30 +1324,114 @@ final class CoreModel: ObservableObject {
         if refreshing { refreshing = false }
     }
 
-    /// "HK 01 · 83 ms" for a member of a group.
+    func groupLabel(_ name: String) -> String {
+        configuredProfile?.groupAliases?[name] ?? name
+    }
+
+    /// "HK 01 · 83 ms" for a node, or the display name of a nested group.
     func memberLabel(_ name: String) -> String {
-        status?.nodes.first(where: { $0.name == name })?.label ?? name
+        if let alias = configuredProfile?.groupAliases?[name] { return alias }
+        return status?.nodes.first(where: { $0.name == name })?.label ?? name
+    }
+
+    var canEditPolicyGroups: Bool {
+        !saving && !changed && !configurationConflict && !profileReadFailed && configuredProfile != nil &&
+        (phase == .stopped || (phase == .running && !statusReadFailed && status != nil))
+    }
+
+    func policyGroupNameError(_ name: String) -> String? {
+        if name.isEmpty { return L("请输入策略组名称。") }
+        if name.count > 80 { return L("名称最多 80 个字符。") }
+        let names = (configuredProfile?.outboundIds?.keys.map { $0 } ?? []) +
+            (configuredProfile?.groupAliases?.values.map { $0 } ?? []) + ["SELECT", "AUTO"]
+        if names.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
+            return L("这个名称已在使用，请换一个。")
+        }
+        return nil
+    }
+
+    func createPolicyGroup(name: String, type: String, members: [String], basedOn source: String) {
+        guard canEditPolicyGroups, source == saved, policyGroupNameError(name) == nil, !members.isEmpty,
+              let ids = configuredProfile?.outboundIds, members.allSatisfy({ ids[$0] != nil }),
+              var config = (try? JSONSerialization.jsonObject(with: Data(source.utf8))) as? [String: Any] else {
+            message = L("策略配置已有更新，请重新打开后再试。")
+            return
+        }
+        var groups = config["groups"] as? [[String: Any]] ?? []
+        groups.append(["name": name, "type": type, "members": members])
+        config["groups"] = groups
+        savePolicyGroups(config, basedOn: source)
+    }
+
+    func policyGroupDeletionBlock(_ name: String) -> String? {
+        guard let profile = configuredProfile, profile.localGroups?.contains(name) == true else {
+            return L("此组由订阅管理，可编辑显示名称与线路。")
+        }
+        if profile.selected == name || status?.policy.selected == name {
+            return L("该组是当前或启动出站，请先切换出站。")
+        }
+        if let count = profile.groupRuleRefs?[name], count > 0 {
+            return L("还有 <1> 条规则指向此组，请先修改规则。", count)
+        }
+        if profile.groups?.contains(where: { $0.name != name && $0.members.contains(name) }) == true ||
+            status?.groups?.contains(where: { $0.name != name && $0.members.contains(name) }) == true {
+            return L("其他策略组仍使用此组，请先移除引用。")
+        }
+        return nil
+    }
+
+    func deletePolicyGroup(_ name: String, basedOn source: String) {
+        guard canEditPolicyGroups, !updatingPolicy, source == saved, policyGroupDeletionBlock(name) == nil,
+              var config = (try? JSONSerialization.jsonObject(with: Data(source.utf8))) as? [String: Any],
+              var groups = config["groups"] as? [[String: Any]],
+              let index = groups.firstIndex(where: { $0["name"] as? String == name }),
+              let id = configuredProfile?.outboundIds?[name] else {
+            message = L("无法删除策略组，请检查配置和引用后再试。")
+            return
+        }
+        guard config["selected"] as? String != name else {
+            message = L("高级配置的默认出站仍引用此组，请先修改 selected。")
+            return
+        }
+        groups.remove(at: index)
+        config["groups"] = groups.isEmpty ? nil : groups
+        var aliases = config["groupAliases"] as? [String: String] ?? [:]
+        aliases.removeValue(forKey: id)
+        config["groupAliases"] = aliases.isEmpty ? nil : aliases
+        var members = config["groupMembers"] as? [String: [String]] ?? [:]
+        members.removeValue(forKey: id)
+        config["groupMembers"] = members.isEmpty ? nil : members
+        savePolicyGroups(config, basedOn: source)
+    }
+
+    private func savePolicyGroups(_ config: [String: Any], basedOn source: String) {
+        do {
+            let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+            saveAdvanced(String(decoding: data, as: UTF8.self), basedOn: source, activation: nil)
+        } catch {
+            message = error.localizedDescription
+        }
     }
 
     func renameSubscription(_ id: String, to name: String) {
         let alias = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard alias.count <= 80 else {
-            message = "订阅名称最多 80 个字符。"
+            message = L("订阅名称最多 80 个字符。")
             return
         }
-        updateSubscription(id, success: alias.isEmpty ? "已恢复默认订阅名称。" : "订阅名称已更新。") { records, index, _ in
+        updateSubscription(id, success: alias.isEmpty ? L("已恢复默认订阅名称。") : L("订阅名称已更新。")) { records, index, _ in
             records[index]["alias"] = alias.isEmpty ? nil : alias
         }
     }
 
     func pauseSubscription(_ id: String, paused: Bool) {
-        updateSubscription(id, success: paused ? "订阅已暂停。" : "订阅已恢复。") { records, index, _ in
+        updateSubscription(id, success: paused ? L("订阅已暂停。") : L("订阅已恢复。")) { records, index, _ in
             records[index]["paused"] = paused ? true : nil
         }
     }
 
     func removeSubscription(_ id: String) {
-        updateSubscription(id, success: "订阅已移除。") { records, index, config in
+        updateSubscription(id, success: L("订阅已移除。")) { records, index, config in
             let removed = Set(records.remove(at: index)["nodes"] as? [String] ?? [])
             let shared = Set(records.flatMap { $0["nodes"] as? [String] ?? [] })
             let orphaned = removed.subtracting(shared)
@@ -1359,7 +1450,7 @@ final class CoreModel: ObservableObject {
     ) {
         guard !saving, let executable else { return }
         guard !changed else {
-            message = "请先保存配置草稿，再修改订阅。"
+            message = L("请先保存配置草稿，再修改订阅。")
             return
         }
         let originalName = subscriptions.first(where: { $0.id == id })?.originalName
@@ -1369,13 +1460,13 @@ final class CoreModel: ObservableObject {
                   ($0["id"] as? String) == id ||
                   ($0["id"] == nil && $0["name"] as? String == originalName)
               }) else {
-            message = "找不到这份订阅，请刷新列表后重试。"
+            message = L("找不到这份订阅，请刷新列表后重试。")
             return
         }
         edit(&records, index, &config)
         config["subscriptions"] = records
         guard let json = try? JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) else {
-            message = "无法保存订阅。"
+            message = L("无法保存订阅。")
             return
         }
         let text = String(decoding: json, as: UTF8.self)
@@ -1392,7 +1483,7 @@ final class CoreModel: ObservableObject {
                 let applied = phase == .running ? " " + (await applyRunning()) : ""
                 message = success + applied
             } catch {
-                writeFailed(error, prefix: "无法保存订阅 · ")
+                writeFailed(error, prefix: L("无法保存订阅 · "))
             }
         }
     }
@@ -1425,12 +1516,22 @@ final class CoreModel: ObservableObject {
     }
 
     private func reloadTraffic() {
-        guard let modified = try? trafficURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
-              modified != trafficModifiedAt,
-              let data = try? Data(contentsOf: trafficURL),
-              let history = try? JSONDecoder().decode(TrafficHistory.self, from: data) else { return }
-        trafficModifiedAt = modified
-        trafficHistory = history
+        guard trafficReadTask == nil else { return }
+        let url = trafficURL
+        let previous = trafficStamp
+        trafficReadTask = Task { [weak self] in
+            let result = await Task.detached { () -> (TrafficHistory.DiskStamp, TrafficHistory)? in
+                let stamp = TrafficHistory.stamp(at: url)
+                guard stamp != previous, let history = TrafficHistory.load(at: url) else { return nil }
+                return (stamp, history)
+            }.value
+            guard let self else { return }
+            trafficReadTask = nil
+            if let (stamp, history) = result {
+                trafficStamp = stamp
+                trafficHistory = history
+            }
+        }
     }
 
     private func retryUnavailableNodes() {
@@ -1469,7 +1570,7 @@ final class CoreModel: ObservableObject {
             do {
                 try child.run()
             } catch {
-                message = "无法启动测速 · " + error.localizedDescription
+                message = L("无法启动测速 · ") + error.localizedDescription
                 return
             }
             probeProcess = child
@@ -1518,7 +1619,7 @@ final class CoreModel: ObservableObject {
                     request.httpBody = try JSONEncoder().encode(["names": names])
                     let (bytes, response) = try await session.bytes(for: request)
                     guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                        throw CoreError(message: "运行中的内核未接受测速请求。")
+                        throw CoreError(message: L("运行中的内核未接受测速请求。"))
                     }
                     let decoder = JSONDecoder()
                     for try await line in bytes.lines {
@@ -1540,11 +1641,11 @@ final class CoreModel: ObservableObject {
             let completed = probeTotal - remaining
             if showSummary {
                 if interrupted || remaining > 0 {
-                    message = "测速未完整结束 · 已完成 \(completed)/\(probeTotal)，剩余 \(remaining) 个。"
+                    message = L("测速未完整结束 · 已完成 <1>/<2>，剩余 <3> 个。", completed, probeTotal, remaining)
                 } else {
                     let failed = completed - available - inconclusive
-                    let uncertain = inconclusive == 0 ? "" : "，\(inconclusive) 个待复测"
-                    message = "测速完成 · \(completed) 个节点，\(available) 个可用，\(failed) 个失败或超时\(uncertain)。"
+                    let uncertain = inconclusive == 0 ? "" : L("，<1> 个待复测", inconclusive)
+                    message = L("测速完成 · <1> 个节点，<2> 个可用，<3> 个失败或超时<4>。", completed, available, failed, uncertain)
                 }
             }
             probeTask = nil
@@ -1584,7 +1685,7 @@ final class CoreModel: ObservableObject {
                     }
                     child.waitUntilExit()
                     guard child.terminationStatus == 0, pending.isEmpty else {
-                        throw CoreError(message: "测速进程退出。")
+                        throw CoreError(message: L("测速进程退出。"))
                     }
                     continuation.finish()
                 } catch {
@@ -1634,7 +1735,7 @@ final class CoreModel: ObservableObject {
         }
         if endpoint != nil {
             let path = id.map { "subscriptions/" + $0 + "/refresh" } ?? "subscriptions/refresh"
-            trigger(path, done: "正在刷新订阅…")
+            trigger(path, done: L("正在刷新订阅…"))
             return
         }
         saving = true
@@ -1646,21 +1747,22 @@ final class CoreModel: ObservableObject {
                     try Self.runProfileCommand("-refresh-subscriptions", at: destination, executable: executable, subscriptionID: id)
                 }.value
                 let result = try JSONDecoder().decode([String: Int].self, from: data)
-                message = "已刷新 \(result["updated"] ?? 0) 份订阅 · \(result["failed"] ?? 0) 份失败"
+                message = L("已刷新 <1> 份订阅 · <2> 份失败", result["updated"] ?? 0, result["failed"] ?? 0)
                 reloadConfiguredNodes()
             } catch {
-                message = "刷新失败 · " + error.localizedDescription
+                message = L("刷新失败 · ") + error.localizedDescription
             }
         }
     }
 
-    nonisolated private static func runProfileCommand(_ flag: String, at destination: URL, executable: URL, subscriptionID: String? = nil) throws -> Data {
+    nonisolated private static func runProfileCommand(_ flag: String, at destination: URL, executable: URL, subscriptionID: String? = nil, desktopSelected: String? = nil) throws -> Data {
         let child = Process()
         let output = Pipe()
         child.executableURL = executable
         child.arguments = [flag, "-config", destination.path]
         if flag == "-inspect" { child.arguments?.append("-desktop-routing") }
         if let subscriptionID { child.arguments?.append(contentsOf: ["-subscription-id", subscriptionID]) }
+        if let desktopSelected { child.arguments?.append(contentsOf: ["-desktop-selected", desktopSelected]) }
         let lifetime = flag == "-refresh-subscriptions" ? Pipe() : nil
         if let lifetime {
             child.arguments?.append("-watch-stdin")
@@ -1672,7 +1774,7 @@ final class CoreModel: ObservableObject {
         try child.run()
         let data = output.fileHandleForReading.readDataToEndOfFile()
         child.waitUntilExit()
-        guard child.terminationStatus == 0 else { throw CoreError(message: "内核命令失败。") }
+        guard child.terminationStatus == 0 else { throw CoreError(message: L("内核命令失败。")) }
         return data
     }
 
@@ -1682,7 +1784,7 @@ final class CoreModel: ObservableObject {
 
     func importContent(_ raw: String) {
         guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            message = "请先复制订阅地址、节点链接或 Clash 配置。"
+            message = L("请先复制订阅地址、节点链接或 Clash 配置。")
             return
         }
         _ = commitImport(Data(raw.utf8), prepared: false, basedOn: savedRevision)
@@ -1695,15 +1797,15 @@ final class CoreModel: ObservableObject {
     private func commitImport(_ input: Data, prepared: Bool, basedOn expected: String) -> Bool {
         guard !saving, let executable else { return false }
         guard !changed else {
-            message = "请先保存配置草稿，再导入节点。"
+            message = L("请先保存配置草稿，再导入节点。")
             return false
         }
         guard savedRevision == expected else {
-            message = "配置已更新，请重新预览导入。"
+            message = L("配置已更新，请重新预览导入。")
             return false
         }
         saving = true
-        message = prepared ? "正在保存已预览的配置…" : "正在识别并导入…"
+        message = prepared ? L("正在保存已预览的配置…") : L("正在识别并导入…")
         let destination = configURL
         Task {
             defer { saving = false }
@@ -1715,14 +1817,14 @@ final class CoreModel: ObservableObject {
                 }.value
                 acceptSavedConfiguration(receipt.text, revision: receipt.revision)
                 importCount += 1
-                var next = "启动后可在概览切换出站。"
+                var next = L("启动后可在概览切换出站。")
                 if phase == .running {
                     next = await applyRunning()
                 }
-                let summary = ["已导入 \(receipt.added) 个节点，跳过 \(receipt.skipped) 个。"] + (receipt.notes ?? [])
+                let summary = [L("已导入 <1> 个节点，跳过 <2> 个。", receipt.added, receipt.skipped)] + (receipt.notes ?? [])
                 message = (summary + [next]).joined(separator: " ")
             } catch {
-                writeFailed(error, prefix: "导入失败 · ")
+                writeFailed(error, prefix: L("导入失败 · "))
             }
         }
         return true
@@ -1756,7 +1858,7 @@ final class CoreModel: ObservableObject {
 
     func previewImport(_ raw: String) async throws -> ImportPreview {
         guard let executable, !changed else {
-            throw CoreError(message: "请先保存配置草稿，再预览导入。")
+            throw CoreError(message: L("请先保存配置草稿，再预览导入。"))
         }
         let destination = configURL
         let expected = savedRevision
@@ -1772,9 +1874,9 @@ final class CoreModel: ObservableObject {
     nonisolated private static func runProfileInput(_ input: Data, mode: String, at destination: URL,
                                                      expected: String? = nil, with executable: URL) throws -> Data {
         if mode == "-commit-prepared-import" {
-            guard input.count <= 16 * 1_048_576 else { throw CoreError(message: "预览后的导入数据超过 16 MB。") }
+            guard input.count <= 16 * 1_048_576 else { throw CoreError(message: L("预览后的导入数据超过 16 MB。")) }
         } else {
-            guard input.count <= 1_048_576 else { throw CoreError(message: "输入上限为 1 MB。") }
+            guard input.count <= 1_048_576 else { throw CoreError(message: L("输入上限为 1 MB。")) }
         }
         let files = FileManager.default
         let directory = files.temporaryDirectory.appendingPathComponent("hopway-" + UUID().uuidString)
@@ -1782,7 +1884,7 @@ final class CoreModel: ObservableObject {
         defer { try? files.removeItem(at: directory) }
         let source = directory.appendingPathComponent("input")
         guard files.createFile(atPath: source.path, contents: input, attributes: [.posixPermissions: 0o600]) else {
-            throw CoreError(message: "无法暂存配置内容。")
+            throw CoreError(message: L("无法暂存配置内容。"))
         }
         let output = Pipe()
         let lifetime = Pipe()
@@ -1802,7 +1904,7 @@ final class CoreModel: ObservableObject {
         if child.terminationStatus == 3 { throw ProfileWriteConflict() }
         guard child.terminationStatus == 0 else {
             let explanation = String(decoding: data.prefix(2048), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            throw CoreError(message: explanation.isEmpty ? "内核无法处理配置。" : explanation)
+            throw CoreError(message: explanation.isEmpty ? L("内核无法处理配置。") : explanation)
         }
         return data
     }
@@ -1813,7 +1915,7 @@ final class CoreModel: ObservableObject {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
             guard let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 1_048_576 else {
-                throw CoreError(message: "配置文件上限为 1 MB。")
+                throw CoreError(message: L("配置文件上限为 1 MB。"))
             }
             draft = try String(contentsOf: url, encoding: .utf8)
             message = nil
@@ -1826,7 +1928,7 @@ final class CoreModel: ObservableObject {
         do {
             guard var object = try JSONSerialization.jsonObject(with: Data(draft.utf8)) as? [String: Any],
                   object["nodes"] == nil || object["nodes"] is NSNull || object["nodes"] is [[String: Any]] else {
-                throw CoreError(message: "请先将草稿修正为 JSON 对象，nodes 应为数组。")
+                throw CoreError(message: L("请先将草稿修正为 JSON 对象，nodes 应为数组。"))
             }
             var nodes = object["nodes"] as? [[String: Any]] ?? []
             var name = type
@@ -1836,9 +1938,9 @@ final class CoreModel: ObservableObject {
                 name = "\(type)-\(index)"
             }
             var node = ["name": name, "type": type, "server": "proxy.example.com:443"]
-            if type == "trojan" || type == "shadowsocks" { node["password"] = "替换为节点密码" }
+            if type == "trojan" || type == "shadowsocks" { node["password"] = L("替换为节点密码") }
             if type == "shadowsocks" { node["cipher"] = "aes-128-gcm" }
-            if type == "vless" || type == "vmess" { node["uuid"] = "替换为节点 UUID" }
+            if type == "vless" || type == "vmess" { node["uuid"] = L("替换为节点 UUID") }
             nodes.append(node)
             object["nodes"] = nodes
             let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
@@ -1855,7 +1957,7 @@ final class CoreModel: ObservableObject {
 
     func saveAdvanced(_ candidate: String, basedOn source: String, activation: String?) {
         guard !changed, saved == source else {
-            message = "配置已有更新，请重新打开高级配置后再保存。"
+            message = L("配置已有更新，请重新打开高级配置后再保存。")
             return
         }
         saveConfiguration(candidate, activation: activation)
@@ -1877,13 +1979,13 @@ final class CoreModel: ObservableObject {
                 if phase == .running {
                     if let activation {
                         let applied = await applyRunning()
-                        message = applied == "已生效，无需重启。" ? "配置已保存。\(activation)" : "配置已保存，\(applied)"
+                        message = applied == L("已生效，无需重启。") ? L("配置已保存。<1>", activation) : L("配置已保存，<1>", applied)
                         if configurationNotice == nil { configurationNotice = activation }
                     } else {
-                        message = "配置已保存，" + (await applyRunning())
+                        message = L("配置已保存，") + (await applyRunning())
                     }
                 } else {
-                    message = "配置已保存。"
+                    message = L("配置已保存。")
                 }
             } catch {
                 writeFailed(error)
@@ -1895,7 +1997,7 @@ final class CoreModel: ObservableObject {
                                                     expected: String, with executable: URL) throws -> String {
         let data = try runProfileInput(Data(text.utf8), mode: "-save-config", at: destination, expected: expected, with: executable)
         let receipt = try JSONDecoder().decode([String: String].self, from: data)
-        guard let revision = receipt["revision"] else { throw CoreError(message: "无法读取保存后的配置版本。") }
+        guard let revision = receipt["revision"] else { throw CoreError(message: L("无法读取保存后的配置版本。")) }
         return revision
     }
 }

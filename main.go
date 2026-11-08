@@ -52,6 +52,7 @@ func main() {
 	startupNode := flag.String("startup-node", "", "internal: connect through this node when the app starts")
 	startupProbeKey := flag.String("startup-probe-key", "", "internal: verify the requested node configuration")
 	desktopMode := flag.String("save-desktop-mode", "", "internal: choose a routing preset for the next desktop launch")
+	desktopSelected := flag.String("desktop-selected", "", "internal: choose a fallback group for the next desktop launch")
 	inspect := flag.Bool("inspect", false, "print the effective configuration's node and subscription summaries")
 	probe := flag.Bool("probe", false, "measure latency through configured nodes")
 	var probeNames []string
@@ -113,7 +114,7 @@ func main() {
 	if *desktopMode != "" {
 		ctx, cancel := profileCommandContext(false)
 		defer cancel()
-		if err := app.SaveDesktopMode(ctx, *path, dataDir(*path), *desktopMode, backend.Default()); err != nil {
+		if err := app.SaveDesktopMode(ctx, *path, dataDir(*path), *desktopMode, *desktopSelected, backend.Default()); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -812,6 +813,10 @@ func inspectProfile(ctx context.Context, path string, inspect, probe, refresh bo
 			Nodes          []engine.NodeSummary  `json:"nodes"`
 			Subs           []engine.Subscription `json:"subscriptions"`
 			Groups         []engine.Group        `json:"groups,omitempty"`
+			OutboundIDs    map[string]string     `json:"outboundIds,omitempty"`
+			GroupAliases   map[string]string     `json:"groupAliases,omitempty"`
+			GroupRuleRefs  map[string]int        `json:"groupRuleRefs,omitempty"`
+			LocalGroups    []string              `json:"localGroups,omitempty"`
 			RuleSets       []string              `json:"ruleSets,omitempty"`
 			RuleCount      int                   `json:"ruleCount"`
 			Mode           string                `json:"mode"`
@@ -851,8 +856,29 @@ func inspectProfile(ctx context.Context, path string, inspect, probe, refresh bo
 			result.Subs[i].ID = result.Subs[i].Key()
 			result.Subs[i].URL = ""
 		}
+		result.OutboundIDs = map[string]string{"DIRECT": "DIRECT", "REJECT": "REJECT"}
+		result.GroupAliases = make(map[string]string)
+		for _, group := range loaded.User.Groups {
+			result.LocalGroups = append(result.LocalGroups, group.Name)
+		}
+		groupNames := make(map[string]bool, len(config.Groups))
+		for _, group := range config.Groups {
+			groupNames[group.Name] = true
+			id := config.OutboundID(group.Name, true)
+			result.OutboundIDs[group.Name] = id
+			if alias := strings.TrimSpace(config.GroupAliases[id]); alias != "" {
+				result.GroupAliases[group.Name] = alias
+			}
+		}
+		result.GroupRuleRefs = make(map[string]int)
+		for _, rule := range config.Rules {
+			if groupNames[rule.Via] {
+				result.GroupRuleRefs[rule.Via]++
+			}
+		}
 		probeKeys := config.ProbeKeys()
 		for _, node := range config.Nodes {
+			result.OutboundIDs[node.Name] = config.OutboundID(node.Name, false)
 			result.Nodes = append(result.Nodes, engine.NodeSummary{Name: node.Name, Type: node.Type, ProbeKey: probeKeys[node.Name]})
 		}
 		return output.Encode(result)

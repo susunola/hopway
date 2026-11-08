@@ -4,6 +4,7 @@
 <dict>
     <key>CFBundleExecutable</key><string>MacProxy</string>
     <key>CFBundleIdentifier</key><string>local.macproxy.desktop</string>
+    <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
     <key>CFBundleName</key><string>HopWay</string>
     <key>CFBundleIconFile</key><string>HopWay.icns</string>
     <key>CFBundleDisplayName</key><string>HopWay</string>

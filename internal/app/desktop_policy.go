@@ -150,12 +150,12 @@ func (s *Supervisor) saveDesktopPolicy(policy engine.Policy) error {
 }
 
 // SaveDesktopMode changes the next launch's preset while the profile is stopped.
-func SaveDesktopMode(ctx context.Context, path, dir, mode string, impl backend.Backend) error {
+func SaveDesktopMode(ctx context.Context, path, dir, mode, selected string, impl backend.Backend) error {
 	if path == "" || dir == "" {
 		return errors.New("缺少配置路径")
 	}
 	switch mode {
-	case "fastest", "rule", "direct":
+	case "fastest", "rule", "direct", "global":
 	default:
 		return errors.New("未知的策略预设")
 	}
@@ -174,9 +174,22 @@ func SaveDesktopMode(ctx context.Context, path, dir, mode string, impl backend.B
 	}
 	policy := DesktopStartupPolicy(loaded, dir)
 	policy.Mode, policy.Auto = mode, nil
-	if mode == "direct" {
+	switch {
+	case mode == "global":
+		found := false
+		for _, group := range loaded.Merged.Groups {
+			if group.Name == selected && group.Type == engine.GroupFallback {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errors.New("找不到所选的故障转移组")
+		}
+		policy.Selected = selected
+	case mode == "direct":
 		policy.Selected = "DIRECT"
-	} else if policy.Selected == "" {
+	case policy.Selected == "":
 		policy.Selected = loaded.Merged.Selected
 	}
 	return newDesktopPolicy(loaded.Merged, policy).write(dir)

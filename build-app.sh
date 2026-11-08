@@ -8,6 +8,7 @@ trap 'rm -rf "$staging"' EXIT
 app="$staging/build.noindex/HopWay.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp ui/Info.plist "$app/Contents/Info.plist"
+ditto ui/en.lproj "$app/Contents/Resources/en.lproj"
 iconset="$staging/HopWay.iconset"
 mkdir -p "$iconset"
 xcrun swift tools/make-icon.swift "$iconset"

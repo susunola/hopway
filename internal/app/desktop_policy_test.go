@@ -260,6 +260,10 @@ func TestSaveDesktopPresetChangesOnlyNextStartupPolicy(t *testing.T) {
 	path, cache := filepath.Join(dir, "config.json"), filepath.Join(dir, "cache")
 	config := engine.Default()
 	config.Rules = []engine.Rule{{Type: engine.RuleDomain, Value: "local.test", Via: "DIRECT"}}
+	config.Groups = []engine.Group{
+		{Name: "Backup", Type: engine.GroupFallback, Members: []string{"DIRECT"}},
+		{Name: "Manual", Type: engine.GroupSelect, Members: []string{"DIRECT"}},
+	}
 	document, err := json.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
@@ -268,15 +272,26 @@ func TestSaveDesktopPresetChangesOnlyNextStartupPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, mode := range []string{"fastest", "direct", "rule"} {
-		if err := SaveDesktopMode(context.Background(), path, cache, mode, backend.Native{}); err != nil {
+		if err := SaveDesktopMode(context.Background(), path, cache, mode, "", backend.Native{}); err != nil {
 			t.Fatal(err)
 		}
 		if got := DesktopStartupPolicy(profile.Loaded{User: config, Merged: config}, cache); got.Mode != mode {
 			t.Fatalf("saved mode %q, want %q", got.Mode, mode)
 		}
 	}
-	if err := SaveDesktopMode(context.Background(), path, cache, "auto", backend.Native{}); err == nil {
+	if err := SaveDesktopMode(context.Background(), path, cache, "auto", "", backend.Native{}); err == nil {
 		t.Fatal("accepted regional routing without a region")
+	}
+	for _, name := range []string{"", "missing", "Manual"} {
+		if err := SaveDesktopMode(context.Background(), path, cache, "global", name, backend.Native{}); err == nil {
+			t.Fatalf("accepted %q as a fallback group", name)
+		}
+	}
+	if err := SaveDesktopMode(context.Background(), path, cache, "global", "Backup", backend.Native{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := DesktopStartupPolicy(profile.Loaded{User: config, Merged: config}, cache); got.Mode != "global" || got.Selected != "Backup" {
+		t.Fatalf("saved fallback policy %+v", got)
 	}
 	if saved, err := os.ReadFile(path); err != nil || !bytes.Equal(saved, document) {
 		t.Fatalf("the preset changed the user configuration: %v", err)

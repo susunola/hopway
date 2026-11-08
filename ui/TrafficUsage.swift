@@ -2,15 +2,20 @@ import Charts
 import Foundation
 import SwiftUI
 
-struct TrafficHistory: Decodable {
-    struct Count: Decodable, Equatable {
+struct TrafficHistory: Decodable, Sendable {
+    struct Count: Decodable, Equatable, Sendable {
         var upload: UInt64 = 0
         var download: UInt64 = 0
-        var total: UInt64 { upload + download }
+        var total: UInt64 { Self.sum(upload, download) }
 
         mutating func add(_ count: Count) {
-            upload += count.upload
-            download += count.download
+            upload = Self.sum(upload, count.upload)
+            download = Self.sum(download, count.download)
+        }
+
+        private static func sum(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+            let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? .max : sum
         }
     }
 
@@ -23,6 +28,64 @@ struct TrafficHistory: Decodable {
 
     let since: String
     let days: [String: [String: Count]]
+    private let through: UInt64?
+
+    private struct Batch: Decodable {
+        let since: String
+        let sequence: UInt64
+        let days: [String: [String: Count]]
+    }
+
+    struct DiskStamp: Equatable, Sendable {
+        let checkpoint: Date?
+        let journal: Date?
+    }
+
+    static func stamp(at url: URL) -> DiskStamp {
+        func modified(_ file: URL) -> Date? {
+            let attributes = try? FileManager.default.attributesOfItem(atPath: file.path)
+            return attributes?[.modificationDate] as? Date
+        }
+        return DiskStamp(checkpoint: modified(url), journal: modified(url.appendingPathExtension("journal")))
+    }
+
+    static func load(at url: URL) -> TrafficHistory? {
+        let journal = url.appendingPathExtension("journal")
+        let decoder = JSONDecoder()
+        // Capture names before reading the snapshot. Compaction installs the
+        // snapshot before removing its batches, so disappearing files are
+        // covered by a newer snapshot.
+        for _ in 0..<2 {
+            let files = ((try? FileManager.default.contentsOfDirectory(atPath: journal.path)) ?? []).sorted()
+            let snapshot = (try? Data(contentsOf: url)).flatMap { try? decoder.decode(Self.self, from: $0) }
+            var since = snapshot?.since
+            var days = snapshot?.days ?? [:]
+            var through = snapshot?.through ?? 0
+            var removed = false
+            for name in files {
+                guard name.utf8.count == 25, name.hasSuffix(".json"),
+                      let sequence = UInt64(name.prefix(20)), sequence > through,
+                      name == String(format: "%020llu.json", sequence) else { continue }
+                let data: Data
+                do {
+                    data = try Data(contentsOf: journal.appendingPathComponent(name))
+                } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                    removed = true
+                    break
+                } catch {
+                    continue
+                }
+                guard let batch = try? decoder.decode(Batch.self, from: data), batch.sequence == sequence else { continue }
+                since = since ?? batch.since
+                for (day, nodes) in batch.days {
+                    days[day, default: [:]].merge(nodes) { _, new in new }
+                }
+                through = sequence
+            }
+            if !removed { return since.map { Self(since: $0, days: days, through: through) } }
+        }
+        return nil
+    }
 
     func series(from start: Date, through end: Date, calendar: Calendar, includeLeadingDays: Bool = false) -> [Day] {
         let formatter = DateFormatter()
@@ -56,32 +119,35 @@ struct TrafficRate: Equatable {
 }
 
 struct TrafficDashboard: View {
+    @Environment(\.locale) private var interfaceLocale
     @ObservedObject var core: CoreModel
 
     var body: some View {
+        let _ = interfaceLocale
         ScrollView {
             VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
-                HopPageHeading(title: "用量", detail: "监测本机经过 HopWay 的流量")
+                HopPageHeading(title: L("用量"), detail: L("监测本机经过 HopWay 的流量"))
                 liveMonitor.hopPanel(verticalPadding: 10)
                 LocalTrafficView(history: core.trafficHistory, subscriptions: core.subscriptions)
                     .hopPanel()
             }
             .padding(.bottom, 12)
         }
+        .scrollBounceBehavior(.basedOnSize)
     }
 
     private var liveMonitor: some View {
         let running = core.phase == .running
         let rate = running ? core.liveTraffic : nil
         return HStack(spacing: 18) {
-            Label("实时流量", systemImage: "waveform.path").font(.headline)
+            Label(L("实时流量"), systemImage: "waveform.path").labelStyle(HopSectionLabelStyle())
             if let rate {
                 Spacer()
-                liveMetric("下载", rate.download)
-                liveMetric("上传", rate.upload)
+                liveMetric(L("下载"), rate.download)
+                liveMetric(L("上传"), rate.upload)
             } else {
                 Spacer()
-                Text(running ? "等待流量数据" : core.phase.rawValue)
+                Text(running ? L("等待流量数据") : L(core.phase.rawValue))
                     .font(.callout).foregroundStyle(.secondary)
             }
         }
@@ -98,6 +164,7 @@ struct TrafficDashboard: View {
 }
 
 struct LocalTrafficView: View {
+    @Environment(\.locale) private var interfaceLocale
     let history: TrafficHistory?
     let subscriptions: [SubscriptionSummary]
     @State private var period = Period.fortnight
@@ -177,7 +244,7 @@ struct LocalTrafficView: View {
         report.eligibleNodes = eligible.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         report.nodes = counts.map { name, count in
             let sources = providers[name] ?? []
-            let provider = name == "DIRECT" ? "直连" : sources.count > 1 ? "多个订阅" : sources.first?.name ?? "未归属"
+            let provider = name == "DIRECT" ? L("直连") : sources.count > 1 ? L("多个订阅") : sources.first?.name ?? L("未归属")
             return Node(name: name, provider: provider, count: count)
         }.sorted { lhs, rhs in
             lhs.count.total == rhs.count.total ? lhs.name < rhs.name : lhs.count.total > rhs.count.total
@@ -186,38 +253,40 @@ struct LocalTrafficView: View {
     }
 
     var body: some View {
+        let _ = interfaceLocale
         let data = report
         VStack(alignment: .leading, spacing: 15) {
             HStack {
-                Text("历史用量").font(.headline)
+                Text(L("历史用量")).font(.headline)
                 Spacer()
-                Picker("统计范围", selection: $period) {
-                    ForEach(Period.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                Picker(L("统计范围"), selection: $period) {
+                    ForEach(Period.allCases, id: \.self) { Text(L($0.rawValue)).tag($0) }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 205)
+                .id(interfaceLocale.identifier)
+                .fixedSize()
             }
             HStack(alignment: .bottom, spacing: 12) {
-                historyFilter("来源", value: sourceLabel, selection: $source) {
-                    Text("全部出站").tag(Source.all)
-                    Text("仅直连").tag(Source.direct)
-                    Text("仅代理节点").tag(Source.proxy)
+                historyFilter(L("来源"), value: sourceLabel, selection: $source) {
+                    Text(L("全部出站")).tag(Source.all)
+                    Text(L("仅直连")).tag(Source.direct)
+                    Text(L("仅代理节点")).tag(Source.proxy)
                     ForEach(subscriptions.filter { !($0.nodes ?? []).isEmpty }) { subscription in
                         Text(subscription.name).tag(Source.subscription(subscription.id))
                     }
                 }
-                historyFilter("节点", value: node.map { $0 == "DIRECT" ? "直连" : NodeLocation(name: $0).title } ?? "全部节点",
+                historyFilter(L("节点"), value: node.map { $0 == "DIRECT" ? L("直连") : NodeLocation(name: $0).title } ?? L("全部节点"),
                               selection: $node) {
-                    Text("全部节点").tag(String?.none)
+                    Text(L("全部节点")).tag(String?.none)
                     ForEach(data.eligibleNodes, id: \.self) { name in
-                        Text(name == "DIRECT" ? "直连" : NodeLocation(name: name).title)
+                        Text(name == "DIRECT" ? L("直连") : NodeLocation(name: name).title)
                             .tag(Optional(name))
                     }
                 }
                 .disabled(data.eligibleNodes.isEmpty)
                 if source != .all || node != nil {
-                    Button("清除筛选") {
+                    Button(L("清除筛选")) {
                         source = .all
                         node = nil
                     }
@@ -227,17 +296,17 @@ struct LocalTrafficView: View {
             .font(.callout)
             Divider()
             HStack(spacing: 16) {
-                metric("合计", data.total.total)
-                metric("下载", data.total.download)
-                metric("上传", data.total.upload)
-                metric("日均", data.total.total / UInt64(max(data.days.count, 1)))
+                metric(L("合计"), data.total.total)
+                metric(L("下载"), data.total.download)
+                metric(L("上传"), data.total.upload)
+                metric(L("日均"), data.total.total / UInt64(max(data.days.count, 1)))
             }
             if data.total.total > 0 {
                 TrafficTrendChart(days: data.days, height: 138)
                 breakdown(data.nodes, total: data.total.total)
             } else {
                 Label(
-                    history == nil ? "启动代理后开始记录本机流量。" : "当前时间和筛选范围内暂无流量。",
+                    history == nil ? L("启动代理后开始记录本机流量。") : L("当前时间和筛选范围内暂无流量。"),
                     systemImage: "chart.bar"
                 )
                 .foregroundStyle(.secondary)
@@ -256,10 +325,10 @@ struct LocalTrafficView: View {
 
     private var sourceLabel: String {
         switch source {
-        case .all: "全部出站"
-        case .direct: "仅直连"
-        case .proxy: "仅代理节点"
-        case .subscription(let id): subscriptions.first { $0.id == id }?.name ?? "订阅"
+        case .all: L("全部出站")
+        case .direct: L("仅直连")
+        case .proxy: L("仅代理节点")
+        case .subscription(let id): subscriptions.first { $0.id == id }?.name ?? L("订阅")
         }
     }
 
@@ -267,9 +336,8 @@ struct LocalTrafficView: View {
         _ title: String, value: String, selection: Binding<Value>, @ViewBuilder options: () -> Options
     ) -> some View {
         HopLabeledControl(title: title) {
-            HopSelectionMenu(title: title, value: value, labelWidth: 132, selection: selection, options: options)
+            HopSelectionMenu(title: title, value: value, labelWidth: nil, selection: selection, options: options)
         }
-        .frame(width: 170, alignment: .leading)
     }
 
     private func metric(_ title: String, _ count: UInt64) -> some View {
@@ -283,10 +351,10 @@ struct LocalTrafficView: View {
 
     private func breakdown(_ nodes: [Node], total: UInt64) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("按节点").font(.callout.weight(.semibold)).foregroundStyle(.secondary)
+            Text(L("按节点")).font(.callout.weight(.semibold)).foregroundStyle(.secondary)
             ForEach(nodes.prefix(5)) { usageRow($0, total: total) }
             if nodes.count > 5 {
-                HopDisclosure("还有 \(nodes.count - 5) 个节点") {
+                HopDisclosure(L("还有 <1> 个节点", nodes.count - 5)) {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(nodes.dropFirst(5)) { usageRow($0, total: total) }
                     }
@@ -299,7 +367,7 @@ struct LocalTrafficView: View {
     private func usageRow(_ node: Node, total: UInt64) -> some View {
         let ratio = Double(node.count.total) / Double(total)
         return HStack(spacing: 12) {
-            Text(node.name == "DIRECT" ? "直连" : NodeLocation(name: node.name).title)
+            Text(node.name == "DIRECT" ? L("直连") : NodeLocation(name: node.name).title)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .help(node.name)
@@ -320,38 +388,49 @@ struct LocalTrafficView: View {
 }
 
 struct TrafficTrendChart: View {
+    @Environment(\.locale) private var interfaceLocale
     let days: [TrafficHistory.Day]
     let height: CGFloat
     var barWidth: MarkDimension = .automatic
+    var maxHeight: CGFloat? = nil
+    var showsGrid = false
 
     var body: some View {
+        let _ = interfaceLocale
         VStack(alignment: .leading, spacing: 8) {
             Chart(days) { day in
                 BarMark(
-                    x: .value("日期", day.date, unit: .day),
-                    y: .value("下载", Double(day.count.download)),
+                    x: .value(L("日期"), day.date, unit: .day),
+                    y: .value(L("下载"), Double(day.count.download)),
                     width: barWidth
                 )
-                .foregroundStyle(by: .value("方向", "下载"))
+                .foregroundStyle(by: .value(L("方向"), L("下载")))
                 BarMark(
-                    x: .value("日期", day.date, unit: .day),
-                    y: .value("上传", Double(day.count.upload)),
+                    x: .value(L("日期"), day.date, unit: .day),
+                    y: .value(L("上传"), Double(day.count.upload)),
                     width: barWidth
                 )
-                .foregroundStyle(by: .value("方向", "上传"))
+                .foregroundStyle(by: .value(L("方向"), L("上传")))
             }
-            .chartForegroundStyleScale(["下载": HopAppearance.accent, "上传": HopAppearance.mint.opacity(0.76)])
+            .chartForegroundStyleScale([L("下载"): HopAppearance.accent, L("上传"): HopAppearance.chartUpload])
             .chartLegend(.hidden)
             .chartXAxis {
-                AxisMarks(values: .stride(by: .day, count: days.count > 15 ? 5 : days.count > 6 ? 3 : 1)) {
-                    AxisValueLabel(format: .dateTime.month(.defaultDigits).day(.defaultDigits))
+                AxisMarks(values: .stride(by: .day, count: showsGrid ? 1 : days.count > 15 ? 5 : days.count > 6 ? 3 : 1)) {
+                    AxisValueLabel(format: .dateTime.month(.defaultDigits).day(.defaultDigits), centered: showsGrid ? true : nil)
                 }
             }
-            .chartYAxis(.hidden)
-            .frame(height: height)
+            .chartYAxis {
+                if showsGrid {
+                    AxisMarks(values: .automatic(desiredCount: 4)) {
+                        AxisGridLine().foregroundStyle(Color.primary.opacity(0.09))
+                    }
+                }
+            }
+            .chartYAxis(showsGrid ? .visible : .hidden)
+            .frame(minHeight: height, idealHeight: height, maxHeight: maxHeight ?? height)
             HStack(spacing: 12) {
-                legend("下载", color: HopAppearance.accent)
-                legend("上传", color: HopAppearance.mint.opacity(0.76))
+                legend(L("下载"), color: HopAppearance.accent)
+                legend(L("上传"), color: HopAppearance.chartUpload)
             }
         }
     }

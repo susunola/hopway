@@ -20,6 +20,7 @@ struct AutoRoutingStatus: Decodable, Equatable {
 }
 
 struct AutoRoutingSheet: View {
+    @Environment(\.locale) private var interfaceLocale
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var core: CoreModel
     @State private var region = ""
@@ -45,29 +46,30 @@ struct AutoRoutingSheet: View {
     }
 
     var body: some View {
+        let _ = interfaceLocale
         VStack(alignment: .leading, spacing: 15) {
-            HopPageHeading(title: "自动选路", detail: "为新连接在同一地区选择服务商和节点。")
+            HopPageHeading(title: L("自动选路"), detail: L("为新连接在同一地区选择服务商和节点。"))
             if regions.isEmpty {
-                Text("需要至少一份已关联节点的订阅。请用原订阅链接重新导入，或重启代理以载入新节点。")
+                Text(L("需要至少一份已关联节点的订阅。请用原订阅链接重新导入，或重启代理以载入新节点。"))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 HStack(alignment: .top, spacing: 12) {
-                    HopLabeledControl(title: "地区") {
-                        HopSelectionMenu(title: "地区", value: region.isEmpty ? "请选择地区" : regionName(region),
+                    HopLabeledControl(title: L("地区")) {
+                        HopSelectionMenu(title: L("地区"), value: region.isEmpty ? L("请选择地区") : regionName(region),
                                          labelWidth: 176, selection: $region) {
-                            Text("请选择地区").tag("")
+                            Text(L("请选择地区")).tag("")
                             ForEach(regions, id: \.self) { code in
                                 Text(regionName(code)).tag(code)
                             }
                         }
                     }
                     .frame(width: 215)
-                    HopLabeledControl(title: "首选服务商") {
-                        HopSelectionMenu(title: "首选服务商",
-                                         value: availableProviders.first { $0.id == preferred }?.name ?? "按导入顺序",
+                    HopLabeledControl(title: L("首选服务商")) {
+                        HopSelectionMenu(title: L("首选服务商"),
+                                         value: availableProviders.first { $0.id == preferred }?.name ?? L("按导入顺序"),
                                          labelWidth: 176, selection: $preferred) {
-                            Text("按导入顺序").tag("")
+                            Text(L("按导入顺序")).tag("")
                             ForEach(availableProviders) { subscription in
                                 Text(subscription.name).tag(subscription.id)
                             }
@@ -76,15 +78,15 @@ struct AutoRoutingSheet: View {
                     }
                     .frame(width: 215)
                 }
-                Text("首选服务商不可用时按导入顺序尝试备用。同一服务商内会保持当前节点，直到测速确认需要切换。")
+                Text(L("首选服务商不可用时按导入顺序尝试备用。同一服务商内会保持当前节点，直到测速确认需要切换。"))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
                 Spacer()
-                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("启用自动选路", action: enable)
+                Button(L("取消")) { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(L("启用自动选路"), action: enable)
                     .buttonStyle(HopPrimaryButton())
                     .keyboardShortcut(.defaultAction)
                     .disabled(region.isEmpty || availableProviders.isEmpty || core.updatingPolicy)
@@ -96,7 +98,7 @@ struct AutoRoutingSheet: View {
     }
 
     private func regionName(_ code: String) -> String {
-        Locale(identifier: "zh_Hans").localizedString(forRegionCode: code) ?? code
+        interfaceLocale.localizedString(forRegionCode: code) ?? code
     }
 
     private func enable() {

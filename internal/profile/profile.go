@@ -272,8 +272,56 @@ func merge(user engine.Config, snapshots map[string]*Snapshot, owners map[refere
 			merged.Selected = merged.Nodes[0].Name
 		}
 	}
+	warnings = append(warnings, applyGroupMembers(&merged)...)
 	warnings = append(warnings, prune(&merged)...)
 	return merged, warnings
+}
+
+// Overrides can add nodes and reorder existing subgroup links. Keeping
+// subgroup links within the source graph avoids cycles after a refresh.
+func applyGroupMembers(config *engine.Config) []string {
+	if len(config.GroupMembers) == 0 {
+		return nil
+	}
+	names := map[string]string{"DIRECT": "DIRECT", "REJECT": "REJECT"}
+	groupNames := make(map[string]bool, len(config.Groups))
+	for _, node := range config.Nodes {
+		names[config.OutboundID(node.Name, false)] = node.Name
+	}
+	for _, group := range config.Groups {
+		names[config.OutboundID(group.Name, true)] = group.Name
+		groupNames[group.Name] = true
+	}
+	var warnings []string
+	for i := range config.Groups {
+		group := &config.Groups[i]
+		members, customized := config.GroupMembers[config.OutboundID(group.Name, true)]
+		if !customized {
+			continue
+		}
+		original := make(map[string]bool, len(group.Members))
+		for _, name := range group.Members {
+			original[name] = true
+		}
+		group.Members = nil
+		seen := make(map[string]bool, len(members))
+		for _, id := range members {
+			name := names[id]
+			if name == "" || seen[name] || (groupNames[name] && !original[name]) {
+				continue
+			}
+			seen[name] = true
+			group.Members = append(group.Members, name)
+		}
+		if len(group.Members) == 0 {
+			group.Members = []string{"REJECT"}
+			warnings = append(warnings, fmt.Sprintf("策略组「%s」的自定义线路均不可用，暂时阻断", group.Name))
+		}
+		if !seen[group.Selected] {
+			group.Selected = ""
+		}
+	}
+	return warnings
 }
 
 func remapDetour(node *outbound.Node, names map[string]string) {

@@ -34,9 +34,13 @@ type Config struct {
 	Selected  string          `json:"selected"`
 	Nodes     []outbound.Node `json:"nodes"`
 	Groups    []Group         `json:"groups,omitempty"`
-	Rules     []Rule          `json:"rules"`
-	RuleSets  []RuleSet       `json:"ruleSets,omitempty"`
-	Health    *Health         `json:"health,omitempty"`
+	// GroupMembers overrides membership by stable outbound identity after subscription merging.
+	GroupMembers map[string][]string `json:"groupMembers,omitempty"`
+	// GroupAliases only affects labels in the desktop app.
+	GroupAliases map[string]string `json:"groupAliases,omitempty"`
+	Rules        []Rule            `json:"rules"`
+	RuleSets     []RuleSet         `json:"ruleSets,omitempty"`
+	Health       *Health           `json:"health,omitempty"`
 	// Subscriptions are merged in by the profile package; the engine only
 	// sees their nodes, groups and rules.
 	Subscriptions          []Subscription `json:"subscriptions,omitempty"`

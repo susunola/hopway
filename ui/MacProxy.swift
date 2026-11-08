@@ -15,38 +15,43 @@ private final class HopWayAppDelegate: NSObject, NSApplicationDelegate {
 struct MacProxyApp: App {
     @NSApplicationDelegateAdaptor(HopWayAppDelegate.self) private var appDelegate
     @StateObject private var core = CoreModel()
+    @AppStorage(HopLanguage.key) private var language = HopLanguage.chinese
 
     var body: some Scene {
         Window("HopWay", id: "dashboard") {
-            Dashboard(core: core)
+            Dashboard(core: core, language: $language)
+                .environment(\.locale, Locale(identifier: language.rawValue))
         }
         .defaultSize(width: 1040, height: 690)
 
         MenuBarExtra("HopWay", systemImage: core.phase == .running ? "point.3.connected.trianglepath.dotted" : "point.3.filled.connected.trianglepath.dotted") {
             StatusMenu(core: core)
+                .environment(\.locale, Locale(identifier: language.rawValue))
         }
     }
 }
 
 private struct StatusMenu: View {
+    @Environment(\.locale) private var interfaceLocale
     @Environment(\.openWindow) private var openWindow
     @ObservedObject var core: CoreModel
 
     var body: some View {
-        Text("内核 · " + core.phase.rawValue)
+        let _ = interfaceLocale
+        Text(L("内核 · ") + L(core.phase.rawValue))
         if core.phase == .running {
-            Text("接入 · " + core.accessLabel)
-            Text("出口 · " + core.reachabilityLabel)
+            Text(L("接入 · ") + core.accessLabel)
+            Text(L("出口 · ") + core.reachabilityLabel)
         }
         Divider()
-        Button(core.phase == .running ? "停止代理" : "启动代理", action: core.toggle)
+        Button(core.phase == .running ? L("停止代理") : L("启动代理"), action: core.toggle)
             .disabled(core.phase == .starting || core.phase == .stopping || core.saving)
-        Button("打开控制台") {
+        Button(L("打开控制台")) {
             openWindow(id: "dashboard")
             NSApp.activate(ignoringOtherApps: true)
         }
         Divider()
-        Button("退出 HopWay") { NSApp.terminate(nil) }.keyboardShortcut("q")
+        Button(L("退出 HopWay")) { NSApp.terminate(nil) }.keyboardShortcut("q")
     }
 }
 
@@ -55,13 +60,13 @@ private enum DashboardPage: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .overview: "概览"
-        case .nodes: "节点"
-        case .subscriptions: "订阅"
-        case .usage: "用量"
-        case .policies: "策略"
-        case .connections: "连接"
-        case .settings: "设置"
+        case .overview: L("概览")
+        case .nodes: L("节点")
+        case .subscriptions: L("订阅")
+        case .usage: L("用量")
+        case .policies: L("策略")
+        case .connections: L("连接")
+        case .settings: L("设置")
         }
     }
 
@@ -79,13 +84,19 @@ private enum DashboardPage: String, CaseIterable {
 }
 
 private struct Dashboard: View {
+    @Environment(\.locale) private var interfaceLocale
     @ObservedObject var core: CoreModel
+    @Binding var language: HopLanguage
     @State private var routeHost = ""
     @State private var routeResult: String?
     @State private var testingRoute = false
     @State private var showsRouteTester = false
     @State private var showsAutoRouting = false
+    @State private var showsFallbackRouting = false
+    @State private var editsCustomRules = false
     @State private var showsPolicyDetails = false
+    @State private var editingGroup: ProfileInspection.Group?
+    @State private var showsNewPolicyGroup = false
     @State private var page: DashboardPage = .overview
     @State private var showsLinkImport = false
     @State private var importLink = ""
@@ -97,8 +108,10 @@ private struct Dashboard: View {
     @State private var confirmsDiskVersion = false
     @State private var advancedDraft: AdvancedSettingsDraft?
     @State private var hoveredPreset: RoutingPreset?
+    @State private var hoveredPage: DashboardPage?
 
     var body: some View {
+        let _ = interfaceLocale
         HStack(spacing: 0) {
             sidebar
             Divider()
@@ -121,17 +134,19 @@ private struct Dashboard: View {
                         ScrollView {
                             VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
                                 HStack {
-                                    HopPageHeading(title: "策略", detail: "选择出站方式，检查规则和策略组")
+                                    HopPageHeading(title: L("策略"), detail: L("选择出站方式，检查规则和策略组"))
                                     Spacer()
-                                    Button("检查路由…") { showsRouteTester = true }
+                                    Button(L("检查路由…")) { showsRouteTester = true }
                                         .fixedSize()
                                         .disabled(core.phase != .running || core.statusReadFailed)
                                 }
                                 routingPresets
                                 policySummary
+                                policyGroups
                             }
                             .padding(.bottom, 12)
                         }
+                        .scrollBounceBehavior(.basedOnSize)
                     case .subscriptions:
                         SubscriptionDashboard(core: core) { showsLinkImport = true }
                     case .usage:
@@ -143,8 +158,8 @@ private struct Dashboard: View {
                     }
                 }
                 .padding(.horizontal, 26)
-                .padding(.top, 26)
-                .padding(.bottom, page == .overview ? 0 : 26)
+                .padding(.top, page == .settings ? 20 : 26)
+                .padding(.bottom, page == .overview ? 0 : page == .settings ? 18 : 26)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 if let message = core.tunProgress ?? core.message {
                     Divider()
@@ -155,20 +170,20 @@ private struct Dashboard: View {
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         if core.refreshing {
-                            Button("取消刷新", action: core.cancelRefresh)
+                            Button(L("取消刷新"), action: core.cancelRefresh)
                         } else if core.tunProgress == nil && !core.statusReadFailed {
                             Button(action: core.dismissMessage) {
                                 Image(systemName: "xmark")
                             }
                             .buttonStyle(.borderless)
-                            .accessibilityLabel("关闭提示")
+                            .accessibilityLabel(L("关闭提示"))
                         }
                     }
                     .padding(.horizontal, 26)
                     .padding(.vertical, 11)
                 }
             }
-            .background(Color(nsColor: .controlBackgroundColor))
+            .background(HopAppearance.pageSurface)
         }
         .tint(HopAppearance.accent)
         .frame(minWidth: 880, minHeight: 525)
@@ -182,14 +197,14 @@ private struct Dashboard: View {
             importError = nil
         }) {
             VStack(alignment: .leading, spacing: 12) {
-                Text("导入链接").font(.headline)
-                Text("粘贴 Shadowrocket 或 Clash 的一键导入链接，也可直接填订阅地址。")
+                Text(L("导入链接")).font(.headline)
+                Text(L("粘贴 Shadowrocket 或 Clash 的一键导入链接，也可直接填订阅地址。"))
                     .foregroundStyle(.secondary)
-                TextField("订阅或节点链接", text: $importLink)
+                TextField(L("订阅或节点链接"), text: $importLink)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
                 if let preview {
-                    Text("识别到 \(preview.added) 个节点 · 跳过 \(preview.skipped) 条")
+                    Text(L("识别到 <1> 个节点 · 跳过 <2> 条", preview.added, preview.skipped))
                         .font(.headline)
                     ForEach(Array(preview.notes.enumerated()), id: \.offset) { _, note in
                         Text(note).font(.caption).foregroundStyle(.secondary)
@@ -201,8 +216,8 @@ private struct Dashboard: View {
                 }
                 HStack {
                     Spacer()
-                    Button("取消") { showsLinkImport = false }.keyboardShortcut(.cancelAction)
-                    Button(previewing ? "正在预览…" : preview == nil ? "预览" : "确认导入") {
+                    Button(L("取消")) { showsLinkImport = false }.keyboardShortcut(.cancelAction)
+                    Button(previewing ? L("正在预览…") : preview == nil ? L("预览") : L("确认导入")) {
                         if let preview {
                             if core.confirmImport(preview) {
                                 showsLinkImport = false
@@ -239,10 +254,19 @@ private struct Dashboard: View {
                 importError = nil
             }
         }
-        .sheet(isPresented: $showsConfigurationEditor) {
+        .sheet(isPresented: $showsConfigurationEditor, onDismiss: { editsCustomRules = false }) {
             configurationEditor
         }
+        .sheet(isPresented: $showsFallbackRouting) {
+            fallbackRouting
+        }
         .sheet(isPresented: $showsRouteTester) { routeTester }
+        .sheet(isPresented: $showsNewPolicyGroup) { NewPolicyGroupSheet(core: core) }
+        .sheet(item: $editingGroup) { group in
+            if let ids = core.configuredProfile?.outboundIds {
+                PolicyGroupEditor(core: core, group: group, ids: ids)
+            }
+        }
     }
 
     private var sidebar: some View {
@@ -263,7 +287,7 @@ private struct Dashboard: View {
                 } label: {
                     HStack(spacing: 10) {
                         Image(systemName: destination.icon).frame(width: 17)
-                        Text(destination.title)
+                        Text(destination.title).lineLimit(1).minimumScaleFactor(0.82)
                         Spacer(minLength: 0)
                         if destination == .nodes && !core.configuredNodes.isEmpty {
                             Text(core.configuredNodes.count.formatted())
@@ -275,27 +299,45 @@ private struct Dashboard: View {
                     .foregroundStyle(page == destination ? HopAppearance.accent : Color.primary)
                     .padding(.horizontal, 10)
                     .frame(height: 34)
-                    .background(page == destination ? HopAppearance.accent.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 8))
+                    .background {
+                        if page == destination {
+                            RoundedRectangle(cornerRadius: 9).fill(HopAppearance.accent.opacity(0.11))
+                        } else if hoveredPage == destination {
+                            RoundedRectangle(cornerRadius: 9).fill(HopAppearance.accent.opacity(0.06))
+                        }
+                    }
+                    .overlay(alignment: .leading) {
+                        if page == destination {
+                            Capsule().fill(HopAppearance.accent).frame(width: 2, height: 16)
+                                .padding(.leading, 3)
+                                .accessibilityHidden(true)
+                        }
+                    }
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .onHover { hovered in
+                    if hovered { hoveredPage = destination }
+                    else if hoveredPage == destination { hoveredPage = nil }
+                }
                 .accessibilityLabel(destination.title)
                 .accessibilityAddTraits(page == destination ? .isSelected : [])
             }
 
             Spacer()
-            Divider().padding(.bottom, 8)
             HStack(spacing: 7) {
                 Circle()
                     .fill(core.statusReadFailed ? HopAppearance.warning :
                           core.phase == .running ? HopAppearance.accent : Color.secondary)
                     .frame(width: 7, height: 7)
-                Text(core.statusReadFailed ? "状态更新失败" : core.phase.rawValue)
+                Text(core.statusReadFailed ? L("状态更新失败") : L(core.phase.rawValue))
                     .font(.caption)
                     .foregroundStyle(core.statusReadFailed ? HopAppearance.warning : .secondary)
             }
             .padding(.horizontal, 10)
-            .padding(.bottom, 5)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(HopAppearance.insetSurface, in: RoundedRectangle(cornerRadius: 9))
         }
         .padding(14)
         .frame(width: 172)
@@ -305,15 +347,15 @@ private struct Dashboard: View {
     private var routeTester: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label("检查路由", systemImage: "arrow.triangle.branch").font(.headline)
+                Label(L("检查路由"), systemImage: "arrow.triangle.branch").font(.headline)
                 Spacer()
-                Button("关闭") { showsRouteTester = false }.keyboardShortcut(.cancelAction)
+                Button(L("关闭")) { showsRouteTester = false }.keyboardShortcut(.cancelAction)
             }
             HStack {
-                TextField("域名或 IP", text: $routeHost)
+                TextField(L("域名或 IP"), text: $routeHost)
                     .textFieldStyle(.roundedBorder)
-                    .accessibilityLabel("待测试地址")
-                Button(testingRoute ? "正在检查…" : "检查") {
+                    .accessibilityLabel(L("待测试地址"))
+                Button(testingRoute ? L("正在检查…") : L("检查")) {
                     testingRoute = true
                     let address = routeHost
                     let policy = core.status?.policy
@@ -324,7 +366,7 @@ private struct Dashboard: View {
                             let result = try await core.explainRoute(address)
                             guard routeHost == address, core.phase == .running,
                                   core.status?.policy == policy, core.status?.reloaded == reload else { return }
-                            routeResult = result.rule + " · " + ((result.path ?? []) + [result.outbound]).joined(separator: " → ")
+                            routeResult = result.rule + " · " + ((result.path ?? []) + [result.outbound]).map(core.groupLabel).joined(separator: " → ")
                         } catch {
                             if routeHost == address, core.phase == .running {
                                 routeResult = error.localizedDescription
@@ -347,8 +389,16 @@ private struct Dashboard: View {
     }
 
     private enum RoutingPreset: String, CaseIterable, Identifiable {
-        case fastest, rule, auto, direct
+        case fastest, rule, auto, direct, custom, fallback
         var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .custom: L("自定义")
+            case .fallback: L("按顺序备用")
+            default: Policy.label(rawValue)
+            }
+        }
 
         var icon: String {
             switch self {
@@ -356,31 +406,37 @@ private struct Dashboard: View {
             case .rule: "arrow.triangle.branch"
             case .auto: "globe"
             case .direct: "arrow.right"
+            case .custom: "slider.horizontal.3"
+            case .fallback: "arrow.triangle.2.circlepath"
             }
         }
 
         var detail: String {
             switch self {
-            case .fastest: "从已验证的可用节点中选延迟最低的。"
-            case .rule: "按已有规则分流，未命中时直连。"
-            case .auto: "固定地区，在节点和服务商之间自动切换。"
-            case .direct: "新连接直接访问目标。"
+            case .fastest: L("从已验证的可用节点中选延迟最低的。")
+            case .rule: L("按已有规则分流，未命中时直连。")
+            case .auto: L("固定地区，在节点和服务商之间自动切换。")
+            case .direct: L("新连接直接访问目标。")
+            case .custom: L("按域名、IP 或应用编写分流规则。")
+            case .fallback: L("优先走组内主线路，故障时按顺序切换。")
             }
         }
     }
 
     private var routingPresets: some View {
         let mode = core.status?.policy.mode ?? core.configuredProfile?.mode
+        let outbound = core.status?.policy.selected ?? core.configuredProfile?.selected
+        let usingFallback = mode == "global" && fallbackGroups.contains { $0.name == outbound }
         let ready = core.phase == .stopped ? !core.profileReadFailed && core.configuredProfile != nil :
             core.phase == .running && !core.statusReadFailed && core.status != nil
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Text("策略模板").font(.headline)
-                Text("双击卡片切换").font(.caption).foregroundStyle(.secondary)
+                Label(L("策略模板"), systemImage: "square.grid.2x2").labelStyle(HopSectionLabelStyle())
+                Text(L("双击使用或配置")).font(.caption).foregroundStyle(.secondary)
             }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible())], spacing: 10) {
                 ForEach(RoutingPreset.allCases) { preset in
-                    presetCard(preset, selected: preset.rawValue == mode, ready: ready)
+                    presetCard(preset, selected: preset == .fallback ? usingFallback : preset.rawValue == mode, ready: ready)
                 }
             }
         }
@@ -389,15 +445,23 @@ private struct Dashboard: View {
     }
 
     private func presetCard(_ preset: RoutingPreset, selected: Bool, ready: Bool) -> some View {
-        let title = Policy.label(preset.rawValue)
-        let canActivate = ready && !core.saving && !core.updatingPolicy &&
-            (preset == .auto ? core.phase == .running : !selected)
+        let title = preset.title
+        let available = switch preset {
+        case .custom: true
+        case .auto: ready && core.phase == .running
+        case .fallback: ready
+        default: ready && !selected
+        }
+        let canActivate = available && !core.saving && !core.updatingPolicy
         let activate = {
             guard canActivate else { return }
-            if preset == .auto {
-                showsAutoRouting = true
-            } else {
-                core.selectRoutingPreset(preset.rawValue)
+            switch preset {
+            case .auto: showsAutoRouting = true
+            case .custom:
+                editsCustomRules = true
+                showsConfigurationEditor = true
+            case .fallback: showsFallbackRouting = true
+            default: core.selectRoutingPreset(preset.rawValue)
             }
         }
         return HStack(alignment: .center, spacing: 11) {
@@ -405,7 +469,8 @@ private struct Dashboard: View {
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(selected ? HopAppearance.accent : .secondary)
                 .frame(width: 31, height: 31)
-                .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
+                .background(selected ? HopAppearance.accent.opacity(0.13) : HopAppearance.insetSurface,
+                            in: RoundedRectangle(cornerRadius: 8))
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(.callout.weight(.semibold))
@@ -413,31 +478,36 @@ private struct Dashboard: View {
             }
             Spacer(minLength: 6)
             if selected {
-                Label(core.phase == .stopped ? "启动时使用" : "已启用", systemImage: "checkmark.circle.fill")
+                Label(core.phase == .stopped ? L("启动时使用") : L("已启用"), systemImage: "checkmark.circle.fill")
                     .font(.caption)
                     .foregroundStyle(HopAppearance.accent)
                     .fixedSize()
             }
             if preset == .auto {
-                Button(selected ? "调整…" : "配置…", action: activate)
-                    .accessibilityLabel("配置按地区自动")
+                Button(selected ? L("调整…") : L("配置…"), action: activate)
+                    .accessibilityLabel(L("配置按地区自动"))
                     .disabled(!canActivate)
-                    .help(core.phase == .stopped ? "启动代理后可配置地区与服务商。" : "设置地区与首选服务商")
+                    .help(core.phase == .stopped ? L("启动代理后可配置地区与服务商。") : L("设置地区与首选服务商"))
                     .sheet(isPresented: $showsAutoRouting) { AutoRoutingSheet(core: core) }
+            } else if preset == .custom || preset == .fallback {
+                Button(preset == .custom ? L("编辑…") : selected ? L("调整…") : L("配置…"), action: activate)
+                    .accessibilityLabel(preset == .custom ? L("编辑自定义规则") : L("配置按顺序备用"))
+                    .disabled(!canActivate)
             } else if !selected {
-                Button("使用", action: activate)
-                    .accessibilityLabel("使用" + title)
+                Button(L("使用"), action: activate)
+                    .accessibilityLabel(L("使用") + title)
                     .disabled(!canActivate)
             }
         }
         .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
         .padding(11)
         .background(
-            selected ? HopAppearance.accent.opacity(0.08) : Color.primary.opacity(hoveredPreset == preset ? 0.075 : 0.035),
-            in: RoundedRectangle(cornerRadius: 8)
+            selected ? HopAppearance.accent.opacity(0.09) : Color.primary.opacity(hoveredPreset == preset ? 0.055 : 0.02),
+            in: RoundedRectangle(cornerRadius: 10)
         )
-        .overlay(RoundedRectangle(cornerRadius: 8)
-            .strokeBorder(selected ? HopAppearance.accent.opacity(0.52) : .clear))
+        .overlay(RoundedRectangle(cornerRadius: 10)
+            .strokeBorder(selected ? HopAppearance.accent.opacity(0.44) : HopAppearance.panelBorder)
+            .allowsHitTesting(false))
         .contentShape(Rectangle())
         .onHover { hovered in
             if hovered { hoveredPreset = preset }
@@ -446,43 +516,66 @@ private struct Dashboard: View {
         .onTapGesture(count: 2, perform: activate)
     }
 
+    private var fallbackGroups: [ProfileInspection.Group] {
+        let groups = (core.configuredProfile?.groups ?? []).filter { $0.type == "fallback" }
+        if core.phase == .running {
+            let active = Set((core.status?.groups ?? []).filter { $0.type == "fallback" }.map(\.name))
+            return groups.filter { active.contains($0.name) }
+        }
+        return groups
+    }
+
+    private var fallbackRouting: some View {
+        FallbackRoutingSheet(
+            groups: fallbackGroups,
+            aliases: core.configuredProfile?.groupAliases ?? [:],
+            selected: core.status?.policy.selected ?? core.configuredProfile?.selected,
+            running: core.phase == .running,
+            canApply: !core.saving && !core.updatingPolicy && !core.statusReadFailed
+        ) { group in
+            core.selectRoutingPreset("global", fallbackGroup: group)
+        }
+    }
+
     private var policySummary: some View {
         let profile = core.configuredProfile
         let status = core.status
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
-                Label(status == nil ? "启动出站" : "当前出站", systemImage: "point.3.connected.trianglepath.dotted")
+                Label(status == nil ? L("启动出站") : L("当前出站"), systemImage: "point.3.connected.trianglepath.dotted")
                     .font(.headline)
                     .fixedSize()
                 if let mode = status?.policy.mode ?? profile?.mode {
                     let outbound: String? = if mode == "auto" || mode == "fastest" {
-                        status.map { $0.auto?.node ?? "等待可用节点" }
+                        status.map { $0.auto?.node ?? L("等待可用节点") }
                     } else if mode == "global" {
                         status?.policy.selected ?? profile?.selected
                     } else {
                         nil
                     }
-                    Text([Policy.label(mode), outbound].compactMap { $0 }.joined(separator: " · "))
+                    let label = mode == "global" && fallbackGroups.contains { $0.name == outbound }
+                        ? RoutingPreset.fallback.title : Policy.label(mode)
+                    Text([label, outbound.map(core.groupLabel)].compactMap { $0 }.joined(separator: " · "))
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
                         .help(outbound ?? Policy.label(mode))
                 }
                 Spacer(minLength: 10)
                 if let profile {
-                    Text("\(profile.ruleCount ?? 0) 条规则 · \(profile.groups?.count ?? 0) 个策略组 · \(profile.ruleSets?.count ?? 0) 个规则集")
+                    Text(L("<1> 条规则 · <2> 个策略组 · <3> 个规则集", profile.ruleCount ?? 0, profile.groups?.count ?? 0, profile.ruleSets?.count ?? 0))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .fixedSize()
-                    if !(profile.groups ?? []).isEmpty || !(profile.ruleSets ?? []).isEmpty {
-                        Button("策略详情…") { showsPolicyDetails = true }
+                    if !(profile.ruleSets ?? []).isEmpty {
+                        Button(L("规则集…")) { showsPolicyDetails = true }
                             .fixedSize()
                             .sheet(isPresented: $showsPolicyDetails) { policyDetails }
                     }
                 }
             }
             if let defaults = status?.ruleDefaults, status?.policy.mode == "rule" {
-                HopDisclosure("规则命中统计") {
-                    Text("兜底规则 \(defaults.explicitMatch.formatted()) 次 · 未命中直连 \(defaults.implicit.formatted()) 次")
+                HopDisclosure(L("规则命中统计")) {
+                    Text(L("兜底规则 <1> 次 · 未命中直连 <2> 次", defaults.explicitMatch.formatted(), defaults.implicit.formatted()))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
@@ -490,7 +583,7 @@ private struct Dashboard: View {
                 .font(.callout)
             }
             if core.profileReadFailed {
-                Label("配置读取失败，请在设置中检查已保存的配置。", systemImage: "exclamationmark.circle")
+                Label(L("配置读取失败，请在设置中检查已保存的配置。"), systemImage: "exclamationmark.circle")
                     .font(.caption)
                     .foregroundStyle(HopAppearance.warning)
             }
@@ -499,104 +592,94 @@ private struct Dashboard: View {
         .hopPanel()
     }
 
-    private var policyDetails: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                HopPageHeading(title: "策略详情", detail: "手动组可以换成员，自动组由内核选路。")
-                Spacer(minLength: 10)
-                Button("完成") { showsPolicyDetails = false }
-                    .keyboardShortcut(.cancelAction)
+    private var policyGroups: some View {
+        let groups = core.configuredProfile?.groups ?? []
+        let liveGroups = core.status?.groups ?? []
+        return VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Label(L("策略组"), systemImage: "point.3.connected.trianglepath.dotted").labelStyle(HopSectionLabelStyle())
+                Text(L("线路归属与顺序")).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button { showsNewPolicyGroup = true } label: {
+                    Label(L("新增策略组…"), systemImage: "plus")
+                }
+                .disabled(!core.canEditPolicyGroups)
             }
-            Divider()
-            ScrollView { policies }
-        }
-        .padding(22)
-        .frame(width: 560, height: 430)
-    }
-
-    private var policies: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let groups = core.status?.groups, !groups.isEmpty {
-                let manual = groups.filter { $0.type == "select" }
-                let automatic = groups.filter { $0.type != "select" }
-                if !manual.isEmpty {
-                    Text("手动切换").font(.headline)
-                    ForEach(manual) { group in
-                        if group.id != manual.first?.id { Divider() }
-                        manualGroup(group)
-                    }
-                }
-                if !automatic.isEmpty {
-                    if !manual.isEmpty { Divider() }
-                    HopDisclosure("自动与备用分组（\(automatic.count)）") {
-                        ForEach(automatic) { group in
-                            inspectGroup(group.name, current: group.now, members: group.members)
-                        }
-                    }
-                    .font(.callout)
-                }
-            } else if let groups = core.configuredProfile?.groups, !groups.isEmpty {
-                Text("启动代理后可在此切换手动组成员。")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                HopDisclosure("已保存的分组（\(groups.count)）") {
-                    ForEach(groups) { group in
-                        inspectGroup(group.name, current: group.selected, members: group.members)
-                    }
-                }
-                .font(.callout)
-            } else {
-                Text(core.configuredProfile == nil ? "正在读取已保存的策略。" : "当前配置没有策略组。")
-                    .foregroundStyle(.secondary)
-                    .font(.callout)
+            if groups.isEmpty {
+                Text(core.configuredProfile == nil ? L("正在读取策略组…") : L("暂无策略组。可以新增一个，也可以从订阅导入。"))
+                    .font(.callout).foregroundStyle(.secondary)
             }
-
-            if let sets = core.status?.ruleSets, !sets.isEmpty {
+            ForEach(groups) { group in
                 Divider()
-                HopDisclosure("规则集（\(sets.count)）") {
-                    VStack(alignment: .leading, spacing: 7) {
-                        Button("更新规则集") { core.trigger("rulesets/refresh", done: "正在更新规则集…") }
-                            .disabled(core.phase != .running || core.statusReadFailed || core.refreshing)
-                        ForEach(sets) { item in
-                            sourceRow(item.name, detail: "\(item.entries) 条", updated: item.updated, error: item.error)
-                        }
-                    }
-                }
-            } else if let names = core.configuredProfile?.ruleSets, !names.isEmpty {
-                Divider()
-                HopDisclosure("规则集（\(names.count)）") {
-                    ForEach(names, id: \.self) { name in
-                        Text(name).font(.callout)
-                    }
-                }
+                policyGroupRow(group, live: liveGroups.first { $0.name == group.name })
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .hopPanel(verticalPadding: 12)
     }
 
-    private func manualGroup(_ group: ProxyStatus.PolicyGroup) -> some View {
-        let selected = group.selected ?? group.now
+    private func policyGroupRow(_ group: ProfileInspection.Group, live: ProxyStatus.PolicyGroup?) -> some View {
+        let type = switch group.type {
+        case "select": L("手动")
+        case "url-test": L("自动测速")
+        case "fallback": L("故障转移")
+        default: group.type
+        }
+        let title = core.groupLabel(group.name)
         return HStack(spacing: 12) {
-            Text(group.name).font(.callout.weight(.medium)).lineLimit(1).help(group.name)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            HopSelectionMenu(title: "切换 \(group.name)", value: core.memberLabel(selected), labelWidth: 153,
-                             selection: Binding(get: { selected }, set: { core.selectInGroup(group.name, member: $0) })) {
-                ForEach(group.members, id: \.self) { Text(core.memberLabel($0)).tag($0) }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.callout.weight(.medium)).lineLimit(1).help(group.name)
+                Text(L("<1> · <2> 条线路", type, group.members.count))
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            .disabled(core.phase != .running || core.statusReadFailed)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if let live, live.type == "select" {
+                let selected = live.selected ?? live.now
+                HopSelectionMenu(title: L("切换 ") + title, value: core.memberLabel(selected), labelWidth: 130,
+                                 selection: Binding(get: { selected }, set: { core.selectInGroup(group.name, member: $0) })) {
+                    ForEach(live.members, id: \.self) { Text(core.memberLabel($0)).tag($0) }
+                }
+                .disabled(core.statusReadFailed || core.saving)
+            } else if let current = live?.now, !current.isEmpty {
+                Text(core.memberLabel(current)).font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1).frame(maxWidth: 160, alignment: .trailing)
+                    .help(current)
+            }
+            Button(L("编辑…")) { editingGroup = group }
+                .accessibilityLabel(L("编辑策略组 ") + title)
+                .fixedSize()
+                .disabled(core.saving || core.changed || core.configurationConflict ||
+                          core.configuredProfile?.outboundIds?[group.name] == nil)
+                .help(core.changed || core.configurationConflict ? L("请先处理高级配置中的草稿或冲突。") : L("修改名称、成员与线路顺序"))
         }
     }
 
-    private func inspectGroup(_ name: String, current: String?, members: [String]) -> some View {
-        HopDisclosure(name) {
-            if let current, !current.isEmpty {
-                Text((core.phase == .running ? "组内当前 · " : "默认成员 · ") + core.memberLabel(current))
+    private var policyDetails: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                HopPageHeading(title: L("规则集"))
+                Spacer(minLength: 10)
+                Button(L("完成")) { showsPolicyDetails = false }
+                    .keyboardShortcut(.cancelAction)
             }
-            Text("\(members.count) 个成员")
-            Text(members.map { core.memberLabel($0) }.joined(separator: "，"))
-                .textSelection(.enabled)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 9) {
+                    if let sets = core.status?.ruleSets, !sets.isEmpty {
+                        Button(L("更新规则集")) { core.trigger("rulesets/refresh", done: L("正在更新规则集…")) }
+                            .disabled(core.phase != .running || core.statusReadFailed || core.refreshing)
+                        ForEach(sets) { item in
+                            sourceRow(item.name, detail: L("<1> 条", item.entries), updated: item.updated, error: item.error)
+                        }
+                    } else {
+                        ForEach(core.configuredProfile?.ruleSets ?? [], id: \.self) { name in Text(name) }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
-        .font(.callout)
+        .padding(22)
+        .frame(width: 560, height: 360)
     }
 
     private func sourceRow(_ name: String, detail: String, updated: Double?, error: String?) -> some View {
@@ -610,28 +693,41 @@ private struct Dashboard: View {
                 Text(Date(timeIntervalSince1970: updated / 1000).formatted(date: .abbreviated, time: .shortened))
                     .foregroundStyle(.secondary)
             } else {
-                Text("尚未下载").foregroundStyle(.secondary)
+                Text(L("尚未下载")).foregroundStyle(.secondary)
             }
         }
         .font(.callout)
     }
 
     private var configuration: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
-                HStack {
-                    HopPageHeading(title: "设置", detail: "本机端口和高级配置")
-                    Spacer()
-                    Button(action: core.exportDiagnostics) {
-                        Label(core.exportingDiagnostics ? "正在生成…" : "导出诊断…", systemImage: "doc.text.magnifyingglass")
-                    }
-                    .fixedSize()
-                    .disabled(core.exportingDiagnostics)
+        AdvancedSettingsPanel(core: core, draft: $advancedDraft, editJSON: { showsConfigurationEditor = true }) {
+            HStack {
+                HopPageHeading(title: L("设置"), detail: L("本机端口和高级配置"))
+                Spacer()
+                Button(action: core.exportDiagnostics) {
+                    Label(core.exportingDiagnostics ? L("正在生成…") : L("导出诊断…"), systemImage: "doc.text.magnifyingglass")
                 }
-                AdvancedSettingsPanel(core: core, draft: $advancedDraft) { showsConfigurationEditor = true }
-                configurationFeedback
+                .fixedSize()
+                .disabled(core.exportingDiagnostics)
             }
-            .padding(.bottom, 12)
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(L("界面语言"), systemImage: "globe").labelStyle(HopSectionLabelStyle())
+                    Text(L("选择 HopWay 的显示语言。")).font(.callout).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Picker(L("界面语言"), selection: $language) {
+                    ForEach(HopLanguage.allCases, id: \.self) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .fixedSize()
+            }
+            .hopPanel(verticalPadding: 12)
+        } feedback: {
+            configurationFeedback
         }
     }
 
@@ -644,11 +740,11 @@ private struct Dashboard: View {
         }
         if core.profileReadFailed || core.configurationConflict {
             HStack {
-                Label(core.configurationConflict ? "磁盘配置已有新版本" : "无法读取已保存的配置",
+                Label(core.configurationConflict ? L("磁盘配置已有新版本") : L("无法读取已保存的配置"),
                       systemImage: "exclamationmark.circle")
                     .foregroundStyle(HopAppearance.warning)
                 Spacer()
-                Button("重新读取配置") {
+                Button(L("重新读取配置")) {
                     if core.changed { showsConfigurationEditor = true }
                     else { core.readDiskConfiguration() }
                 }
@@ -671,26 +767,31 @@ private struct Dashboard: View {
     private var configurationEditor: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("高级配置").font(.headline)
-                if core.changed { Text("未保存").font(.caption).foregroundStyle(HopAppearance.warning) }
+                Text(editsCustomRules ? L("自定义规则") : L("高级配置")).font(.headline)
+                if core.changed { Text(L("未保存")).font(.caption).foregroundStyle(HopAppearance.warning) }
                 Spacer()
-                Button("关闭") { showsConfigurationEditor = false }.keyboardShortcut(.cancelAction)
+                Button(L("关闭")) { showsConfigurationEditor = false }.keyboardShortcut(.cancelAction)
             }
             HStack {
-                Button("打开 JSON", action: core.importDraft).disabled(core.saving)
+                Button(L("打开 JSON"), action: core.importDraft).disabled(core.saving)
                 if core.configurationConflict || core.changed {
-                    Button("读取磁盘版本", action: requestDiskVersion).disabled(core.saving)
+                    Button(L("读取磁盘版本"), action: requestDiskVersion).disabled(core.saving)
                 }
-                Menu("插入节点模板") {
+                Menu(L("插入节点模板")) {
                     ForEach(["socks5", "http", "https", "trojan", "shadowsocks", "anytls", "vless", "vmess"], id: \.self) { type in
                         Button(type) { core.insertTemplate(type) }
                     }
                 }.disabled(core.saving)
                 Spacer()
-                Button("还原草稿") { core.draft = core.saved }.disabled(core.saving || !core.changed)
-                Button(core.saving ? "正在校验…" : "校验并保存", action: core.save)
+                Button(L("还原草稿")) { core.draft = core.saved }.disabled(core.saving || !core.changed)
+                Button(core.saving ? L("正在校验…") : L("校验并保存"), action: core.save)
                     .buttonStyle(HopPrimaryButton())
                     .disabled(core.saving || !core.changed || core.configurationConflict)
+            }
+            if editsCustomRules {
+                Text(L("编辑 rules 数组，按顺序匹配。保存后选用「按规则」即可应用分流。"))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
             TextEditor(text: $core.draft)
                 .disabled(core.saving)
@@ -699,23 +800,89 @@ private struct Dashboard: View {
                 .padding(6)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary))
-                .accessibilityLabel("JSON 配置编辑器")
-            Text(core.message ?? "保存后尝试热加载。修改监听端口需重启代理。关闭会保留草稿。")
+                .accessibilityLabel(L("JSON 配置编辑器"))
+            Text(core.message ?? L("保存后尝试热加载。修改监听端口需重启代理。关闭会保留草稿。"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
         }
         .padding(20)
         .frame(width: 650, height: 395)
-        .confirmationDialog("读取磁盘配置", isPresented: $confirmsDiskVersion, titleVisibility: .visible) {
-            Button("复制草稿并读取") {
+        .confirmationDialog(L("读取磁盘配置"), isPresented: $confirmsDiskVersion, titleVisibility: .visible) {
+            Button(L("复制草稿并读取")) {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(core.draft, forType: .string)
                 core.readDiskConfiguration()
             }
-            Button("取消", role: .cancel) {}
+            Button(L("取消"), role: .cancel) {}
         } message: {
-            Text("可以先复制当前草稿，再读取并比较磁盘版本。")
+            Text(L("可以先复制当前草稿，再读取并比较磁盘版本。"))
         }
+    }
+}
+
+
+private struct FallbackRoutingSheet: View {
+    @Environment(\.locale) private var interfaceLocale
+    @Environment(\.dismiss) private var dismiss
+    let groups: [ProfileInspection.Group]
+    let aliases: [String: String]
+    let running: Bool
+    let canApply: Bool
+    let apply: (String) -> Void
+    @State private var selection: String
+
+    init(groups: [ProfileInspection.Group], aliases: [String: String], selected: String?, running: Bool, canApply: Bool,
+         apply: @escaping (String) -> Void) {
+        self.groups = groups
+        self.aliases = aliases
+        self.running = running
+        self.canApply = canApply
+        self.apply = apply
+        _selection = State(initialValue: groups.first { $0.name == selected }?.name ?? groups.first?.name ?? "")
+    }
+
+    var body: some View {
+        let _ = interfaceLocale
+        let group = groups.first { $0.name == selection }
+        VStack(alignment: .leading, spacing: 14) {
+            HopPageHeading(title: L("按顺序备用"), detail: L("优先使用组内排在最前的可用线路。"))
+            if groups.isEmpty {
+                Text(L("当前没有故障转移组。可导入带 fallback 组的 Clash 配置，或在高级配置的 groups 数组中添加。"))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                HopLabeledControl(title: L("故障转移组")) {
+                    HopSelectionMenu(title: L("故障转移组"), value: group.map { aliases[$0.name] ?? $0.name } ?? L("请选择"),
+                                     labelWidth: 270, selection: $selection) {
+                        ForEach(groups) { item in Text(aliases[item.name] ?? item.name).tag(item.name) }
+                    }
+                }
+                if let group {
+                    Text(L("<1> 条线路 · 首选 <2>", group.members.count, group.members.first.map { aliases[$0] ?? $0 } ?? "—"))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help(group.members.joined(separator: " → "))
+                }
+            }
+            HStack {
+                Spacer()
+                Button(groups.isEmpty ? L("完成") : L("取消")) { dismiss() }.keyboardShortcut(.cancelAction)
+                if !groups.isEmpty {
+                    Button(running ? L("启用备用") : L("下次启动使用")) {
+                        guard let group, canApply else { return }
+                        apply(group.name)
+                        dismiss()
+                    }
+                    .buttonStyle(HopPrimaryButton())
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(group == nil || !canApply)
+                }
+            }
+        }
+        .padding(24)
+        .frame(width: 470)
     }
 }

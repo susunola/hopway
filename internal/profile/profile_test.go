@@ -3,6 +3,7 @@ package profile
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -55,6 +56,42 @@ func TestMerge(t *testing.T) {
 	if merged.Selected != "DIRECT" || len(merged.Rules) != 1 || len(warnings) != 2 {
 		t.Fatalf("prune: selected %s rules %+v warnings %v", merged.Selected, merged.Rules, warnings)
 	}
+}
+
+func TestGroupMembershipFollowsSubscriptionIdentity(t *testing.T) {
+	config := engine.Default()
+	config.Nodes = []outbound.Node{node("Shared")}
+	config.Subscriptions = []engine.Subscription{{Name: "air", ID: "provider", URL: "https://air.test/sub"}}
+	snapshot := &Snapshot{
+		Nodes: []outbound.Node{node("Shared"), node("Backup")},
+		Groups: []engine.Group{
+			{Name: "Switch", Type: engine.GroupFallback, Members: []string{"Shared", "Backup"}},
+		},
+	}
+	snapshots := map[string]*Snapshot{"air": snapshot}
+	id := engine.SourceOutboundID("provider", "Switch", true)
+	config.GroupMembers = map[string][]string{id: {
+		engine.SourceOutboundID("provider", "Backup", false),
+		engine.SourceOutboundID("provider", "Shared", false),
+	}}
+	checkMembers := func(want []string) {
+		t.Helper()
+		merged, _ := Merge(config, snapshots)
+		if got := merged.Groups[0].Members; !slices.Equal(got, want) {
+			t.Fatalf("group members = %v, want %v", got, want)
+		}
+		if err := engine.Validate(merged, backend.Native{}); err != nil {
+			t.Fatalf("merged configuration invalid: %v", err)
+		}
+	}
+	checkMembers([]string{"Backup", "Shared (air 2)"})
+	config.Nodes = nil
+	checkMembers([]string{"Backup", "Shared"})
+	snapshot.Nodes = []outbound.Node{node("Replacement")}
+	snapshot.Groups[0].Members = []string{"Replacement"}
+	checkMembers([]string{"REJECT"})
+	delete(config.GroupMembers, id)
+	checkMembers([]string{"Replacement"})
 }
 
 func TestLoadFallsBackToLastGood(t *testing.T) {

@@ -27,9 +27,9 @@ struct NodeProbeResult: Decodable {
     }
 
     var status: String {
-        if inconclusive == true { return "待复测" }
-        if isAvailable { return "可用" }
-        return timedOut ? "超时" : "失败"
+        if inconclusive == true { return L("待复测") }
+        if isAvailable { return L("可用") }
+        return timedOut ? L("超时") : L("失败")
     }
 
     func isHistorical(at date: Date) -> Bool {
@@ -37,18 +37,19 @@ struct NodeProbeResult: Decodable {
     }
 
     func explanation(at date: Date) -> String {
-        let source = fromRuntime ? "内核健康记录" : "手动测速"
+        let source = fromRuntime ? L("内核健康记录") : L("手动测速")
         let time = observedAt.formatted(date: .abbreviated, time: .shortened)
         let context = [source, time, target].compactMap { $0 }.joined(separator: " · ")
         let reason = DialDiagnostic.message(failureCode, fallback: failure)
         let detail = [DialDiagnostic.stage(failureStage), reason].compactMap { $0 }.joined(separator: " · ")
-        let previous = lastKnownLatency.map { "上次可用延迟 \($0) ms" }
-        let age = isHistorical(at: date) ? "此记录已超过 15 分钟" : nil
-        return [context, detail.isEmpty ? (isAvailable ? "节点可用" : "本次结果不足以判断节点是否可用") : detail, previous, age].compactMap { $0 }.joined(separator: "\n")
+        let previous = lastKnownLatency.map { L("上次可用延迟 <1> ms", $0) }
+        let age = isHistorical(at: date) ? L("此记录已超过 15 分钟") : nil
+        return [context, detail.isEmpty ? (isAvailable ? L("节点可用") : L("本次结果不足以判断节点是否可用")) : detail, previous, age].compactMap { $0 }.joined(separator: "\n")
     }
 }
 
 struct NodeDashboard: View {
+    @Environment(\.locale) private var interfaceLocale
     @ObservedObject var core: CoreModel
     let importLink: () -> Void
     @State private var filter = ""
@@ -134,7 +135,7 @@ struct NodeDashboard: View {
         return NodeProbeResult(
             name: node.name,
             milliseconds: runtime.latencyMs,
-            failure: alive ? nil : runtime.error ?? "内核报告节点不可用",
+            failure: alive ? nil : runtime.error ?? L("内核报告节点不可用"),
             failureStage: runtime.failureStage,
             failureCode: runtime.failureCode,
             target: runtime.probeTarget,
@@ -144,39 +145,40 @@ struct NodeDashboard: View {
     }
 
     var body: some View {
+        let _ = interfaceLocale
         let providers = providers
         let rows = rows(providers: providers)
         let currentName = core.status?.currentOutbound
         let current = core.status?.nodes.first(where: { $0.name == currentName })?.probeIdentity
         VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
             HStack(alignment: .center) {
-                HopPageHeading(title: "节点", detail: rows.count == core.configuredNodes.count
-                               ? "\(rows.count) 个节点" : "显示 \(rows.count) / \(core.configuredNodes.count) 个节点")
+                HopPageHeading(title: L("节点"), detail: rows.count == core.configuredNodes.count
+                               ? L("<1> 个节点", rows.count) : L("显示 <1> / <2> 个节点", rows.count, core.configuredNodes.count))
                 Spacer()
                 Menu {
-                    if !core.configuredNodes.isEmpty { Button("导入节点…", action: importLink) }
-                    Button("从剪贴板导入", action: core.importClipboard)
-                    Button("刷新节点", action: core.refreshNodes)
+                    if !core.configuredNodes.isEmpty { Button(L("导入节点…"), action: importLink) }
+                    Button(L("从剪贴板导入"), action: core.importClipboard)
+                    Button(L("刷新节点"), action: core.refreshNodes)
                         .disabled(core.refreshing || core.probeTotal > 0 || (core.configuredNodes.isEmpty && core.subscriptions.isEmpty))
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
-                .accessibilityLabel("其他节点操作")
+                .accessibilityLabel(L("其他节点操作"))
                 .disabled(core.saving)
                 if core.configuredNodes.isEmpty {
-                    Button("导入节点…", action: importLink)
+                    Button(L("导入节点…"), action: importLink)
                         .buttonStyle(HopPrimaryButton())
                         .disabled(core.saving)
                 } else if core.probeTotal > 0 {
-                    Button("停止测速", action: core.cancelProbe).buttonStyle(HopPrimaryButton())
+                    Button(L("停止测速"), action: core.cancelProbe).buttonStyle(HopPrimaryButton())
                 } else {
                     Button {
                         sortByLatency = true
                         core.testNodes()
                     } label: {
-                        Label("一键测速", systemImage: "gauge.with.dots.needle.67percent")
+                        Label(L("一键测速"), systemImage: "gauge.with.dots.needle.67percent")
                     }
                     .buttonStyle(HopPrimaryButton())
                     .disabled(core.saving)
@@ -184,13 +186,13 @@ struct NodeDashboard: View {
             }
             if !core.configuredNodes.isEmpty {
                 HStack(spacing: 10) {
-                    HopSearchField(placeholder: "搜索节点、协议或订阅", text: $filter)
-                        .frame(minWidth: 140, idealWidth: 230, maxWidth: 300)
+                    HopSearchField(placeholder: L("搜索节点、协议或订阅"), text: $filter)
+                        .frame(minWidth: 140, maxWidth: .infinity)
                     if !providers.isEmpty {
-                        HopSelectionMenu(title: "订阅来源",
-                                         value: providers.first { $0.id == providerID }?.name ?? "全部订阅",
-                                         labelWidth: 90, selection: $providerID) {
-                            Text("全部订阅").tag(String?.none)
+                        HopSelectionMenu(title: L("订阅来源"),
+                                         value: providers.first { $0.id == providerID }?.name ?? L("全部订阅"),
+                                         labelWidth: 140, selection: $providerID) {
+                            Text(L("全部订阅")).tag(String?.none)
                             ForEach(providers) { provider in
                                 Text(provider.name).tag(Optional(provider.id))
                             }
@@ -199,53 +201,52 @@ struct NodeDashboard: View {
                     Button {
                         showsFilters.toggle()
                     } label: {
-                        Label(stateFilter != .all || showUnavailable ? "筛选中" : "筛选", systemImage: "line.3.horizontal.decrease")
+                        Label(stateFilter != .all || showUnavailable ? L("筛选中") : L("筛选"), systemImage: "line.3.horizontal.decrease")
                     }
                     .fixedSize()
                     .popover(isPresented: $showsFilters, arrowEdge: .bottom) {
                         VStack(alignment: .leading, spacing: 10) {
-                            Picker("节点状态", selection: $stateFilter) {
-                                ForEach(StateFilter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                            Picker(L("节点状态"), selection: $stateFilter) {
+                                ForEach(StateFilter.allCases, id: \.self) { Text(L($0.rawValue)).tag($0) }
                             }
-                            Toggle("按延迟排序", isOn: $sortByLatency)
+                            Toggle(L("按延迟排序"), isOn: $sortByLatency)
                             if !core.hiddenNodes.isEmpty {
-                                Toggle("显示暂不可用（\(core.hiddenNodes.count)）", isOn: $showUnavailable)
+                                Toggle(L("显示暂不可用（<1>）", core.hiddenNodes.count), isOn: $showUnavailable)
                             }
                         }
                         .padding(16)
                         .frame(minWidth: 205)
                     }
-                    Spacer()
                 }
             }
             if core.probeTotal > 0 {
                 ProgressView(
-                    "已完成 \(core.probeTotal - core.probePending.count) / \(core.probeTotal)",
+                    L("已完成 <1> / <2>", core.probeTotal - core.probePending.count, core.probeTotal),
                     value: Double(core.probeTotal - core.probePending.count),
                     total: Double(core.probeTotal)
                 )
             }
             if core.configuredProfile == nil && !core.profileReadFailed {
-                ProgressView("正在读取节点…").frame(maxWidth: .infinity, maxHeight: .infinity)
+                ProgressView(L("正在读取节点…")).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if core.profileReadFailed && core.configuredNodes.isEmpty {
-                ContentUnavailableView("无法读取节点", systemImage: "exclamationmark.circle",
-                                       description: Text("可以在设置中检查已保存的配置。"))
+                ContentUnavailableView(L("无法读取节点"), systemImage: "exclamationmark.circle",
+                                       description: Text(L("可以在设置中检查已保存的配置。")))
             } else if core.configuredNodes.isEmpty {
                 ContentUnavailableView {
-                    Label("还没有节点", systemImage: "point.3.connected.trianglepath.dotted")
+                    Label(L("还没有节点"), systemImage: "point.3.connected.trianglepath.dotted")
                 } description: {
-                    Text("导入订阅后，节点和测速状态会显示在这里。")
+                    Text(L("导入订阅后，节点和测速状态会显示在这里。"))
                 }
             } else if rows.isEmpty {
                 ContentUnavailableView(
-                    "没有可显示的节点", systemImage: "magnifyingglass",
+                    L("没有可显示的节点"), systemImage: "magnifyingglass",
                     description: Text(core.hiddenNodes.isEmpty || showUnavailable
-                        ? "试试其他关键词或订阅。"
-                        : "可以清除筛选，或显示暂不可用的节点。")
+                        ? L("试试其他关键词或订阅。")
+                        : L("可以清除筛选，或显示暂不可用的节点。"))
                 )
             } else {
                 Table(rows, selection: $selectedNode) {
-                    TableColumn("节点名称") { row in
+                    TableColumn(L("节点名称")) { row in
                         let node = row.node
                         let location = NodeLocation(name: node.name)
                         HStack(spacing: 8) {
@@ -264,50 +265,52 @@ struct NodeDashboard: View {
                             if current == node.probeIdentity {
                                 Image(systemName: "checkmark.circle.fill")
                                     .foregroundStyle(HopAppearance.accent)
-                                    .help("当前选定出站")
-                                    .accessibilityLabel("当前选定出站")
+                                    .help(L("当前选定出站"))
+                                    .accessibilityLabel(L("当前选定出站"))
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                         .simultaneousGesture(TapGesture(count: 2).onEnded { core.connectToNode(node.name) })
-                        .accessibilityAction(named: Text("连接此节点")) { core.connectToNode(node.name) }
+                        .accessibilityAction(named: Text(L("连接此节点"))) { core.connectToNode(node.name) }
                     }.width(min: 155, ideal: 212)
-                    TableColumn("协议") {
+                    TableColumn(L("协议")) {
                         Text($0.node.type.uppercased())
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                             .help($0.node.type.uppercased())
                     }.width(71)
-                    TableColumn("订阅") { row in
-                        Text(row.provider ?? "本地").lineLimit(1)
+                    TableColumn(L("订阅")) { row in
+                        Text(row.provider ?? L("本地")).lineLimit(1)
                             .foregroundStyle(.secondary)
-                            .help(row.provider ?? "本地节点")
+                            .help(row.provider ?? L("本地节点"))
                     }.width(92)
-                    TableColumn("状态") { row in statusCell(row) }.width(82)
-                    TableColumn("延迟") { row in
+                    TableColumn(L("状态")) { row in statusCell(row) }.width(82)
+                    TableColumn(L("延迟")) { row in
                         if row.rank == 0, let milliseconds = row.result?.milliseconds {
                             Text("\(milliseconds) ms").monospacedDigit()
                         } else {
                             Text("—").foregroundStyle(.secondary)
                         }
                     }.width(61)
-                    TableColumn("操作") { row in
-                        Button("测速") {
+                    TableColumn(L("操作")) { row in
+                        Button(L("测速")) {
                             sortByLatency = true
                             core.testNodes(row.node.name)
                         }
                         .buttonStyle(.borderless)
-                        .accessibilityLabel("测速 \(row.node.name)")
+                        .accessibilityLabel(L("测速 <1>", row.node.name))
                         .disabled(core.probeTotal > 0 || core.saving)
-                    }.width(54)
+                    }.width(64)
                 }
                 .alternatingRowBackgrounds(rows.count < 8 ? .disabled : .enabled)
-                .frame(maxHeight: rows.count < 8 ? CGFloat(37 + 24 * rows.count) : .infinity)
+                .frame(maxHeight: .infinity)
+                .scrollBounceBehavior(.basedOnSize)
+                .hopTableSurface()
                 .contextMenu(forSelectionType: String.self) { selection in
                     if selection.count == 1, let id = selection.first, let node = rows.first(where: { $0.id == id })?.node {
-                        Button("连接此节点") { core.connectToNode(node.name) }
+                        Button(L("连接此节点")) { core.connectToNode(node.name) }
                             .disabled(!core.canConnectToNode)
                     }
                 }
@@ -318,10 +321,9 @@ struct NodeDashboard: View {
                     core.connectToNode(node.name)
                     return .handled
                 }
-                Text("双击节点名称即可连接。悬停状态可查看测速详情。")
+                Text(L("双击节点名称即可连接。悬停状态可查看测速详情。"))
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                if rows.count < 8 { Spacer(minLength: 0) }
             }
         }
         .onChange(of: providers.map(\.id)) { _, ids in
@@ -332,17 +334,17 @@ struct NodeDashboard: View {
     private func statusCell(_ row: Row) -> some View {
         Group {
             if row.pending {
-                Label("测试中", systemImage: "clock").foregroundStyle(.secondary)
+                Label(L("测试中"), systemImage: "clock").foregroundStyle(.secondary)
             } else if let result = row.result {
                 TimelineView(.periodic(from: .now, by: 60)) { timeline in
                     let historical = result.isHistorical(at: timeline.date)
                     let symbol = result.isAvailable ? "checkmark.circle.fill" : result.isFailure ? "exclamationmark.circle" : "questionmark.circle"
-                    Label(historical ? "历史结果" : result.status, systemImage: historical ? "clock.arrow.circlepath" : symbol)
+                    Label(historical ? L("历史结果") : result.status, systemImage: historical ? "clock.arrow.circlepath" : symbol)
                         .foregroundStyle(historical ? .secondary : result.isAvailable ? HopAppearance.accent : result.isFailure ? HopAppearance.warning : .secondary)
                         .help(result.explanation(at: timeline.date))
                 }
             } else {
-                Text("未测试").foregroundStyle(.secondary)
+                Text(L("未测试")).foregroundStyle(.secondary)
             }
         }
     }

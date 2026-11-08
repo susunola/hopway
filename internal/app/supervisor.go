@@ -77,31 +77,32 @@ type Supervisor struct {
 	ports         []int
 	lease         *os.File
 
-	ledger           *engine.TrafficLedger
-	budget           *engine.ResourceBudget
-	startupIndexes   engine.RuleSetIndexes
-	refreshGate      chan struct{}
-	controlSlots     chan struct{}
-	current          atomic.Pointer[engine.Engine]
-	mu               sync.Mutex // serializes reloads; guards the fields below
-	loaded           profile.Loaded
-	autoPolicy       *engine.Policy
-	desktopRouting   bool
-	initialPolicy    *engine.Policy
-	desktopPolicy    *desktopPolicy
-	subErr           map[string]string
-	subMeta          map[string]SubscriptionStatus // nodes and update time of each snapshot
-	subReloadPending bool
-	started          time.Time
-	generation       uint64
-	ctx              context.Context
-	work             *lifetime.Group
-	networkCtx       context.Context
-	cancelNetwork    context.CancelFunc
-	closing          bool
-	closeOnce        sync.Once
-	retiring         sync.WaitGroup
-	retirement       retirement
+	ledger             *engine.TrafficLedger
+	trafficWriteFailed bool
+	budget             *engine.ResourceBudget
+	startupIndexes     engine.RuleSetIndexes
+	refreshGate        chan struct{}
+	controlSlots       chan struct{}
+	current            atomic.Pointer[engine.Engine]
+	mu                 sync.Mutex // serializes reloads; guards the fields below
+	loaded             profile.Loaded
+	autoPolicy         *engine.Policy
+	desktopRouting     bool
+	initialPolicy      *engine.Policy
+	desktopPolicy      *desktopPolicy
+	subErr             map[string]string
+	subMeta            map[string]SubscriptionStatus // nodes and update time of each snapshot
+	subReloadPending   bool
+	started            time.Time
+	generation         uint64
+	ctx                context.Context
+	work               *lifetime.Group
+	networkCtx         context.Context
+	cancelNetwork      context.CancelFunc
+	closing            bool
+	closeOnce          sync.Once
+	retiring           sync.WaitGroup
+	retirement         retirement
 
 	proxyMu     sync.Mutex
 	proxy       *sysproxy.Manager
@@ -682,6 +683,16 @@ func (s *Supervisor) status(includeConnections bool) Status {
 	core := s.current.Load()
 	status := Status{Revision: s.loaded.Revision, ProfileFallback: s.loaded.Fallback, Retirement: s.retirement.status(), Generation: s.generation}
 	status.Warnings = s.loaded.Warnings
+	recoveredTraffic := s.ledger != nil && s.ledger.Recovered()
+	if recoveredTraffic || s.trafficWriteFailed {
+		status.Warnings = append([]string(nil), status.Warnings...)
+		if recoveredTraffic {
+			status.Warnings = append(status.Warnings, "已隔离损坏的流量记录，其他记录可继续查看")
+		}
+		if s.trafficWriteFailed {
+			status.Warnings = append(status.Warnings, "本机用量暂未写入，将自动重试")
+		}
+	}
 	status.SystemProxy = SystemProxyStatus{Supported: SystemProxySupported, Enabled: s.proxy.Enabled(),
 		Error: s.proxyErr, Recovered: s.recovered}
 	status.Network = append([]netmon.Event(nil), s.events...)
@@ -922,7 +933,14 @@ func (s *Supervisor) flushTraffic(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = s.ledger.Flush()
+			err := s.ledger.Flush()
+			s.mu.Lock()
+			firstFailure := err != nil && !s.trafficWriteFailed
+			s.trafficWriteFailed = err != nil
+			s.mu.Unlock()
+			if firstFailure {
+				log.Printf("flush traffic history: %v", err)
+			}
 		}
 	}
 }

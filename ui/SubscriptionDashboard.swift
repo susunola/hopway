@@ -63,6 +63,7 @@ struct SubscriptionSummary: Decodable, Identifiable {
 }
 
 struct SubscriptionDashboard: View {
+    @Environment(\.locale) private var interfaceLocale
     @ObservedObject var core: CoreModel
     let importLink: () -> Void
     @State private var editing: SubscriptionSummary?
@@ -70,28 +71,29 @@ struct SubscriptionDashboard: View {
     @State private var removing: SubscriptionSummary?
 
     var body: some View {
+        let _ = interfaceLocale
         let active = core.subscriptions.filter { !$0.isPaused }.count
         let paused = core.subscriptions.count - active
         ScrollView {
             VStack(alignment: .leading, spacing: HopAppearance.pageSpacing) {
                 HStack {
                     HopPageHeading(
-                        title: "订阅",
-                        detail: core.subscriptions.isEmpty ? "管理服务商套餐、额度和到期时间" :
-                            "\(core.subscriptions.count) 份订阅 · \(active) 份启用 · \(paused) 份暂停"
+                        title: L("订阅"),
+                        detail: core.subscriptions.isEmpty ? L("管理服务商套餐、额度和到期时间") :
+                            L("<1> 份订阅 · <2> 份启用 · <3> 份暂停", core.subscriptions.count, active, paused)
                     )
                     Spacer()
                     Button(action: core.refreshAllSubscriptions) {
-                        Label("刷新全部", systemImage: "arrow.clockwise")
+                        Label(L("刷新全部"), systemImage: "arrow.clockwise")
                     }
                     .disabled(core.saving || core.refreshing || !core.subscriptions.contains { !$0.isPaused })
-                    Button("导入订阅…", action: importLink)
+                    Button(L("导入订阅…"), action: importLink)
                         .buttonStyle(HopPrimaryButton())
                         .disabled(core.saving)
                 }
                 if core.subscriptions.isEmpty {
-                    ContentUnavailableView("还没有订阅", systemImage: "tray.full",
-                                           description: Text("导入后可以查看剩余流量和到期时间。"))
+                    ContentUnavailableView(L("还没有订阅"), systemImage: "tray.full",
+                                           description: Text(L("导入后可以查看剩余流量和到期时间。")))
                         .frame(maxWidth: .infinity)
                 } else {
                     ForEach(core.subscriptions) { subscription in
@@ -102,31 +104,32 @@ struct SubscriptionDashboard: View {
             }
             .padding(.bottom, 12)
         }
-        .alert("移除订阅", isPresented: Binding(
+        .scrollBounceBehavior(.basedOnSize)
+        .alert(L("移除订阅"), isPresented: Binding(
             get: { removing != nil },
             set: { if !$0 { removing = nil } }
         ), presenting: removing) { subscription in
-            Button("移除", role: .destructive) { core.removeSubscription(subscription.id) }
-            Button("取消", role: .cancel) {}
+            Button(L("移除"), role: .destructive) { core.removeSubscription(subscription.id) }
+            Button(L("取消"), role: .cancel) {}
         } message: { subscription in
-            Text("移除「\(subscription.name)」及仅属于它的节点。")
+            Text(L("移除「<1>」及仅属于它的节点。", subscription.name))
         }
         .sheet(item: $editing) { subscription in
             VStack(alignment: .leading, spacing: 13) {
-                Text("编辑订阅名称").font(.headline)
-                TextField("显示名称", text: $newName)
+                Text(L("编辑订阅名称")).font(.headline)
+                TextField(L("显示名称"), text: $newName)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
-                Text("默认名称 · \(subscription.originalName)")
+                Text(L("默认名称 · <1>", subscription.originalName))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
                     if subscription.alias != nil {
-                        Button("恢复默认") { saveName(subscription, "") }
+                        Button(L("恢复默认")) { saveName(subscription, "") }
                     }
                     Spacer()
-                    Button("取消") { editing = nil }.keyboardShortcut(.cancelAction)
-                    Button("保存") { saveName(subscription, newName) }
+                    Button(L("取消")) { editing = nil }.keyboardShortcut(.cancelAction)
+                    Button(L("保存")) { saveName(subscription, newName) }
                         .keyboardShortcut(.defaultAction)
                         .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || newName.count > 80)
                 }
@@ -154,9 +157,9 @@ struct SubscriptionDashboard: View {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(subscription.name).font(.headline).lineLimit(1).help(subscription.name)
                     if subscription.isPaused {
-                        Text("已暂停").font(.caption).foregroundStyle(.secondary).fixedSize()
+                        Text(L("已暂停")).font(.caption).foregroundStyle(.secondary).fixedSize()
                     } else if let nodes = subscription.nodes {
-                        Text("\(nodes.count) 个节点").foregroundStyle(.secondary).fixedSize()
+                        Text(L("<1> 个节点", nodes.count)).foregroundStyle(.secondary).fixedSize()
                     }
                 }
                 Divider().frame(height: 24)
@@ -171,34 +174,34 @@ struct SubscriptionDashboard: View {
                     Text("/ \(trafficBytes(total))").monospacedDigit().foregroundStyle(.secondary)
                 }
                 Menu {
-                    Button("编辑名称…") {
+                    Button(L("编辑名称…")) {
                         newName = subscription.name
                         editing = subscription
                     }
-                    Button("刷新订阅") { core.refreshSubscription(subscription.id) }
+                    Button(L("刷新订阅")) { core.refreshSubscription(subscription.id) }
                         .disabled(core.refreshing || subscription.isPaused)
-                    Button(subscription.isPaused ? "恢复订阅" : "暂停订阅") {
+                    Button(subscription.isPaused ? L("恢复订阅") : L("暂停订阅")) {
                         core.pauseSubscription(subscription.id, paused: !subscription.isPaused)
                     }
-                    Button("移除订阅…", role: .destructive) { removing = subscription }
+                    Button(L("移除订阅…"), role: .destructive) { removing = subscription }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
                 .disabled(core.saving)
-                .accessibilityLabel("\(subscription.name) 的订阅操作")
+                .accessibilityLabel(L("<1> 的订阅操作", subscription.name))
             }
             if let ratio {
                 ProgressView(value: min(1, ratio))
                     .tint(warning ? HopAppearance.warning : HopAppearance.accent)
-                    .accessibilityLabel("已用流量占比")
+                    .accessibilityLabel(L("已用流量占比"))
             }
             HStack(spacing: 10) {
                 if let used, let total, let ratio {
-                    let remaining = "剩余 \(trafficBytes(total > used ? total - used : 0))"
-                    let detail = subscription.projectedDays.map { "近 7 天用量推算约 \($0) 天用完" }
-                        ?? "已用 \(ratio.formatted(.percent.precision(.fractionLength(0))))"
+                    let remaining = L("剩余 <1>", trafficBytes(total > used ? total - used : 0))
+                    let detail = subscription.projectedDays.map { L("近 7 天用量推算约 <1> 天用完", $0) }
+                        ?? L("已用 <1>", ratio.formatted(.percent.precision(.fractionLength(0))))
                     if warning {
                         Label("\(remaining) · \(detail)", systemImage: "exclamationmark.triangle")
                             .foregroundStyle(HopAppearance.warning)
@@ -206,9 +209,9 @@ struct SubscriptionDashboard: View {
                         Text("\(remaining) · \(detail)")
                     }
                 } else if meter == nil {
-                    Text("服务商暂未提供用量。")
+                    Text(L("服务商暂未提供用量。"))
                 } else {
-                    Text("服务商未提供完整额度。")
+                    Text(L("服务商未提供完整额度。"))
                 }
                 Spacer(minLength: 8)
                 if let expiration = meter?.expiration {
@@ -219,7 +222,7 @@ struct SubscriptionDashboard: View {
             .foregroundStyle(.secondary)
             if let error = runtime?.error {
                 VStack(alignment: .leading, spacing: 3) {
-                    Label(nodeSync > 0 ? "刷新失败 · 使用上次缓存" : "刷新失败", systemImage: "exclamationmark.circle")
+                    Label(nodeSync > 0 ? L("刷新失败 · 使用上次缓存") : L("刷新失败"), systemImage: "exclamationmark.circle")
                         .foregroundStyle(HopAppearance.warning)
                     Text(error)
                         .lineLimit(2)
@@ -238,14 +241,14 @@ struct SubscriptionDashboard: View {
         let quota = quotaSync.flatMap { $0 > 0 ? Date(timeIntervalSince1970: Double($0)) : nil }
         let compact = Date.FormatStyle().month(.defaultDigits).day(.defaultDigits)
             .hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
-        let nodeDetail = nodes.map { "节点同步 " + $0.formatted(date: .abbreviated, time: .shortened) } ?? "节点待同步"
-        let quotaDetail = quota.map { "额度更新 " + $0.formatted(date: .abbreviated, time: .shortened) }
+        let nodeDetail = nodes.map { L("节点同步 ") + $0.formatted(date: .abbreviated, time: .shortened) } ?? L("节点待同步")
+        let quotaDetail = quota.map { L("额度更新 ") + $0.formatted(date: .abbreviated, time: .shortened) }
         let checkDetail = checked.flatMap { time in
-            time > nodeSync ? "已检查 · 节点未变更 " + Date(timeIntervalSince1970: time / 1000).formatted(date: .abbreviated, time: .shortened) : nil
+            time > nodeSync ? L("已检查 · 节点未变更 ") + Date(timeIntervalSince1970: time / 1000).formatted(date: .abbreviated, time: .shortened) : nil
         }
         return VStack(alignment: .leading, spacing: 2) {
-            Text(nodes.map { "节点同步 " + $0.formatted(compact) } ?? "节点待同步")
-            if let quota { Text("额度更新 " + quota.formatted(compact)) }
+            Text(nodes.map { L("节点同步 ") + $0.formatted(compact) } ?? L("节点待同步"))
+            if let quota { Text(L("额度更新 ") + quota.formatted(compact)) }
         }
         .font(.caption.monospacedDigit())
         .foregroundStyle(.secondary)
@@ -259,8 +262,8 @@ struct SubscriptionDashboard: View {
             [.day], from: calendar.startOfDay(for: .now), to: calendar.startOfDay(for: date)
         ).day ?? 0
         let label = date.formatted(.dateTime.month().day())
-        if days < 0 { return "\(label) 到期 · 已过期" }
-        if days == 0 { return "\(label) 到期 · 今天" }
-        return "\(label) 到期 · 还剩 \(days) 天"
+        if days < 0 { return L("<1> 到期 · 已过期", label) }
+        if days == 0 { return L("<1> 到期 · 今天", label) }
+        return L("<1> 到期 · 还剩 <2> 天", label, days)
     }
 }
