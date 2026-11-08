@@ -19,6 +19,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Formatting and vet
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet -tags "$HOPWAY_TAGS" ./...
       - name: Test production protocols
         run: go test -tags "$HOPWAY_TAGS" -ldflags=-checklinkname=0 ./...
       - name: Check for races
@@ -33,6 +37,11 @@ jobs:
           go test -race -tags "$HOPWAY_TAGS" -ldflags=-checklinkname=0
           -gcflags='github.com/sagernet/sing-vmess/vless=-d=checkptr=0'
           -run 'TestServerFirstTarget/reality' ./internal/engine
+      - name: Performance gate
+        # Advisory until the runner model is pinned in tools/perf-baseline.json;
+        # the gate is strict on a developer machine.
+        continue-on-error: true
+        run: python3 tools/perf-gate.py --count 3
       - name: Build and verify the app
         run: |
           app="$RUNNER_TEMP/build.noindex/HopWay.app"

@@ -13,10 +13,41 @@ struct AutoRoutingConfig: Codable, Equatable {
 }
 
 struct AutoRoutingStatus: Decodable, Equatable {
+    struct Switch: Decodable, Equatable {
+        let from: String?
+        let to: String?
+        let provider: String?
+        let reason: String
+        let at: Int64
+
+        /// What the console says about the last automatic move. The engine
+        /// only keeps the latest change, so this explains the route in use.
+        var label: String {
+            switch reason {
+            case "failover": L("节点失败，已切换")
+            case "latency": L("延迟更优，已切换")
+            case "fastest": L("按延迟选中")
+            case "provider": L("服务商不可用，已更换")
+            case "exhausted": L("没有可用节点，已阻断")
+            default: L("已切换")
+            }
+        }
+
+        var detail: String {
+            switch (from, to) {
+            case let (from?, to?): "\(from) → \(to)"
+            case let (nil, to?): to
+            case let (from?, nil): from
+            default: ""
+            }
+        }
+    }
+
     let provider: String?
     let node: String?
     let probing: Bool
     let candidates: Int?
+    let lastSwitch: Switch?
 }
 
 struct AutoRoutingSheet: View {

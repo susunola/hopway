@@ -278,13 +278,15 @@ struct OverviewDashboard: View {
     }
 
     private func routingContext(mode: String, status: ProxyStatus?) -> some View {
+        let lastSwitch = status?.auto?.lastSwitch
+        let switchNote = lastSwitch.map { " · " + $0.label } ?? ""
         let detail: String = switch mode {
         case "fastest":
-            status?.auto?.candidates.map { L("<1> 个候选节点", $0) } ?? L("按延迟选可用节点")
+            (status?.auto?.candidates.map { L("<1> 个候选节点", $0) } ?? L("按延迟选可用节点")) + switchNote
         case "rule":
             L("<1> 条配置规则", core.configuredProfile?.ruleCount ?? 0)
         case "auto":
-            status?.policy.auto?.region ?? L("同地区自动切换")
+            (status?.policy.auto?.region ?? L("同地区自动切换")) + switchNote
         case "direct":
             L("新连接直达目标")
         default:
@@ -295,7 +297,8 @@ struct OverviewDashboard: View {
             if status == nil || mode == "global" {
                 Text(Policy.label(mode)).fontWeight(.medium).fixedSize()
             }
-            Text(detail).foregroundStyle(.secondary).lineLimit(1).help(detail)
+            Text(detail).foregroundStyle(.secondary).lineLimit(1)
+                .help(lastSwitch.map { $0.label + " " + $0.detail } ?? detail)
         }
         .font(.callout)
     }

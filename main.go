@@ -350,7 +350,15 @@ func run(path string, port int, check, managed, desktopRouting bool, initialPoli
 			cancel()
 		}()
 	}
-	supervisor, err := app.OpenContext(lifetime, path, dataDir(path), impl)
+	loadCtx, loadCancel := context.WithTimeout(lifetime, startupConfigTimeout)
+	supervisor, err := loadWithin("读取配置", startupConfigTimeout+time.Second, func() (*app.Supervisor, error) {
+		return app.OpenContext(loadCtx, path, dataDir(path), impl)
+	}, func(supervisor *app.Supervisor) {
+		if supervisor != nil {
+			supervisor.Close()
+		}
+	})
+	loadCancel()
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil
@@ -366,14 +374,18 @@ func run(path string, port int, check, managed, desktopRouting bool, initialPoli
 		config.SOCKSPort = port
 	}
 
-	socks, err := listen(config.SOCKSPort)
+	socks, err := listenWithin("绑定 SOCKS5 端口", startupListenTimeout, func() (*net.TCPListener, error) {
+		return listen(config.SOCKSPort)
+	})
 	if err != nil {
-		return fmt.Errorf("SOCKS5: %w", err)
+		return err
 	}
 	defer socks.Close()
-	httpProxy, err := listen(config.HTTPPort)
+	httpProxy, err := listenWithin("绑定 HTTP 代理端口", startupListenTimeout, func() (*net.TCPListener, error) {
+		return listen(config.HTTPPort)
+	})
 	if err != nil {
-		return fmt.Errorf("HTTP proxy: %w", err)
+		return err
 	}
 	defer httpProxy.Close()
 
@@ -381,7 +393,9 @@ func run(path string, port int, check, managed, desktopRouting bool, initialPoli
 	ports := []int{socks.Addr().(*net.TCPAddr).Port, httpProxy.Addr().(*net.TCPAddr).Port}
 	var control *net.TCPListener
 	if managed {
-		control, err = listen(0)
+		control, err = listenWithin("绑定控制接口", startupListenTimeout, func() (*net.TCPListener, error) {
+			return listen(0)
+		})
 		if err != nil {
 			return err
 		}
@@ -394,8 +408,14 @@ func run(path string, port int, check, managed, desktopRouting bool, initialPoli
 		info.Control = "http://" + control.Addr().String()
 		info.Token = hex.EncodeToString(token[:])
 	}
-	if err := supervisor.StartContext(lifetime, sysproxy.Target{HTTP: info.HTTP, SOCKS: info.SOCKS}, ports...); err != nil {
-		return err
+	startCtx, startCancel := context.WithTimeout(lifetime, startupEngineTimeout)
+	startErr := supervisor.StartContext(startCtx, sysproxy.Target{HTTP: info.HTTP, SOCKS: info.SOCKS}, ports...)
+	startCancel()
+	if startErr != nil {
+		if errors.Is(startErr, context.DeadlineExceeded) && lifetime.Err() == nil {
+			return &startupError{Stage: "构建路由引擎", After: startupEngineTimeout}
+		}
+		return asStartupError("构建路由引擎", startErr)
 	}
 	if lifetime.Err() != nil {
 		return nil

@@ -1300,7 +1300,7 @@ func (engine *Engine) status(includeConnections bool) Status {
 		}
 	}
 	if state := engine.auto; state != nil {
-		status.Auto = &AutoStatus{Node: state.activeNode, Probing: state.probing || state.ready != nil}
+		status.Auto = &AutoStatus{Node: state.activeNode, Probing: state.probing || state.ready != nil, LastSwitch: state.lastSwitch}
 		if state.fastest {
 			status.Auto.Candidates = len(state.eligible)
 		} else if state.activeGroup >= 0 {

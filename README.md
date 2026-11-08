@@ -144,8 +144,11 @@ TAGS=with_quic,with_utls,badlinkname,tfogo_checklinkname0
 go run -tags $TAGS -ldflags=-checklinkname=0 .          # 单独运行 Go 内核
 go run -tags $TAGS -ldflags=-checklinkname=0 . -check -config /path/config.json
 go test -tags $TAGS -ldflags=-checklinkname=0 ./...      # 含 8 种协议的端到端互通测试
+python3 tools/perf-gate.py                              # 规则匹配、转发、fake-IP、UDP 的性能基线
 ./build-app.sh                                         # 安装到 ~/Applications/HopWay.app
 ```
+
+`tools/perf-gate.py` 对四个热路径各自设门槛，而不是用一个总百分比：规则匹配测十万条规则的索引查询，转发测池化拷贝，fake-IP 测租约抖动，UDP 测本机中继。基线在 `tools/perf-baseline.json` 里，包含采样机器和容差；换机器后先用 `--count 5` 复测，确认是有意改动再用 `--update` 更新，并在提交信息里说明原因。CI 上这项先按提示运行，等 runner 机型固定后再改成阻断。
 
 阅读顺序可从 `main.go` 开始，再看 `internal/socks5` 和 `internal/httpproxy` 如何接收流量，`internal/engine` 如何分流（`rules.go`）、选组和测速（`groups.go`）、记录诊断，`internal/backend` 如何把节点交给 sing-box 并测量各阶段耗时，最后看 `internal/importer` 和 `ui/CoreModel.swift`。控制接口只监听本机随机端口，每次运行产生新的令牌，提供 `GET /status`、`PUT /policy`、`PUT /groups/{name}`（切换 select 组）、`POST /probe`（立即测速全部节点）、`POST /reload`（热加载配置）、`POST /subscriptions/refresh` 和 `POST /rulesets/refresh`（立即更新）。界面关闭内核子进程的标准输入后，内核退出。
 
