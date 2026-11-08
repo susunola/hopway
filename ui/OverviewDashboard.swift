@@ -519,47 +519,52 @@ struct OverviewDashboard: View {
 
     private func subscriptionSummary(_ subscription: SubscriptionSummary, inUse: Bool, compact: Bool) -> some View {
         let meter = subscription.usage
-        let remaining: String
+        var remaining = L("额度未提供")
         if let used = meter?.used, let total = meter?.total, total > 0 {
             remaining = L("剩余 ") + trafficBytes(total > used ? total - used : 0)
-        } else {
-            remaining = L("额度未提供")
         }
         let expiration = meter?.expiration
         let expired = expiration.map { $0 < Calendar.current.startOfDay(for: .now) } ?? false
-        let expiry = expiration.map { $0.formatted(.dateTime.month(.defaultDigits).day(.defaultDigits)) + L(" 到期") }
-            ?? L("到期日未知")
+        var expiry = L("到期日未知")
+        if let expiration {
+            expiry = expiration.formatted(.dateTime.month(.defaultDigits).day(.defaultDigits)) + L(" 到期")
+        }
         let detail = remaining + " · " + (expired ? L("已到期") : expiry)
-
+        let detailColor: Color = expired ? HopAppearance.warning : .secondary
+        let surface: Color = inUse ? HopAppearance.accent.opacity(0.08) : Color.primary.opacity(0.035)
         return VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                Text(subscription.name).font(.callout.weight(.semibold)).lineLimit(1)
-                if inUse {
-                    HStack(spacing: 4) {
-                        Circle().fill(HopAppearance.accent).frame(width: 6, height: 6)
-                            .accessibilityHidden(true)
-                        Text(L("使用中")).font(.caption.weight(.medium))
-                    }
-                    .foregroundStyle(HopAppearance.accent)
-                    .fixedSize()
-                } else if subscription.isPaused {
-                    Text(L("已暂停")).font(.caption).foregroundStyle(.secondary)
-                        .fixedSize()
-                }
-            }
+            subscriptionTitle(subscription, inUse: inUse)
             Text(detail)
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(expired ? HopAppearance.warning : .secondary)
+                .foregroundStyle(detailColor)
                 .lineLimit(1)
                 .minimumScaleFactor(0.82)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 9)
         .padding(.vertical, compact ? 5 : 7)
-        .background(inUse ? HopAppearance.accent.opacity(0.08) : Color.primary.opacity(0.035),
-                    in: RoundedRectangle(cornerRadius: 7))
+        .background(surface, in: RoundedRectangle(cornerRadius: 7))
         .accessibilityElement(children: .combine)
         .help(subscription.name + " · " + remaining + " · " + expiry)
+    }
+
+    @ViewBuilder
+    private func subscriptionTitle(_ subscription: SubscriptionSummary, inUse: Bool) -> some View {
+        HStack(spacing: 6) {
+            Text(subscription.name).font(.callout.weight(.semibold)).lineLimit(1)
+            if inUse {
+                HStack(spacing: 4) {
+                    Circle().fill(HopAppearance.accent).frame(width: 6, height: 6)
+                        .accessibilityHidden(true)
+                    Text(L("使用中")).font(.caption.weight(.medium))
+                }
+                .foregroundStyle(HopAppearance.accent)
+                .fixedSize()
+            } else if subscription.isPaused {
+                Text(L("已暂停")).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize()
+            }
+        }
     }
 
     private func overviewLink(_ title: String, action: @escaping () -> Void) -> some View {
