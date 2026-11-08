@@ -190,7 +190,8 @@ def occupied_http_port(binary, path):
             try:
                 assert child.wait(timeout=4) != 0
                 message = json.loads(child.stdout.read())
-                assert message.get("error", "").startswith("HTTP proxy:"), message
+                error = message.get("error", "")
+                assert "绑定 HTTP 代理端口" in error or error.startswith("HTTP proxy:"), message
             finally:
                 if child.poll() is None:
                     child.kill()
