@@ -69,6 +69,7 @@ type Status struct {
 	ProfileFallback bool                 `json:"profileFallback,omitempty"`
 	Retirement      RetirementStatus     `json:"retirement,omitzero"`
 	Generation      uint64               `json:"generation"`
+	CanUndoRoute    bool                 `json:"canUndoRoute,omitempty"`
 }
 
 type Supervisor struct {
@@ -110,6 +111,9 @@ type Supervisor struct {
 	proxyErr    string
 	recovered   bool
 	events      []netmon.Event
+
+	undoMu    sync.Mutex // guards the one-level route undo snapshot
+	undoRoute *engine.Runtime
 
 	tunMu        sync.Mutex // serializes TUN changes; the helper prompt can take minutes
 	tunDevice    *tun.Service
@@ -670,6 +674,38 @@ func (s *Supervisor) reloadLocked(ctx context.Context, expected string) error {
 	return nil
 }
 
+// RememberRoute keeps the state before a manual outbound change. Only the
+// latest change is kept: undo goes back one step, not through a history.
+func (s *Supervisor) RememberRoute(runtime engine.Runtime) {
+	s.undoMu.Lock()
+	s.undoRoute = &runtime
+	s.undoMu.Unlock()
+}
+
+// UndoRoute restores the policy and select-group members from before the last
+// manual change. It reports what was restored so the console can explain it.
+func (s *Supervisor) UndoRoute() (engine.Policy, bool) {
+	s.undoMu.Lock()
+	runtime := s.undoRoute
+	s.undoRoute = nil
+	s.undoMu.Unlock()
+	if runtime == nil {
+		return engine.Policy{}, false
+	}
+	core := s.Engine()
+	if core == nil {
+		return engine.Policy{}, false
+	}
+	core.Restore(*runtime)
+	return runtime.Policy, true
+}
+
+func (s *Supervisor) canUndoRoute() bool {
+	s.undoMu.Lock()
+	defer s.undoMu.Unlock()
+	return s.undoRoute != nil
+}
+
 func (s *Supervisor) Status() Status {
 	return s.status(true)
 }
@@ -718,6 +754,7 @@ func (s *Supervisor) status(includeConnections bool) Status {
 			status.Status = core.CompactStatus()
 		}
 	}
+	status.CanUndoRoute = s.canUndoRoute()
 	return status
 }
 

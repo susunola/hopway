@@ -273,6 +273,7 @@ struct ProxyStatus: Decodable, Equatable {
     let nodes: [Node]
     let active: Int
     let generation: UInt64
+    let canUndoRoute: Bool?
     let sessionTraffic: TrafficHistory.Count?
     let udpDrops: [String: UDPDropCounts]?
     struct Resources: Decodable, Equatable {
@@ -1139,6 +1140,24 @@ final class CoreModel: ObservableObject {
                 try await applyPolicy(policy, to: info)
                 reloadConfiguredNodes()
                 await refresh(info)
+            } catch {
+                if endpoint?.token == info.token { message = error.localizedDescription }
+            }
+        }
+    }
+
+    /// Goes back one manual outbound change. The engine keeps only the latest
+    /// snapshot, so a second undo has nothing to restore.
+    func undoRoute() {
+        guard let info = endpoint, !updatingPolicy else { return }
+        updatingPolicy = true
+        message = nil
+        Task {
+            defer { if endpoint?.token == info.token { updatingPolicy = false } }
+            do {
+                _ = try await call(info, path: "undo", method: "POST")
+                await refresh(info)
+                message = L("已撤销上一次出站切换。")
             } catch {
                 if endpoint?.token == info.token { message = error.localizedDescription }
             }

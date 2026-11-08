@@ -554,8 +554,13 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	router.HandleFunc("PUT /policy", func(writer http.ResponseWriter, request *http.Request) {
 		var policy engine.Policy
 		err := decodeControlJSON(writer, request, 64<<10, &policy)
+		var previous engine.Runtime
 		if err == nil {
+			previous = core().Runtime()
 			err = supervisor.SetPolicy(policy)
+			if err == nil {
+				supervisor.RememberRoute(previous)
+			}
 		}
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
@@ -568,14 +573,29 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 			Selected string `json:"selected"`
 		}
 		err := decodeControlJSON(writer, request, 4096, &body)
+		var previous engine.Runtime
 		if err == nil {
+			previous = core().Runtime()
 			err = core().SelectInGroup(request.PathValue("name"), body.Selected)
+			if err == nil {
+				supervisor.RememberRoute(previous)
+			}
 		}
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
 		writer.WriteHeader(http.StatusNoContent)
+	})
+	// Undo goes back one manual outbound change, never through a history.
+	router.HandleFunc("POST /undo", func(writer http.ResponseWriter, request *http.Request) {
+		policy, ok := supervisor.UndoRoute()
+		if !ok {
+			http.Error(writer, "没有可撤销的出站切换", http.StatusConflict)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(map[string]engine.Policy{"policy": policy})
 	})
 	// Probing takes seconds, longer than the control API's write timeout, so
 	// it runs in the background and results appear in /status.

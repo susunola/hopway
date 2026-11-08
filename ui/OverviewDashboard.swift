@@ -272,6 +272,14 @@ struct OverviewDashboard: View {
                 }
             }
             .disabled(core.updatingPolicy || core.statusReadFailed)
+            if status.canUndoRoute == true {
+                Button(action: core.undoRoute) {
+                    Label(L("撤销切换"), systemImage: "arrow.uturn.backward")
+                }
+                .buttonStyle(.borderless)
+                .disabled(core.updatingPolicy)
+                .help(L("回到上一次手动选择的出站"))
+            }
             routingContext(mode: status.policy.mode, status: status)
             Spacer(minLength: 0)
         }
