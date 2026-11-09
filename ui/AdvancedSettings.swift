@@ -408,8 +408,15 @@ struct StartupAccessSettings: View {
             let tun = core.status?.tun
             HStack {
                 Menu(L("TUN 助手")) {
-                    Button(tun?.service == true ? L("移除助手") : L("安装助手")) {
-                        core.setTUNService(tun?.service != true)
+                    if tun?.outdated == true {
+                        // A rebuilt app or a newer protocol version: the
+                        // installed helper still works but must be replaced.
+                        Button(L("更新助手")) { core.setTUNService(true) }
+                        Button(L("移除助手")) { core.setTUNService(false) }
+                    } else {
+                        Button(tun?.service == true ? L("移除助手") : L("安装助手")) {
+                            core.setTUNService(tun?.service != true)
+                        }
                     }
                 }
                 .fixedSize()

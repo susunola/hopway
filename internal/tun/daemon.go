@@ -5,6 +5,8 @@ package tun
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,8 +30,61 @@ const (
 	ServiceSocket  = "/var/run/com.hopway.tun-service.sock"
 	ServiceBinary  = "/Library/PrivilegedHelperTools/com.hopway.tun-service"
 	ServicePlist   = "/Library/LaunchDaemons/com.hopway.tun-service.plist"
+	ServiceMeta    = "/Library/PrivilegedHelperTools/com.hopway.tun-service.json"
 	ServiceVersion = 1 // bump for incompatible request or reply changes
 )
+
+// ServiceMetadata records what was installed, so a later app version can say
+// "this helper is older than me" instead of failing with a version mismatch
+// only when the user tries to turn TUN on.
+type ServiceMetadata struct {
+	Version     int    `json:"version"`
+	SHA256      string `json:"sha256,omitempty"`
+	UID         uint32 `json:"uid,omitempty"`
+	InstalledAt int64  `json:"installedAt,omitempty"`
+}
+
+func ReadServiceMetadata(path string) (ServiceMetadata, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ServiceMetadata{}, err
+	}
+	var metadata ServiceMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return ServiceMetadata{}, err
+	}
+	return metadata, nil
+}
+
+// BinaryDigest is the content hash used to notice that the app was rebuilt
+// after the helper was installed.
+func BinaryDigest(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// ServiceOutdated reports whether the installed helper differs from this
+// build. A missing metadata file counts as outdated: it was written by an
+// older installer that could not describe itself.
+func ServiceOutdated(executable string) bool {
+	return serviceOutdatedAt(ServiceMeta, executable)
+}
+
+func serviceOutdatedAt(metaPath, executable string) bool {
+	metadata, err := ReadServiceMetadata(metaPath)
+	if err != nil {
+		return true
+	}
+	if metadata.Version != ServiceVersion {
+		return true
+	}
+	digest, err := BinaryDigest(executable)
+	return err != nil || metadata.SHA256 != digest
+}
 
 type serviceRequest struct {
 	Version int    `json:"version"`
@@ -235,7 +290,18 @@ func InstallService(executable string, uid uint32) error {
 	if output, err := exec.Command("/bin/launchctl", "bootstrap", "system", ServicePlist).CombinedOutput(); err != nil {
 		return fmt.Errorf("launchctl bootstrap: %s", strings.TrimSpace(string(output)))
 	}
-	return nil
+	metadata := ServiceMetadata{Version: ServiceVersion, UID: uid, InstalledAt: time.Now().Unix()}
+	if metadata.SHA256, err = BinaryDigest(ServiceBinary); err != nil {
+		return err
+	}
+	data, err = json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(ServiceMeta, data, 0o644); err != nil {
+		return err
+	}
+	return os.Chown(ServiceMeta, 0, 0)
 }
 
 // UninstallService removes the launchd job and its files (as root).
@@ -245,7 +311,7 @@ func UninstallService() error {
 	}
 	exec.Command("/bin/launchctl", "bootout", "system/"+ServiceLabel).Run()
 	var errs []error
-	for _, path := range []string{ServicePlist, ServiceBinary, ServiceSocket} {
+	for _, path := range []string{ServicePlist, ServiceBinary, ServiceSocket, ServiceMeta} {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err)
 		}

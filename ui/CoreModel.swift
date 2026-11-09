@@ -195,6 +195,8 @@ struct ProxyStatus: Decodable, Equatable {
         let supported: Bool
         let enabled: Bool
         let service: Bool?
+        let version: Int?
+        let outdated: Bool?
         let device: String?
         let error: String?
         let operation: String?
@@ -944,7 +946,8 @@ final class CoreModel: ObservableObject {
                 lines.append(L("旧内核回收 · 处理中 <1> · 强制关闭 <2> · 清理超时 <3>", retirement.pending, retirement.forced, retirement.slow))
             }
             if let tun = status.tun {
-                lines.append(L("TUN 助手 · ") + (tun.service == true ? L("已安装") : L("未安装")))
+                let state = tun.service == true ? (tun.outdated == true ? L("已安装，需要更新") : L("已安装")) : L("未安装")
+                lines.append(L("TUN 助手 · ") + state)
                 if let pools = tun.fakeIP {
                     lines.append(L("Fake IP IPv4 · <1> / <2> · 暂缓 <3>", pools.ipv4.mapped, pools.ipv4.capacity, pools.ipv4.refused))
                     if let ipv6 = pools.ipv6 {

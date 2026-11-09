@@ -50,6 +50,8 @@ type TUNStatus struct {
 	Supported bool             `json:"supported"`
 	Enabled   bool             `json:"enabled"`
 	Service   bool             `json:"service"` // the password-free service is installed and answering
+	Version   int              `json:"version,omitempty"`
+	Outdated  bool             `json:"outdated,omitempty"` // installed helper differs from this build
 	Device    string           `json:"device,omitempty"`
 	Error     string           `json:"error,omitempty"`
 	Operation string           `json:"operation,omitempty"`
@@ -443,7 +445,9 @@ func serviceInstalled() bool {
 }
 
 // setTUNService installs or removes the password-free TUN service. Either
-// way macOS asks for the administrator password once.
+// way macOS asks for the administrator password once. Removal stops TUN
+// first: the device, its routes and the system DNS must be back to normal
+// before the helper that created them disappears.
 func (s *Supervisor) setTUNService(installed bool) error {
 	if runtime.GOOS != "darwin" {
 		return errors.New("the TUN service is only used on macOS")
@@ -456,7 +460,25 @@ func (s *Supervisor) setTUNService(installed bool) error {
 		return tun.RunAsAdmin(s.ctx, executable, "安装 HopWay 增强模式服务后，开启增强模式（TUN）时不再需要输入密码。",
 			"-tun-install", strconv.Itoa(os.Getuid()))
 	}
-	return tun.RunAsAdmin(s.ctx, executable, "卸载 HopWay 增强模式服务。", "-tun-uninstall")
+	stopErr := s.setTUN(false)
+	uninstallErr := tun.RunAsAdmin(s.ctx, executable, "卸载 HopWay 增强模式服务。", "-tun-uninstall")
+	if uninstallErr != nil {
+		if stopErr != nil {
+			return errors.Join(stopErr, uninstallErr)
+		}
+		return fmt.Errorf("增强模式已关闭、网络已恢复，但服务卸载失败：%w", uninstallErr)
+	}
+	return stopErr
+}
+
+// serviceOutdated compares the installed helper with this build without
+// asking root: the installer leaves a metadata file next to the binary.
+func serviceOutdated() bool {
+	executable, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	return tun.ServiceOutdated(executable)
 }
 
 func (s *Supervisor) networkChanged(event netmon.Event) {
@@ -732,8 +754,13 @@ func (s *Supervisor) status(includeConnections bool) Status {
 	status.SystemProxy = SystemProxyStatus{Supported: SystemProxySupported, Enabled: s.proxy.Enabled(),
 		Error: s.proxyErr, Recovered: s.recovered}
 	status.Network = append([]netmon.Event(nil), s.events...)
+	installed := runtime.GOOS == "darwin" && serviceInstalled()
 	status.TUN = TUNStatus{Supported: TUNSupported, Enabled: s.tunDevice != nil, Device: s.tunName, Error: s.tunErr,
-		Service: runtime.GOOS == "darwin" && serviceInstalled(), Operation: s.tunOperation}
+		Service: installed, Operation: s.tunOperation}
+	if installed {
+		status.TUN.Version = tun.ServiceVersion
+		status.TUN.Outdated = serviceOutdated()
+	}
 	if s.tunDevice != nil {
 		fakeIP := s.tunDevice.FakeIPStats()
 		status.TUN.FakeIP = &fakeIP
