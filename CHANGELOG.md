@@ -13,6 +13,7 @@
 - 新增 `tools/perf-gate.py`：规则匹配、池化转发、fake-IP 抖动、UDP 中继各自按基线比较，带容差和 `--update`；CI 先以提示方式运行。
 - CI 增加 `gofmt`、`go vet` 检查。
 - 修复 `BenchmarkFakeIPChurn` 在 `-count` 下偶发失败：分配压力下拒绝租约是设计中的背压，基准不再把它当作错误。
+- 性能 gate 在结果接近上限时自动复测，并给出每次的中位数与波动区间。
 
 ## 1.0.0-beta.1 - 2026-11-07
 
