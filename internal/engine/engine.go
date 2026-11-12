@@ -52,6 +52,7 @@ type Config struct {
 	// TUN captures all traffic through a virtual network device.
 	TUN               *TUNConfig              `json:"tun,omitempty"`
 	Inbound           InboundConfig           `json:"inbound,omitzero"`
+	DialPolicy        DialPolicy              `json:"dialPolicy,omitzero"`
 	MaxDialAttempts   int                     `json:"maxDialAttempts,omitempty"`
 	Performance       PerformanceConfig       `json:"performance,omitzero"`
 	AutoSwitch        AutoSwitchConfig        `json:"autoSwitch,omitzero"`
@@ -220,6 +221,7 @@ type RuleDefaults struct {
 
 type Engine struct {
 	auto          *autoState
+	dialPolicy    DialPolicy
 	autoWake      chan struct{}
 	subscriptions []Subscription
 	traffic       *TrafficLedger
@@ -316,6 +318,9 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 	if err := config.Inbound.validate(); err != nil {
 		return nil, err
 	}
+	if err := config.DialPolicy.validate(); err != nil {
+		return nil, err
+	}
 	if config.MaxDialAttempts < 0 || config.MaxDialAttempts > maxAllowedDialAttempts {
 		return nil, fmt.Errorf("maxDialAttempts must be between 0 and %d", maxAllowedDialAttempts)
 	}
@@ -343,6 +348,7 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL, probeFallback: defaultProbeFallback,
 		dialSlots: make(map[string]*endpointSlots), attempts: attempts, performance: performance, autoSwitch: autoSwitch,
+		dialPolicy:  config.DialPolicy,
 		recentLimit: recentLimit, recentTTL: recentTTL,
 		lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
 	}

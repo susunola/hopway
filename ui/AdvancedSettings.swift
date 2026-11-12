@@ -13,6 +13,7 @@ struct AdvancedSettingsDraft {
         var sniffing = true
         var probeURL = ""
         var autoRouteInterval = ""
+        var onExhausted = "block"
         var subscriptionRefresh = ""
         var connectionHistory = true
     }
@@ -40,6 +41,7 @@ struct AdvancedSettingsDraft {
             sniffing: tun["disableSniffing"] as? Bool != true,
             probeURL: health["url"] as? String ?? "",
             autoRouteInterval: Self.nonzeroText(performance["autoRouteIntervalSec"]),
+            onExhausted: (config["dialPolicy"] as? [String: Any])?["onExhausted"] as? String ?? "block",
             subscriptionRefresh: Self.nonzeroText(config["subscriptionRefreshMin"]),
             connectionHistory: history["disabled"] as? Bool != true
         )
@@ -92,6 +94,11 @@ struct AdvancedSettingsDraft {
             var health = config["health"] as? [String: Any] ?? [:]
             health["url"] = try url(values.probeURL, label: L("测速地址"))
             config["health"] = health.isEmpty ? nil : health
+        }
+        if values.onExhausted != original.onExhausted {
+            var dial = config["dialPolicy"] as? [String: Any] ?? [:]
+            dial["onExhausted"] = values.onExhausted == "block" ? nil : values.onExhausted
+            config["dialPolicy"] = dial.isEmpty ? nil : dial
         }
         if values.autoRouteInterval != original.autoRouteInterval {
             var performance = config["performance"] as? [String: Any] ?? [:]
@@ -276,6 +283,13 @@ struct AdvancedSettingsPanel<Header: View, Feedback: View>: View {
                 field(L("自动选路复测间隔（秒）"), text: values.autoRouteInterval, prompt: "60")
             }
             hint(L("自动选路复测间隔为 15–3600 秒。"))
+            Picker(L("候选全部不可用时"), selection: values.onExhausted) {
+                Text(L("阻断连接")).tag("block")
+                Text(L("直连")).tag("direct")
+            }
+            .pickerStyle(.segmented)
+            .fixedSize()
+            hint(L("默认阻断，避免流量绕过代理。选择直连后，自动选路没有可用节点时新连接直接出门。"))
         }
     }
 
