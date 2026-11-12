@@ -152,7 +152,7 @@ func validateGroups(groups []Group, known func(string) bool) (map[string]*group,
 func (engine *Engine) choices(name string) []choice {
 	if name == "AUTO" {
 		if engine.auto == nil || len(engine.auto.orderedCandidates) == 0 {
-			return []choice{{via: "REJECT"}}
+			return []choice{engine.exhaustedChoice()}
 		}
 		list := make([]choice, 0, len(engine.auto.orderedCandidates))
 		for _, name := range engine.auto.orderedCandidates {

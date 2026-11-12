@@ -67,6 +67,29 @@ curl --noproxy "" --proxy http://127.0.0.1:8080 https://example.com/
 }
 ```
 
+### DNS 上游
+
+```json
+{
+  "dns": {
+    "servers": [
+      { "name": "ali", "address": "223.5.5.5:53" },
+      { "name": "cf", "address": "1.1.1.1:53" }
+    ],
+    "rules": [
+      { "domain": "example.com", "server": "cf" }
+    ],
+    "default": "ali"
+  }
+}
+```
+
+- 规则按域名后缀匹配（含 apex），第一条命中生效；未命中用 `default`，`system` 表示交回系统解析。
+- `address` 必须是数字 IP 和端口：引导阶段的域名解析会变成新的回环依赖，所以这里不接受主机名。
+- 查询走 HopWay 自己的拨号器，TUN 模式下只从物理网卡发出，不会被 tunnel 劫持；结果按「服务器 + 域名」缓存 60 秒。
+- 连接记录的 `dnsServer` 会写明哪个上游应答，连接详情里显示为 `DNS · <名字>`。
+- 目前作用于内核自己解析的目标（DIRECT 目标和 TUN 嗅探出的域名）；代理节点自身的服务器地址仍由协议栈解析。加密 DNS（DoH/DoT）尚未支持。
+
 ### 策略组、规则和测速
 
 ```json
@@ -96,6 +119,7 @@ curl --noproxy "" --proxy http://127.0.0.1:8080 https://example.com/
 - `select` 由用户选择成员；`url-test` 选测得延迟最低的成员，新成员要比当前成员快出 `toleranceMs` 以上才切换；`fallback` 选第一个可用成员。组可以嵌套。
 - 自动组的成员按 `health` 定期测速。测速之外，节点在连接时出现 DNS、连接或握手失败也会立即标记为不可用。经过自动组的连接如果因节点本身失败，会在同一次请求内换下一个成员重试（最多 3 次），对应用透明。目标站点本身不可达时不会重试。
 - 默认测速目标无法访问时，HopWay 会通过同一个节点试用备用目标。自定义 `health.url` 时可另填 `health.fallbackUrl`。整批测速都失败时，节点标为待复测，保留上一次确认的健康状态。
+- 自动选路没有健康候选时，默认阻断新连接（`"dialPolicy": { "onExhausted": "block" }`）。设成 `"direct"` 则改为直连，适合「代理挂了也要能上网」的场景；代价是这些流量会绕过节点。设置页的「候选全部不可用时」对应这一项。
 - `rule` 模式按顺序取第一条匹配的规则，未匹配时走 `DIRECT`。规则在加载时建立索引，十万条规则的匹配耗时仍在一微秒以内。`SELECT` 表示当前选定出站。
 - 目标是域名时，只有当排在最前的候选规则是 IP 规则时，内核才解析这个域名（每次连接最多解析一次）；带 `noResolve` 的 IP 规则只匹配客户端直接提交的 IP。
 - `process-name` 匹配发起连接的应用：可以填可执行文件名，也可以填 `.app` 包名（不区分大小写）。例如填 `Google Chrome`，就能匹配它的所有 Helper 进程。`process-path` 匹配可执行文件的完整路径；以 `/` 结尾时匹配该目录下的所有程序。识别进程不需要 TUN：内核根据本机应用连接到 HopWay 时使用的端口，在系统连接表（macOS 上是 `net.inet.tcp.pcblist_n`）里找到对应的进程。只有当排在最前的候选规则是进程规则时，内核才会去查进程；其他连接在建立之后才补查，只用于诊断显示，不增加连接延迟。
@@ -144,8 +168,11 @@ TAGS=with_quic,with_utls,badlinkname,tfogo_checklinkname0
 go run -tags $TAGS -ldflags=-checklinkname=0 .          # 单独运行 Go 内核
 go run -tags $TAGS -ldflags=-checklinkname=0 . -check -config /path/config.json
 go test -tags $TAGS -ldflags=-checklinkname=0 ./...      # 含 8 种协议的端到端互通测试
+python3 tools/perf-gate.py                              # 规则匹配、转发、fake-IP、UDP 的性能基线
 ./build-app.sh                                         # 安装到 ~/Applications/HopWay.app
 ```
+
+`tools/perf-gate.py` 对四个热路径各自设门槛，而不是用一个总百分比：规则匹配测十万条规则的索引查询，转发测池化拷贝，fake-IP 测租约抖动，UDP 测本机中继。结果接近上限时会自动复测一轮，报告同时给出中位数和 `min..max` 区间，避免把一次抖动当成回归。基线在 `tools/perf-baseline.json` 里，包含采样机器和容差；换机器后先用 `--count 5` 复测，确认是有意改动再用 `--update` 更新，并在提交信息里说明原因。CI 上这项先按提示运行，等 runner 机型固定后再改成阻断。
 
 阅读顺序可从 `main.go` 开始，再看 `internal/socks5` 和 `internal/httpproxy` 如何接收流量，`internal/engine` 如何分流（`rules.go`）、选组和测速（`groups.go`）、记录诊断，`internal/backend` 如何把节点交给 sing-box 并测量各阶段耗时，最后看 `internal/importer` 和 `ui/CoreModel.swift`。控制接口只监听本机随机端口，每次运行产生新的令牌，提供 `GET /status`、`PUT /policy`、`PUT /groups/{name}`（切换 select 组）、`POST /probe`（立即测速全部节点）、`POST /reload`（热加载配置）、`POST /subscriptions/refresh` 和 `POST /rulesets/refresh`（立即更新）。界面关闭内核子进程的标准输入后，内核退出。
 

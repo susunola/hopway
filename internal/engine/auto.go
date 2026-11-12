@@ -53,10 +53,21 @@ func (config AutoSwitchConfig) effective() (AutoSwitchConfig, error) {
 }
 
 type AutoStatus struct {
-	Provider   string `json:"provider,omitempty"`
-	Node       string `json:"node,omitempty"`
-	Probing    bool   `json:"probing"`
-	Candidates int    `json:"candidates,omitempty"`
+	Provider   string      `json:"provider,omitempty"`
+	Node       string      `json:"node,omitempty"`
+	Probing    bool        `json:"probing"`
+	Candidates int         `json:"candidates,omitempty"`
+	LastSwitch *AutoSwitch `json:"lastSwitch,omitempty"`
+}
+
+// AutoSwitch explains one automatic change of the active outbound, so the
+// console can say why the route moved instead of only showing the new node.
+type AutoSwitch struct {
+	From     string `json:"from,omitempty"`
+	To       string `json:"to,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	Reason   string `json:"reason"` // failover, latency, fastest or exhausted
+	At       int64  `json:"at"`     // unix ms
 }
 
 type autoNode struct {
@@ -80,6 +91,7 @@ type autoState struct {
 	challengerWins    int
 	probing           bool
 	cancel            context.CancelFunc
+	lastSwitch        *AutoSwitch
 	orderedCandidates []string
 	fastest           bool
 	eligible          []string
@@ -136,6 +148,9 @@ func (engine *Engine) rankFastest(state *autoState) {
 		}
 		return cmp.Compare(left.latency, right.latency)
 	})
+	if len(verified) > 0 {
+		state.recordSwitch(-1, verified[0], "fastest")
+	}
 	state.activeNode = ""
 	if len(verified) > 0 {
 		state.activeNode = verified[0]
@@ -337,6 +352,14 @@ func (state *autoState) apply(results []ProbeResult) {
 			continue
 		}
 		if !activeHealthy || group != state.activeGroup {
+			reason := "failover"
+			switch {
+			case state.activeNode == "":
+				reason = "initial"
+			case group != state.activeGroup:
+				reason = "provider"
+			}
+			state.recordSwitch(group, best, reason)
 			state.activeGroup, state.activeNode = group, best
 			state.challenger, state.challengerWins = "", 0
 			return
@@ -362,13 +385,31 @@ func (state *autoState) apply(results []ProbeResult) {
 		}
 		state.challengerWins++
 		if state.challengerWins >= state.switching.Confirmations {
+			state.recordSwitch(state.activeGroup, best, "latency")
 			state.activeNode = best
 			state.challenger, state.challengerWins = "", 0
 		}
 		return
 	}
+	if state.activeNode != "" {
+		state.recordSwitch(-1, "", "exhausted")
+	}
 	state.activeGroup, state.activeNode = -1, ""
 	state.challenger, state.challengerWins = "", 0
+}
+
+// recordSwitch stores the most recent automatic change. Only the latest one
+// is kept: the console explains the route in use, not a history.
+func (state *autoState) recordSwitch(group int, node, reason string) {
+	from := state.activeNode
+	if from == node && (group < 0 || group == state.activeGroup) {
+		return
+	}
+	provider := ""
+	if group >= 0 && group < len(state.config.Groups) {
+		provider = state.config.Groups[group].Name
+	}
+	state.lastSwitch = &AutoSwitch{From: from, To: node, Provider: provider, Reason: reason, At: time.Now().UnixMilli()}
 }
 
 func (state *autoState) candidates() []string {

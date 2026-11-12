@@ -82,7 +82,17 @@ def control_request(ready, method, path, revision=None):
 
 
 def reload(ready):
-    status, body = control_request(ready, "POST", "/reload")
+    # GitHub's macOS runners intermittently refuse to register a second DNS
+    # configuration notification while the retired engine is still alive:
+    # "register DNS configuration notification: status 1000000". It is an
+    # environment limitation, not a routing failure, and a retry succeeds.
+    for attempt in range(3):
+        status, body = control_request(ready, "POST", "/reload")
+        if status == 204:
+            return
+        if b"register DNS configuration notification" not in body:
+            break
+        time.sleep(0.5 * (attempt + 1))
     assert status == 204, (status, body)
 
 
@@ -190,7 +200,8 @@ def occupied_http_port(binary, path):
             try:
                 assert child.wait(timeout=4) != 0
                 message = json.loads(child.stdout.read())
-                assert message.get("error", "").startswith("HTTP proxy:"), message
+                error = message.get("error", "")
+                assert "绑定 HTTP 代理端口" in error or error.startswith("HTTP proxy:"), message
             finally:
                 if child.poll() is None:
                     child.kill()

@@ -1,0 +1,9 @@
+{
+  "note": "Apple M4 Pro, macOS 26, Go 1.25.5. Regenerate with tools/perf-gate.py --update after an intentional change.",
+  "benchmarks": {
+    "BenchmarkMatchRuleCounts/100000": {"nsPerOp": 44.8, "tolerance": 0.35},
+    "BenchmarkRelayWrappedCopy/pooled": {"nsPerOp": 669.8, "tolerance": 0.35},
+    "BenchmarkFakeIPChurn": {"nsPerOp": 865.0, "tolerance": 0.35},
+    "BenchmarkUDPRelayLoopback": {"nsPerOp": 147817, "tolerance": 0.5}
+  }
+}
