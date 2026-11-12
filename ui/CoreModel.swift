@@ -1160,13 +1160,14 @@ final class CoreModel: ObservableObject {
         guard !saving else { return }
         saving = true
         message = nil
+        let destination = configURL
         Task {
             defer { saving = false }
             do {
                 let data = try await Task.detached {
-                    try Self.runProfileCommand("-restore-last-good", at: configURL, executable: executable)
+                    try Self.runProfileCommand("-restore-last-good", at: destination, executable: executable)
                 }.value
-                let text = try String(contentsOf: configURL, encoding: .utf8)
+                let text = try String(contentsOf: destination, encoding: .utf8)
                 saved = text
                 draft = text
                 reloadConfiguredNodes()
