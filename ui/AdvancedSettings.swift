@@ -436,6 +436,11 @@ struct StartupAccessSettings: View {
                 .fixedSize()
                 .disabled(core.phase != .running || tun?.supported != true || core.statusReadFailed || core.changingTUN)
                 .help(core.phase == .stopped ? L("启动代理后可管理 TUN 助手。") : L("管理 TUN 助手"))
+                Button(L("恢复上一次可用配置"), action: core.restoreLastGood)
+                    .disabled(core.phase == .running || core.saving || core.changed)
+                    .help(core.phase == .running
+                          ? L("请先停止代理，再恢复上一次可用的配置。")
+                          : L("用上一次通过校验的配置替换当前文件，原文件会保留备份。"))
                 Spacer()
                 Button(L("完成")) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(core.saving ? L("正在保存…") : L("保存偏好"), action: save)

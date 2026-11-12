@@ -1149,6 +1149,39 @@ final class CoreModel: ObservableObject {
         }
     }
 
+    /// Replaces the saved configuration with the last one that validated.
+    /// The broken file is kept next to it, so recovery is never destructive.
+    func restoreLastGood() {
+        guard let executable else { return }
+        guard !changed else {
+            message = L("请先保存或还原配置草稿，再恢复上一次可用的配置。")
+            return
+        }
+        guard !saving else { return }
+        saving = true
+        message = nil
+        Task {
+            defer { saving = false }
+            do {
+                let data = try await Task.detached {
+                    try Self.runProfileCommand("-restore-last-good", at: configURL, executable: executable)
+                }.value
+                let text = try String(contentsOf: configURL, encoding: .utf8)
+                saved = text
+                draft = text
+                reloadConfiguredNodes()
+                let receipt = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                if let backup = receipt?["backup"] as? String, !backup.isEmpty {
+                    message = L("已恢复上一次可用的配置，原文件备份在 <1>。", backup)
+                } else {
+                    message = L("已恢复上一次可用的配置。")
+                }
+            } catch {
+                message = L("恢复失败 · ") + error.localizedDescription
+            }
+        }
+    }
+
     /// Goes back one manual outbound change. The engine keeps only the latest
     /// snapshot, so a second undo has nothing to restore.
     func undoRoute() {

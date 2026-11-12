@@ -65,6 +65,7 @@ func main() {
 	prepareImport := flag.Bool("prepare-import", false, "internal: produce a private import preview and snapshot")
 	commitPrepared := flag.Bool("commit-prepared-import", false, "internal: save a prepared import without fetching again")
 	saveConfig := flag.Bool("save-config", false, "validate and atomically replace the configuration with JSON from stdin")
+	restoreLastGood := flag.Bool("restore-last-good", false, "replace the configuration with the last one that validated")
 	expectedRevision := flag.String("expected-revision", "", "original configuration SHA-256, or missing for a new file")
 	watchStdin := flag.Bool("watch-stdin", false, "internal: cancel a profile command when its parent closes stdin")
 	inputFile := flag.String("input-file", "", "internal: read profile input from a file while stdin tracks the parent")
@@ -118,6 +119,17 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		return
+	}
+	if *restoreLastGood {
+		impl := backend.Default()
+		validate := func(config engine.Config) error { return engine.Validate(config, impl) }
+		backup, err := profile.RestoreLastGood(*path, dataDir(*path), validate)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		json.NewEncoder(os.Stdout).Encode(map[string]any{"restored": true, "backup": backup})
 		return
 	}
 	if *saveConfig || *commitImport || *prepareImport || *commitPrepared {
