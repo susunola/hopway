@@ -67,6 +67,29 @@ curl --noproxy "" --proxy http://127.0.0.1:8080 https://example.com/
 }
 ```
 
+### DNS 上游
+
+```json
+{
+  "dns": {
+    "servers": [
+      { "name": "ali", "address": "223.5.5.5:53" },
+      { "name": "cf", "address": "1.1.1.1:53" }
+    ],
+    "rules": [
+      { "domain": "example.com", "server": "cf" }
+    ],
+    "default": "ali"
+  }
+}
+```
+
+- 规则按域名后缀匹配（含 apex），第一条命中生效；未命中用 `default`，`system` 表示交回系统解析。
+- `address` 必须是数字 IP 和端口：引导阶段的域名解析会变成新的回环依赖，所以这里不接受主机名。
+- 查询走 HopWay 自己的拨号器，TUN 模式下只从物理网卡发出，不会被 tunnel 劫持；结果按「服务器 + 域名」缓存 60 秒。
+- 连接记录的 `dnsServer` 会写明哪个上游应答，连接详情里显示为 `DNS · <名字>`。
+- 目前作用于内核自己解析的目标（DIRECT 目标和 TUN 嗅探出的域名）；代理节点自身的服务器地址仍由协议栈解析。加密 DNS（DoH/DoT）尚未支持。
+
 ### 策略组、规则和测速
 
 ```json

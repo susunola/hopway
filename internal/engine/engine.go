@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"mac-proxy/internal/backend"
+	"mac-proxy/internal/dnsconf"
 	"mac-proxy/internal/lifetime"
 	"mac-proxy/internal/outbound"
 	"mac-proxy/internal/peer"
@@ -53,6 +54,7 @@ type Config struct {
 	TUN               *TUNConfig              `json:"tun,omitempty"`
 	Inbound           InboundConfig           `json:"inbound,omitzero"`
 	DialPolicy        DialPolicy              `json:"dialPolicy,omitzero"`
+	DNS               *dnsconf.Config         `json:"dns,omitempty"`
 	MaxDialAttempts   int                     `json:"maxDialAttempts,omitempty"`
 	Performance       PerformanceConfig       `json:"performance,omitzero"`
 	AutoSwitch        AutoSwitchConfig        `json:"autoSwitch,omitzero"`
@@ -193,6 +195,7 @@ type Record struct {
 	ProcessBundleID string            `json:"processBundleId,omitempty"`
 	PID             uint32            `json:"pid,omitempty"`
 	Attempts        int               `json:"attempts,omitempty"`
+	DNSServer       string            `json:"dnsServer,omitempty"` // configured upstream that answered
 	DNSMs           int64             `json:"dnsMs,omitempty"`
 	ConnectMs       int64             `json:"connectMs,omitempty"`
 	HandshakeMs     int64             `json:"handshakeMs,omitempty"`
@@ -222,6 +225,7 @@ type RuleDefaults struct {
 type Engine struct {
 	auto          *autoState
 	dialPolicy    DialPolicy
+	resolver      *dnsconf.Resolver
 	autoWake      chan struct{}
 	subscriptions []Subscription
 	traffic       *TrafficLedger
@@ -321,6 +325,16 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 	if err := config.DialPolicy.validate(); err != nil {
 		return nil, err
 	}
+	resolver, err := dnsconf.New(config.DNS, backend.BoundDial)
+	if err != nil {
+		return nil, err
+	}
+	if config.DNS == nil {
+		// Without explicit DNS settings the backend keeps its own resolver
+		// (network-generation aware, shared with the TUN device); only an
+		// explicit configuration opts into the per-domain resolver.
+		resolver = nil
+	}
 	if config.MaxDialAttempts < 0 || config.MaxDialAttempts > maxAllowedDialAttempts {
 		return nil, fmt.Errorf("maxDialAttempts must be between 0 and %d", maxAllowedDialAttempts)
 	}
@@ -348,7 +362,7 @@ func NewContext(ctx context.Context, config Config, impl backend.Backend, budget
 		order: []string{"DIRECT", "REJECT"}, health: make(map[string]*nodeHealth),
 		live: make(map[uint64]*tracked), livePackets: make(map[uint64]*trackedPacket), ports: make(map[uint16]bool), probeURL: defaultProbeURL, probeFallback: defaultProbeFallback,
 		dialSlots: make(map[string]*endpointSlots), attempts: attempts, performance: performance, autoSwitch: autoSwitch,
-		dialPolicy:  config.DialPolicy,
+		dialPolicy: config.DialPolicy, resolver: resolver,
 		recentLimit: recentLimit, recentTTL: recentTTL,
 		lookupProcess: process.Lookup, lookupProcessUDP: process.LookupUDP,
 	}
@@ -766,6 +780,9 @@ func (engine *Engine) Decide(target string) string {
 }
 
 func (engine *Engine) Dial(ctx context.Context, inbound, target string) (net.Conn, error) {
+	if engine.resolver != nil {
+		ctx = backend.WithResolver(ctx, engine.resolver)
+	}
 	host, _, err := wire.Split(target)
 	if err != nil {
 		return nil, err
@@ -1213,6 +1230,7 @@ func (engine *Engine) dialOnce(ctx context.Context, via, target string, record *
 	total := time.Since(start)
 	server, dns, connect, reached, failStage := t.Snapshot()
 	record.Server, record.DNSMs, record.ConnectMs = server, dns.Milliseconds(), connect.Milliseconds()
+	record.DNSServer = t.DNSServerName()
 	record.HandshakeMs, record.Shared = 0, false
 	if via != "DIRECT" && reached {
 		record.HandshakeMs = max(total-dns-connect, 0).Milliseconds()

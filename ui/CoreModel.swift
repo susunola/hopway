@@ -114,6 +114,7 @@ struct ProxyStatus: Decodable, Equatable {
         let failures: [AttemptFailure]?
         let route: [String]?
         let server: String?
+        let dnsServer: String?
         let dnsMs: Int?
         let connectMs: Int?
         let handshakeMs: Int?
@@ -150,7 +151,8 @@ struct ProxyStatus: Decodable, Equatable {
             let lines = [failureMessage, failureStage.map { L("失败阶段 · ") + $0 },
                          processPath.map { L("应用 · ") + $0 }, processBundleId.map { L("应用标识 · ") + $0 }, L("路径 · ") + routeLabel,
                          targetSourceLabel.map { L("目标来源 · ") + $0 },
-                         server.map { L("服务器 · ") + $0 }, timingLabel.isEmpty ? nil : timingLabel]
+                         server.map { L("服务器 · ") + $0 },
+                         dnsServer.map { L("DNS · ") + $0 }, timingLabel.isEmpty ? nil : timingLabel]
             return (lines.compactMap { $0 } + (failures ?? []).map(\.label)).joined(separator: "\n")
         }
 

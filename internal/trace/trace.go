@@ -20,6 +20,7 @@ const (
 type Trace struct {
 	mu        sync.Mutex
 	Server    string        // address the backend actually dialed
+	DNSName   string        // dns server that answered the lookup (empty for literal IPs)
 	DNS       time.Duration // time spent resolving Server
 	Connect   time.Duration // time spent connecting to the resolved address
 	Reached   bool          // a socket to the server was established
@@ -62,6 +63,26 @@ func (t *Trace) Snapshot() (server string, dns, connect time.Duration, reached b
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.Server, t.DNS, t.Connect, t.Reached, t.FailStage
+}
+
+// SetDNSServer remembers which configured server resolved the host, so the
+// connection detail can show the upstream instead of guessing.
+func (t *Trace) SetDNSServer(name string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.DNSName = name
+	t.mu.Unlock()
+}
+
+func (t *Trace) DNSServerName() string {
+	if t == nil {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.DNSName
 }
 
 // Dialed reports whether the backend opened a socket at all for this trace.
