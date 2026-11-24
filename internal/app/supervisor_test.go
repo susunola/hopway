@@ -420,3 +420,73 @@ func TestAutoPolicySurvivesRestart(t *testing.T) {
 		t.Fatalf("manual mode should clear the saved automatic policy: %v", err)
 	}
 }
+
+func TestUndoRouteRestoresThePreviousManualPolicy(t *testing.T) {
+	config := engine.Default()
+	config.Nodes = []outbound.Node{{Name: "node", Type: "socks5", Server: "127.0.0.1:1"}}
+	config.Groups = []engine.Group{{Name: "pick", Type: engine.GroupSelect, Members: []string{"node", "DIRECT"}}}
+	core, err := engine.New(config, backend.Native{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { core.Close() })
+	supervisor := &Supervisor{}
+	supervisor.current.Store(core)
+
+	if supervisor.canUndoRoute() {
+		t.Fatal("a fresh supervisor must not offer undo")
+	}
+	before := core.Runtime()
+	beforePolicy := before.Policy
+	if err := supervisor.SetPolicy(engine.Policy{Mode: "global", Selected: "node"}); err != nil {
+		t.Fatal(err)
+	}
+	supervisor.RememberRoute(before)
+	if !supervisor.canUndoRoute() {
+		t.Fatal("undo was not remembered")
+	}
+
+	policy, ok := supervisor.UndoRoute()
+	if !ok {
+		t.Fatal("undo reported nothing to restore")
+	}
+	if policy != beforePolicy {
+		t.Fatalf("undo reported %+v, want %+v", policy, beforePolicy)
+	}
+	if got := core.Runtime().Policy; got != beforePolicy {
+		t.Fatalf("policy after undo is %+v, want %+v", got, beforePolicy)
+	}
+	if supervisor.canUndoRoute() {
+		t.Fatal("undo must be one level only")
+	}
+}
+
+func TestUndoRouteIsOneStepOnly(t *testing.T) {
+	config := engine.Default()
+	config.Nodes = []outbound.Node{{Name: "one", Type: "socks5", Server: "127.0.0.1:1"},
+		{Name: "two", Type: "socks5", Server: "127.0.0.1:1"}}
+	core, err := engine.New(config, backend.Native{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { core.Close() })
+	supervisor := &Supervisor{}
+	supervisor.current.Store(core)
+
+	for _, name := range []string{"one", "two"} {
+		snapshot := core.Runtime()
+		if err := supervisor.SetPolicy(engine.Policy{Mode: "global", Selected: name}); err != nil {
+			t.Fatal(err)
+		}
+		supervisor.RememberRoute(snapshot)
+	}
+	if _, ok := supervisor.UndoRoute(); !ok {
+		t.Fatal("first undo failed")
+	}
+	if got := core.Runtime().Policy.Selected; got != "one" {
+		t.Fatalf("undo went back to %q, want the immediately previous choice %q", got, "one")
+	}
+	if _, ok := supervisor.UndoRoute(); ok {
+		t.Fatal("a second undo must not go further back")
+	}
+}

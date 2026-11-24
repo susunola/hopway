@@ -65,6 +65,7 @@ func main() {
 	prepareImport := flag.Bool("prepare-import", false, "internal: produce a private import preview and snapshot")
 	commitPrepared := flag.Bool("commit-prepared-import", false, "internal: save a prepared import without fetching again")
 	saveConfig := flag.Bool("save-config", false, "validate and atomically replace the configuration with JSON from stdin")
+	restoreLastGood := flag.Bool("restore-last-good", false, "replace the configuration with the last one that validated")
 	expectedRevision := flag.String("expected-revision", "", "original configuration SHA-256, or missing for a new file")
 	watchStdin := flag.Bool("watch-stdin", false, "internal: cancel a profile command when its parent closes stdin")
 	inputFile := flag.String("input-file", "", "internal: read profile input from a file while stdin tracks the parent")
@@ -118,6 +119,17 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		return
+	}
+	if *restoreLastGood {
+		impl := backend.Default()
+		validate := func(config engine.Config) error { return engine.Validate(config, impl) }
+		backup, err := profile.RestoreLastGood(*path, dataDir(*path), validate)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		json.NewEncoder(os.Stdout).Encode(map[string]any{"restored": true, "backup": backup})
 		return
 	}
 	if *saveConfig || *commitImport || *prepareImport || *commitPrepared {
@@ -350,7 +362,15 @@ func run(path string, port int, check, managed, desktopRouting bool, initialPoli
 			cancel()
 		}()
 	}
-	supervisor, err := app.OpenContext(lifetime, path, dataDir(path), impl)
+	loadCtx, loadCancel := context.WithTimeout(lifetime, startupConfigTimeout)
+	supervisor, err := loadWithin("读取配置", startupConfigTimeout+time.Second, func() (*app.Supervisor, error) {
+		return app.OpenContext(loadCtx, path, dataDir(path), impl)
+	}, func(supervisor *app.Supervisor) {
+		if supervisor != nil {
+			supervisor.Close()
+		}
+	})
+	loadCancel()
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return nil
@@ -366,14 +386,18 @@ func run(path string, port int, check, managed, desktopRouting bool, initialPoli
 		config.SOCKSPort = port
 	}
 
-	socks, err := listen(config.SOCKSPort)
+	socks, err := listenWithin("绑定 SOCKS5 端口", startupListenTimeout, func() (*net.TCPListener, error) {
+		return listen(config.SOCKSPort)
+	})
 	if err != nil {
-		return fmt.Errorf("SOCKS5: %w", err)
+		return err
 	}
 	defer socks.Close()
-	httpProxy, err := listen(config.HTTPPort)
+	httpProxy, err := listenWithin("绑定 HTTP 代理端口", startupListenTimeout, func() (*net.TCPListener, error) {
+		return listen(config.HTTPPort)
+	})
 	if err != nil {
-		return fmt.Errorf("HTTP proxy: %w", err)
+		return err
 	}
 	defer httpProxy.Close()
 
@@ -381,7 +405,9 @@ func run(path string, port int, check, managed, desktopRouting bool, initialPoli
 	ports := []int{socks.Addr().(*net.TCPAddr).Port, httpProxy.Addr().(*net.TCPAddr).Port}
 	var control *net.TCPListener
 	if managed {
-		control, err = listen(0)
+		control, err = listenWithin("绑定控制接口", startupListenTimeout, func() (*net.TCPListener, error) {
+			return listen(0)
+		})
 		if err != nil {
 			return err
 		}
@@ -394,8 +420,14 @@ func run(path string, port int, check, managed, desktopRouting bool, initialPoli
 		info.Control = "http://" + control.Addr().String()
 		info.Token = hex.EncodeToString(token[:])
 	}
-	if err := supervisor.StartContext(lifetime, sysproxy.Target{HTTP: info.HTTP, SOCKS: info.SOCKS}, ports...); err != nil {
-		return err
+	startCtx, startCancel := context.WithTimeout(lifetime, startupEngineTimeout)
+	startErr := supervisor.StartContext(startCtx, sysproxy.Target{HTTP: info.HTTP, SOCKS: info.SOCKS}, ports...)
+	startCancel()
+	if startErr != nil {
+		if errors.Is(startErr, context.DeadlineExceeded) && lifetime.Err() == nil {
+			return &startupError{Stage: "构建路由引擎", After: startupEngineTimeout}
+		}
+		return asStartupError("构建路由引擎", startErr)
 	}
 	if lifetime.Err() != nil {
 		return nil
@@ -534,8 +566,13 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 	router.HandleFunc("PUT /policy", func(writer http.ResponseWriter, request *http.Request) {
 		var policy engine.Policy
 		err := decodeControlJSON(writer, request, 64<<10, &policy)
+		var previous engine.Runtime
 		if err == nil {
+			previous = core().Runtime()
 			err = supervisor.SetPolicy(policy)
+			if err == nil {
+				supervisor.RememberRoute(previous)
+			}
 		}
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
@@ -548,14 +585,29 @@ func controlHandler(supervisor *app.Supervisor, token string) http.Handler {
 			Selected string `json:"selected"`
 		}
 		err := decodeControlJSON(writer, request, 4096, &body)
+		var previous engine.Runtime
 		if err == nil {
+			previous = core().Runtime()
 			err = core().SelectInGroup(request.PathValue("name"), body.Selected)
+			if err == nil {
+				supervisor.RememberRoute(previous)
+			}
 		}
 		if err != nil {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
 		writer.WriteHeader(http.StatusNoContent)
+	})
+	// Undo goes back one manual outbound change, never through a history.
+	router.HandleFunc("POST /undo", func(writer http.ResponseWriter, request *http.Request) {
+		policy, ok := supervisor.UndoRoute()
+		if !ok {
+			http.Error(writer, "没有可撤销的出站切换", http.StatusConflict)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(writer).Encode(map[string]engine.Policy{"policy": policy})
 	})
 	// Probing takes seconds, longer than the control API's write timeout, so
 	// it runs in the background and results appear in /status.

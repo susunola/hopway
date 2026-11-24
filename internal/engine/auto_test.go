@@ -207,3 +207,56 @@ func TestAutoDialTriesBackup(t *testing.T) {
 		t.Fatalf("expected the backup node to carry the connection: %+v", connections)
 	}
 }
+
+func TestAutoSwitchRecordsWhyTheRouteMoved(t *testing.T) {
+	switching, err := (AutoSwitchConfig{}).effective()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := autoState{
+		config: &AutoConfig{Region: "HK", Groups: []AutoGroup{
+			{Name: "Primary", Nodes: []string{"first", "second"}},
+			{Name: "Backup", Nodes: []string{"backup"}},
+		}},
+		switching: switching, health: make(map[string]autoNode), activeGroup: -1,
+	}
+	apply := func(first, second, backup int64) {
+		t.Helper()
+		var results []ProbeResult
+		for _, entry := range []struct {
+			name string
+			ms   int64
+		}{{"first", first}, {"second", second}, {"backup", backup}} {
+			result := ProbeResult{Name: entry.name, Milliseconds: entry.ms}
+			if entry.ms == 0 {
+				result.Failure = "timeout"
+			}
+			results = append(results, result)
+		}
+		state.apply(results)
+	}
+	expect := func(reason, from, to string) {
+		t.Helper()
+		if state.activeNode != to {
+			t.Fatalf("selected %q, want %q", state.activeNode, to)
+		}
+		if state.lastSwitch == nil {
+			t.Fatal("automatic switch was not recorded")
+		}
+		if state.lastSwitch.Reason != reason || state.lastSwitch.From != from || state.lastSwitch.To != to {
+			t.Fatalf("recorded %+v, want reason=%q %q -> %q", *state.lastSwitch, reason, from, to)
+		}
+		if state.lastSwitch.At == 0 {
+			t.Fatal("switch has no timestamp")
+		}
+	}
+
+	apply(210, 240, 40)
+	expect("initial", "", "first")
+	apply(400, 60, 40)
+	apply(400, 60, 40)
+	expect("latency", "first", "second")
+	apply(0, 0, 40)
+	apply(0, 0, 40)
+	expect("provider", "second", "backup")
+}

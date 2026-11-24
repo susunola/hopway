@@ -114,6 +114,7 @@ struct ProxyStatus: Decodable, Equatable {
         let failures: [AttemptFailure]?
         let route: [String]?
         let server: String?
+        let dnsServer: String?
         let dnsMs: Int?
         let connectMs: Int?
         let handshakeMs: Int?
@@ -150,7 +151,8 @@ struct ProxyStatus: Decodable, Equatable {
             let lines = [failureMessage, failureStage.map { L("失败阶段 · ") + $0 },
                          processPath.map { L("应用 · ") + $0 }, processBundleId.map { L("应用标识 · ") + $0 }, L("路径 · ") + routeLabel,
                          targetSourceLabel.map { L("目标来源 · ") + $0 },
-                         server.map { L("服务器 · ") + $0 }, timingLabel.isEmpty ? nil : timingLabel]
+                         server.map { L("服务器 · ") + $0 },
+                         dnsServer.map { L("DNS · ") + $0 }, timingLabel.isEmpty ? nil : timingLabel]
             return (lines.compactMap { $0 } + (failures ?? []).map(\.label)).joined(separator: "\n")
         }
 
@@ -195,6 +197,8 @@ struct ProxyStatus: Decodable, Equatable {
         let supported: Bool
         let enabled: Bool
         let service: Bool?
+        let version: Int?
+        let outdated: Bool?
         let device: String?
         let error: String?
         let operation: String?
@@ -273,6 +277,7 @@ struct ProxyStatus: Decodable, Equatable {
     let nodes: [Node]
     let active: Int
     let generation: UInt64
+    let canUndoRoute: Bool?
     let sessionTraffic: TrafficHistory.Count?
     let udpDrops: [String: UDPDropCounts]?
     struct Resources: Decodable, Equatable {
@@ -943,7 +948,8 @@ final class CoreModel: ObservableObject {
                 lines.append(L("旧内核回收 · 处理中 <1> · 强制关闭 <2> · 清理超时 <3>", retirement.pending, retirement.forced, retirement.slow))
             }
             if let tun = status.tun {
-                lines.append(L("TUN 助手 · ") + (tun.service == true ? L("已安装") : L("未安装")))
+                let state = tun.service == true ? (tun.outdated == true ? L("已安装，需要更新") : L("已安装")) : L("未安装")
+                lines.append(L("TUN 助手 · ") + state)
                 if let pools = tun.fakeIP {
                     lines.append(L("Fake IP IPv4 · <1> / <2> · 暂缓 <3>", pools.ipv4.mapped, pools.ipv4.capacity, pools.ipv4.refused))
                     if let ipv6 = pools.ipv6 {
@@ -1139,6 +1145,58 @@ final class CoreModel: ObservableObject {
                 try await applyPolicy(policy, to: info)
                 reloadConfiguredNodes()
                 await refresh(info)
+            } catch {
+                if endpoint?.token == info.token { message = error.localizedDescription }
+            }
+        }
+    }
+
+    /// Replaces the saved configuration with the last one that validated.
+    /// The broken file is kept next to it, so recovery is never destructive.
+    func restoreLastGood() {
+        guard let executable else { return }
+        guard !changed else {
+            message = L("请先保存或还原配置草稿，再恢复上一次可用的配置。")
+            return
+        }
+        guard !saving else { return }
+        saving = true
+        message = nil
+        let destination = configURL
+        Task {
+            defer { saving = false }
+            do {
+                let data = try await Task.detached {
+                    try Self.runProfileCommand("-restore-last-good", at: destination, executable: executable)
+                }.value
+                let text = try String(contentsOf: destination, encoding: .utf8)
+                saved = text
+                draft = text
+                reloadConfiguredNodes()
+                let receipt = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                if let backup = receipt?["backup"] as? String, !backup.isEmpty {
+                    message = L("已恢复上一次可用的配置，原文件备份在 <1>。", backup)
+                } else {
+                    message = L("已恢复上一次可用的配置。")
+                }
+            } catch {
+                message = L("恢复失败 · ") + error.localizedDescription
+            }
+        }
+    }
+
+    /// Goes back one manual outbound change. The engine keeps only the latest
+    /// snapshot, so a second undo has nothing to restore.
+    func undoRoute() {
+        guard let info = endpoint, !updatingPolicy else { return }
+        updatingPolicy = true
+        message = nil
+        Task {
+            defer { if endpoint?.token == info.token { updatingPolicy = false } }
+            do {
+                _ = try await call(info, path: "undo", method: "POST")
+                await refresh(info)
+                message = L("已撤销上一次出站切换。")
             } catch {
                 if endpoint?.token == info.token { message = error.localizedDescription }
             }

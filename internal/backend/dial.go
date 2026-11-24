@@ -37,6 +37,25 @@ type dialResult struct {
 	connect       time.Duration
 	stage         string
 	guardRejected bool
+	dnsName       string
+}
+
+// HostResolver resolves a host and reports which upstream answered.
+type HostResolver interface {
+	Lookup(ctx context.Context, host string) ([]netip.Addr, string, error)
+}
+
+type resolverContextKey struct{}
+
+// WithResolver attaches a per-engine resolver. Dialers read it from the
+// context, so a reload never has to share mutable resolver state.
+func WithResolver(ctx context.Context, resolver HostResolver) context.Context {
+	return context.WithValue(ctx, resolverContextKey{}, resolver)
+}
+
+func resolverFrom(ctx context.Context) HostResolver {
+	resolver, _ := ctx.Value(resolverContextKey{}).(HostResolver)
+	return resolver
 }
 
 // NetDial resolves and connects to address, recording DNS and connect
@@ -77,9 +96,33 @@ func NetDial(ctx context.Context, network, address string, guard Guard) (net.Con
 	if ip, err := netip.ParseAddr(host); err == nil {
 		result = dialAddresses(ctx, network, port, []netip.Addr{ip.Unmap()}, dialer.DialContext, guard)
 	} else {
-		result = dialFamilies(ctx, network, host, port, func(ctx context.Context, family string) ([]netip.Addr, error) {
-			return Resolver.lookupNetwork(ctx, view, family, host)
-		}, dialer.DialContext, guard)
+		var dnsName atomic.Value
+		lookup := func(ctx context.Context, family string) ([]netip.Addr, error) {
+			resolver := resolverFrom(ctx)
+			if resolver == nil {
+				return Resolver.lookupNetwork(ctx, view, family, host)
+			}
+			addrs, name, err := resolver.Lookup(ctx, host)
+			if name != "" {
+				dnsName.Store(name)
+			}
+			if err != nil {
+				return nil, err
+			}
+			filtered := make([]netip.Addr, 0, len(addrs))
+			for _, addr := range addrs {
+				if family == "ip4" && addr.Is4() {
+					filtered = append(filtered, addr)
+				} else if family != "ip4" && !addr.Is4() {
+					filtered = append(filtered, addr)
+				}
+			}
+			return filtered, nil
+		}
+		result = dialFamilies(ctx, network, host, port, lookup, dialer.DialContext, guard)
+		if name, ok := dnsName.Load().(string); ok {
+			result.dnsName = name
+		}
 	}
 	err = ctx.Err()
 	if err == nil {
@@ -88,6 +131,9 @@ func NetDial(ctx context.Context, network, address string, guard Guard) (net.Con
 	if result.conn != nil && err != nil {
 		result.conn.Close()
 		result.conn, result.err, result.stage = nil, err, trace.StageConnect
+	}
+	if result.dnsName != "" {
+		trace.From(ctx).SetDNSServer(result.dnsName)
 	}
 	trace.From(ctx).Dial(address, result.dns, result.connect, result.stage)
 	return result.conn, result.err

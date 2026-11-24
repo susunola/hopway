@@ -97,6 +97,7 @@ type clashProvider struct {
 	Behavior string `yaml:"behavior"`
 	Format   string `yaml:"format"`
 	URL      string `yaml:"url"`
+	Path     string `yaml:"path"`
 	Interval int    `yaml:"interval"`
 }
 
@@ -128,7 +129,62 @@ type clashGroup struct {
 	Tolerance int      `yaml:"tolerance"`
 }
 
+// unsupportedWireFields are Clash keys that change the framing or the
+// handshake of a connection. Ignoring them would connect with a different
+// protocol than the subscription describes, so the node is refused by name.
+var unsupportedWireFields = map[string]string{
+	"smux":                 "多路复用（smux）",
+	"smux-opts":            "多路复用（smux）",
+	"packet-encoding":      "Shadowsocks 2022 数据包编码",
+	"xudp":                 "XUDP",
+	"global-padding":       "全局填充",
+	"authenticated-length": "认证长度头",
+	"udp-over-tcp-version": "UDP over TCP 版本",
+}
+
+func wireFieldError(entry yaml.Node) string {
+	var fields map[string]any
+	if err := entry.Decode(&fields); err != nil {
+		return ""
+	}
+	for key, meaning := range unsupportedWireFields {
+		if value, present := fields[key]; present && fieldEnabled(value) {
+			return "字段 " + key + "（" + meaning + "）会改变线路格式，当前不支持"
+		}
+	}
+	return ""
+}
+
+// fieldEnabled treats an explicitly disabled option as absent, so a profile
+// that writes smux: false still imports.
+func fieldEnabled(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return false
+	case bool:
+		return typed
+	case string:
+		typed = strings.TrimSpace(strings.ToLower(typed))
+		return typed != "" && typed != "false" && typed != "none" && typed != "0"
+	case int:
+		return typed != 0
+	case int64:
+		return typed != 0
+	case float64:
+		return typed != 0
+	case map[string]any:
+		return true
+	case []any:
+		return len(typed) != 0
+	default:
+		return true
+	}
+}
+
 func (n clashNode) convert() (outbound.Node, error) {
+	if n.UDPOverTCP && n.Plugin != "shadow-tls" && n.Plugin != "shadowtls" {
+		return outbound.Node{}, errors.New("字段 udp-over-tcp（UDP over TCP）会改变线路格式，当前只支持 ShadowTLS 的封装")
+	}
 	if n.CertificateFingerprint != "" {
 		return outbound.Node{}, errors.New("当前内核不支持 Clash 的整张 TLS 证书指纹校验")
 	}
@@ -443,6 +499,10 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 				result.add(outbound.Node{}, errors.New("Clash 节点字段格式无效"))
 				continue
 			}
+			if wireErr := wireFieldError(entry); wireErr != "" {
+				result.add(outbound.Node{Name: proxy.Name}, errors.New(wireErr))
+				continue
+			}
 			if proxy.Insecure {
 				proxy.Insecure = false
 				result.noteStrictTLS()
@@ -451,18 +511,24 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 			node.Name = proxy.Name
 			result.addNamed(proxy.Name, node, err)
 		}
+		var providerNodes map[string][]string
 		if profile.Providers.Kind != 0 {
-			result.Notes = append(result.Notes, "远程节点集（proxy-providers）暂未导入")
+			var providers map[string]clashProvider
+			if err := profile.Providers.Decode(&providers); err != nil {
+				result.Notes = append(result.Notes, "远程节点集（proxy-providers）格式无效，已跳过")
+			} else {
+				providerNodes = result.importProviders(ctx, providers, options)
+			}
 		}
 		if len(profile.Groups) != 0 {
-			result.importClash(profile)
+			result.importClash(profile, providerNodes)
 		}
 	}
 	if result.Announcements != 0 {
 		result.Notes = append(result.Notes, fmt.Sprintf("已跳过 %d 条服务商公告", result.Announcements))
 	}
 	if result.Added == 0 && result.Skipped == 0 {
-		return Result{}, errors.New("没有找到内联节点。仅含远程 proxy-providers 的配置暂不支持")
+		return Result{}, errors.New("没有找到可导入的节点。检查内联节点或远程节点集是否可访问")
 	}
 	if result.Added == 0 && result.Skipped > 0 {
 		return Result{}, fmt.Errorf("没有新增节点，跳过 %d 项。%s", result.Skipped, strings.Join(result.Notes, "；"))
@@ -484,7 +550,7 @@ func ImportWith(ctx context.Context, input io.Reader, base engine.Config, impl b
 
 // importClash replaces groups and rules with the profile's, mapping names
 // through any renames made while adding nodes.
-func (result *Result) importClash(profile clash) {
+func (result *Result) importClash(profile clash, providerNodes map[string][]string) {
 	var groups []engine.Group
 	declared := map[string]bool{}
 	var parsed []clashGroup
@@ -541,8 +607,13 @@ func (result *Result) importClash(profile clash) {
 				seen[name] = true
 			}
 		}
-		if len(g.Use) != 0 {
-			result.Notes = append(result.Notes, "策略组「"+g.Name+"」引用的远程节点集未导入")
+		for _, provider := range g.Use {
+			for _, name := range providerNodes[provider] {
+				if !seen[name] {
+					members = append(members, name)
+					seen[name] = true
+				}
+			}
 		}
 		if len(members) == 0 {
 			dropped++

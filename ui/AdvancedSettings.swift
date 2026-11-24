@@ -13,6 +13,7 @@ struct AdvancedSettingsDraft {
         var sniffing = true
         var probeURL = ""
         var autoRouteInterval = ""
+        var onExhausted = "block"
         var subscriptionRefresh = ""
         var connectionHistory = true
     }
@@ -40,6 +41,7 @@ struct AdvancedSettingsDraft {
             sniffing: tun["disableSniffing"] as? Bool != true,
             probeURL: health["url"] as? String ?? "",
             autoRouteInterval: Self.nonzeroText(performance["autoRouteIntervalSec"]),
+            onExhausted: (config["dialPolicy"] as? [String: Any])?["onExhausted"] as? String ?? "block",
             subscriptionRefresh: Self.nonzeroText(config["subscriptionRefreshMin"]),
             connectionHistory: history["disabled"] as? Bool != true
         )
@@ -92,6 +94,11 @@ struct AdvancedSettingsDraft {
             var health = config["health"] as? [String: Any] ?? [:]
             health["url"] = try url(values.probeURL, label: L("测速地址"))
             config["health"] = health.isEmpty ? nil : health
+        }
+        if values.onExhausted != original.onExhausted {
+            var dial = config["dialPolicy"] as? [String: Any] ?? [:]
+            dial["onExhausted"] = values.onExhausted == "block" ? nil : values.onExhausted
+            config["dialPolicy"] = dial.isEmpty ? nil : dial
         }
         if values.autoRouteInterval != original.autoRouteInterval {
             var performance = config["performance"] as? [String: Any] ?? [:]
@@ -276,6 +283,13 @@ struct AdvancedSettingsPanel<Header: View, Feedback: View>: View {
                 field(L("自动选路复测间隔（秒）"), text: values.autoRouteInterval, prompt: "60")
             }
             hint(L("自动选路复测间隔为 15–3600 秒。"))
+            Picker(L("候选全部不可用时"), selection: values.onExhausted) {
+                Text(L("阻断连接")).tag("block")
+                Text(L("直连")).tag("direct")
+            }
+            .pickerStyle(.segmented)
+            .fixedSize()
+            hint(L("默认阻断，避免流量绕过代理。选择直连后，自动选路没有可用节点时新连接直接出门。"))
         }
     }
 
@@ -408,13 +422,25 @@ struct StartupAccessSettings: View {
             let tun = core.status?.tun
             HStack {
                 Menu(L("TUN 助手")) {
-                    Button(tun?.service == true ? L("移除助手") : L("安装助手")) {
-                        core.setTUNService(tun?.service != true)
+                    if tun?.outdated == true {
+                        // A rebuilt app or a newer protocol version: the
+                        // installed helper still works but must be replaced.
+                        Button(L("更新助手")) { core.setTUNService(true) }
+                        Button(L("移除助手")) { core.setTUNService(false) }
+                    } else {
+                        Button(tun?.service == true ? L("移除助手") : L("安装助手")) {
+                            core.setTUNService(tun?.service != true)
+                        }
                     }
                 }
                 .fixedSize()
                 .disabled(core.phase != .running || tun?.supported != true || core.statusReadFailed || core.changingTUN)
                 .help(core.phase == .stopped ? L("启动代理后可管理 TUN 助手。") : L("管理 TUN 助手"))
+                Button(L("恢复上一次可用配置"), action: core.restoreLastGood)
+                    .disabled(core.phase == .running || core.saving || core.changed)
+                    .help(core.phase == .running
+                          ? L("请先停止代理，再恢复上一次可用的配置。")
+                          : L("用上一次通过校验的配置替换当前文件，原文件会保留备份。"))
                 Spacer()
                 Button(L("完成")) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(core.saving ? L("正在保存…") : L("保存偏好"), action: save)

@@ -171,6 +171,7 @@ struct ConnectionsDashboard: View {
             HopDisclosure(L("诊断详情")) {
                 VStack(alignment: .leading, spacing: 6) {
                     let context = [row.process.map { L("应用 <1>", $0) }, row.server.map { L("服务器 <1>", $0) },
+                                   row.dnsServer.map { L("DNS <1>", $0) },
                                    row.start.map { Date(timeIntervalSince1970: $0 / 1000).formatted(date: .omitted, time: .standard) }]
                         .compactMap { $0 }.joined(separator: " · ")
                     if !context.isEmpty { Text(context).lineLimit(1).help(context) }

@@ -112,7 +112,7 @@ struct SubscriptionDashboard: View {
             Button(L("移除"), role: .destructive) { core.removeSubscription(subscription.id) }
             Button(L("取消"), role: .cancel) {}
         } message: { subscription in
-            Text(L("移除「<1>」及仅属于它的节点。", subscription.name))
+            Text(removalImpact(subscription))
         }
         .sheet(item: $editing) { subscription in
             VStack(alignment: .leading, spacing: 13) {
@@ -142,6 +142,32 @@ struct SubscriptionDashboard: View {
     private func saveName(_ subscription: SubscriptionSummary, _ name: String) {
         core.renameSubscription(subscription.id, to: name)
         editing = nil
+    }
+
+    /// Spelling out what removal actually takes away: the nodes no other
+    /// subscription provides and the policy groups that reference them.
+    private func removalImpact(_ subscription: SubscriptionSummary) -> String {
+        let mine = Set(subscription.nodes ?? [])
+        let shared = Set(core.subscriptions.filter { $0.id != subscription.id }.flatMap { $0.nodes ?? [] })
+        let orphaned = mine.subtracting(shared).sorted()
+        guard !orphaned.isEmpty else {
+            return L("移除「<1>」。它没有独占节点，其他订阅继续提供相同的节点。", subscription.name)
+        }
+        var parts = [L("将移除 <1> 个仅属于它的节点", orphaned.count)]
+        if orphaned.count <= 5 {
+            parts.append(orphaned.joined(separator: "、"))
+        } else {
+            parts.append(orphaned.prefix(4).joined(separator: "、") + L(" 等"))
+        }
+        let groups = (core.status?.groups ?? [])
+            .filter { group in group.members.contains { orphaned.contains($0) } }
+            .map(\.name)
+        if groups.isEmpty {
+            parts.append(L("没有策略组引用这些节点"))
+        } else {
+            parts.append(L("影响 <1> 个策略组：<2>", groups.count, groups.prefix(4).joined(separator: "、")))
+        }
+        return parts.joined(separator: "；")
     }
 
     private func plan(_ subscription: SubscriptionSummary) -> some View {
