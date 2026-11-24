@@ -9,13 +9,15 @@ struct NodeLocation {
             .contains { title.hasPrefix($0) }
     }
 
+    /// The region used by automatic routing. Mainland China is deliberately
+    /// not offered, so domestic nodes never become an automatic region, even
+    /// when the provider puts a flag emoji in the node name.
     var regionCode: String? {
-        guard !isSubscriptionNotice else { return nil }
-        return flag.map { value in
-            String(String.UnicodeScalarView(value.unicodeScalars.compactMap {
-                UnicodeScalar($0.value - 0x1F1E6 + 65)
-            }))
-        }
+        guard !isSubscriptionNotice, let flag else { return nil }
+        let code = String(String.UnicodeScalarView(flag.unicodeScalars.compactMap {
+            UnicodeScalar($0.value - 0x1F1E6 + 65)
+        }))
+        return code == "CN" ? nil : code
     }
 
     init(name: String) {
@@ -40,7 +42,7 @@ struct NodeLocation {
             $0.start == $1.start ? $0.length > $1.length : $0.start < $1.start
         })?.code {
             flag = Self.flag(for: code)
-        } else if let token = name.range(of: #"(?<![\p{L}0-9])(?:HK|TW|MO|JP|SG|US|KR|GB|UK|DE|FR|CA|AU|NL|IN|MY|TH|VN|PH|ID|RU|TR|AE|CN)(?![A-Za-z0-9])"#, options: .regularExpression) {
+        } else if let token = name.range(of: #"(?<![\p{L}0-9])(?:HK|TW|MO|JP|SG|US|KR|GB|UK|DE|FR|CA|AU|NL|IN|MY|TH|VN|PH|ID|RU|TR|AE)(?![A-Za-z0-9])"#, options: .regularExpression) {
             let code = String(name[token])
             flag = Self.flag(for: code == "UK" ? "GB" : code)
         } else {
@@ -68,7 +70,6 @@ struct NodeLocation {
         ("MY", ["马来西亚", "馬來西亞", "Malaysia"]), ("TH", ["泰国", "泰國", "曼谷", "Thailand", "Bangkok"]),
         ("VN", ["越南", "Vietnam"]), ("PH", ["菲律宾", "菲律賓", "Philippines"]),
         ("ID", ["印度尼西亚", "印尼", "Indonesia"]), ("RU", ["俄罗斯", "俄羅斯", "Russia"]),
-        ("TR", ["土耳其", "Türkiye", "Turkey"]), ("AE", ["阿联酋", "阿聯酋", "迪拜", "Dubai"]),
-        ("CN", ["中国大陆", "中國大陸", "中国", "中國", "China"])
+        ("TR", ["土耳其", "Türkiye", "Turkey"]), ("AE", ["阿联酋", "阿聯酋", "迪拜", "Dubai"])
     ]
 }
